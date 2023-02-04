@@ -68,7 +68,7 @@ entt_ext_dep = declare_dependency(
   link_args:linker_args
 )
 
-# set_variable('entt_ext_dep', entt_ext_dep)
+set_variable('entt_ext_dep', entt_ext_dep)
 
 
 
