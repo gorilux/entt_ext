@@ -1,7 +1,7 @@
 project('entt_ext', 'cpp', version : '0.0.1', license: 'MIT', default_options : ['cpp_std=c++23'])
 
 # Add Boost dependency
-boost_dep = dependency('boost', modules: ['system', 'thread'])
+boost_dep = dependency('boost')
 
 entt_ext_sources = [  
   'include/entt_ext/ecs.hpp',
