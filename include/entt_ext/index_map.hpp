@@ -1,5 +1,6 @@
 #pragma once
 
+#include <initializer_list>
 #include <iterator>
 #include <unordered_map>
 #include <vector>
@@ -9,6 +10,18 @@ namespace entt_ext {
 template <typename K, typename V, typename Tag = void>
 class index_map {
 public:
+  // Default constructor
+  index_map() = default;
+
+  // Initializer list constructor
+  index_map(std::initializer_list<std::pair<K, V>> init) {
+    for (const auto& pair : init) {
+      size_t index             = elements.size();
+      key_to_index[pair.first] = index;
+      elements.emplace_back(pair.first, pair.second);
+    }
+  }
+
   // Nested iterator class
   class iterator {
   public:
@@ -99,25 +112,25 @@ public:
 
   // Access element by key, inserting a default if the key is not present
   V& operator[](const K& key) {
-    auto it = index_map.find(key);
-    if (it != index_map.end()) {
+    auto it = key_to_index.find(key);
+    if (it != key_to_index.end()) {
       return elements[it->second].second;
     }
-    size_t index   = elements.size();
-    index_map[key] = index;
+    size_t index      = elements.size();
+    key_to_index[key] = index;
     elements.emplace_back(key, V{});
     return elements.back().second;
   }
 
   // Access element by key (const version)
   const V& operator[](const K& key) const {
-    return elements.at(index_map.at(key)).second;
+    return elements.at(key_to_index.at(key)).second;
   }
 
   // Find an element by key and return an iterator
   iterator find(const K& key) {
-    auto it = index_map.find(key);
-    if (it != index_map.end()) {
+    auto it = key_to_index.find(key);
+    if (it != key_to_index.end()) {
       return iterator(elements.begin() + it->second);
     }
     return end();
@@ -125,8 +138,8 @@ public:
 
   // Find an element by key and return a const_iterator
   const_iterator find(const K& key) const {
-    auto it = index_map.find(key);
-    if (it != index_map.end()) {
+    auto it = key_to_index.find(key);
+    if (it != key_to_index.end()) {
       return const_iterator(elements.begin() + it->second);
     }
     return end();
@@ -134,18 +147,18 @@ public:
 
   // Remove an element by key while maintaining order
   bool erase(const K& key) {
-    auto it = index_map.find(key);
-    if (it == index_map.end()) {
+    auto it = key_to_index.find(key);
+    if (it == key_to_index.end()) {
       return false; // Key not found
     }
 
     size_t index = it->second;
-    index_map.erase(it);
+    key_to_index.erase(it);
 
     // If it's not the last element, swap it with the last to keep order
     if (index != elements.size() - 1) {
       std::swap(elements[index], elements.back());
-      index_map[elements[index].first] = index; // Update index of swapped element
+      key_to_index[elements[index].first] = index; // Update index of swapped element
     }
 
     elements.pop_back(); // Remove the last element (which is now redundant)
@@ -155,7 +168,7 @@ public:
   // Clear all elements
   void clear() {
     elements.clear();
-    index_map.clear();
+    key_to_index.clear();
   }
 
   // Iterators for key-value pairs
@@ -185,12 +198,12 @@ public:
 
   // Insert a new element by key and value
   V& emplace(const K& key, V&& value) {
-    auto it = index_map.find(key);
-    if (it != index_map.end()) {
+    auto it = key_to_index.find(key);
+    if (it != key_to_index.end()) {
       return elements[it->second].second;
     }
-    size_t index   = elements.size();
-    index_map[key] = index;
+    size_t index      = elements.size();
+    key_to_index[key] = index;
     elements.emplace_back(key, std::move(value));
     return elements.back().second;
   }
@@ -206,7 +219,7 @@ public:
       return;
     }
     K last_key = elements.back().first;
-    index_map.erase(last_key);
+    key_to_index.erase(last_key);
     elements.pop_back();
   }
 
@@ -216,7 +229,7 @@ public:
   }
 
 private:
-  std::vector<std::pair<K, V>>  elements;  // Stores keys and values in insertion order
-  std::unordered_map<K, size_t> index_map; // Maps keys to indices in the vector
+  std::vector<std::pair<K, V>>  elements;     // Stores keys and values in insertion order
+  std::unordered_map<K, size_t> key_to_index; // Maps keys to indices in the vector
 };
 } // namespace entt_ext
