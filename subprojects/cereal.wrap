@@ -1,0 +1,11 @@
+[wrap-git]
+directory = cereal
+url = https://github.com/USCiLab/cereal.git
+revision = master
+
+diff_files = cereal.patch
+patch_filename = cereal.tar.gz
+
+[provide]
+cereal = cereal_dep
+
