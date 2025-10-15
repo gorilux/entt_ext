@@ -55,25 +55,6 @@ struct persistent_data_model {
   }
 };
 
-template <typename... ComponentsT>
-struct settings_graph {
-
-  template <typename ArchiveT>
-  static asio::awaitable<void> load(ArchiveT& archive, entt_ext::ecs& ecs) {
-    co_await ecs.load_graph_snapshot<ArchiveT, ComponentsT...>(archive);
-  }
-
-  template <typename ArchiveT>
-  static asio::awaitable<void> save(ArchiveT& archive, entt_ext::ecs const& ecs) {
-    co_await ecs.save_graph_snapshot<ArchiveT, ComponentsT...>(archive);
-  }
-
-  template <typename ArchiveT>
-  static asio::awaitable<bool> merge(ArchiveT& archive, entt_ext::ecs& ecs) {
-    co_return co_await ecs.merge_graph_snapshot<ArchiveT, ComponentsT...>(archive);
-  }
-};
-
 template <int base_version, typename... SettingsT>
 struct settings_collection {
 

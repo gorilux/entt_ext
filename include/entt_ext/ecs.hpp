@@ -2,9 +2,6 @@
 
 #include "core.hpp"
 #include "ecs_fwd.hpp"
-#ifndef __EMSCRIPTEN__
-#include "nodes.hpp"
-#endif
 
 #include "index_map.hpp"
 #include "index_set.hpp"
@@ -19,6 +16,7 @@
 #include <entt/graph/adjacency_matrix.hpp>
 
 #include <chrono>
+#include <coroutine>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -50,15 +48,16 @@ struct state_persistance_header {
 using handler_id = size_t;
 
 template <typename Type, typename EcsT>
-class component {
+class component_observer {
 
-  using handler_type = std::function<void(EcsT&, entt_ext::entity, Type&)>;
+  using handler_type       = std::function<void(EcsT&, entt_ext::entity, Type&)>;
+  using async_handler_type = std::function<asio::awaitable<void>(EcsT&, entt_ext::entity, Type&)>;
 
 public:
-  component(EcsT& ecs, entt_ext::entity entt) {
+  component_observer(EcsT& ecs, entt_ext::entity entt) {
   }
 
-  ~component() = default;
+  ~component_observer() = default;
 
   std::string_view name() const {
     return type_name<Type>();
@@ -67,27 +66,43 @@ public:
   template <typename FuncT>
   handler_id on_construct(FuncT&& func) {
     auto id = next_handler_id++;
-    on_construct_handlers.emplace(id, func);
+    if constexpr (std::is_same_v<std::invoke_result_t<FuncT, EcsT&, entt_ext::entity, Type&>, asio::awaitable<void>>) {
+      on_construct_async_handlers.emplace(id, func);
+    } else {
+      on_construct_handlers.emplace(id, func);
+    }
     return id;
   }
 
   template <typename FuncT>
   handler_id on_destroy(FuncT&& func) {
     auto id = next_handler_id++;
-    on_destroy_handlers.emplace(id, func);
+    if constexpr (std::is_same_v<std::invoke_result_t<FuncT, EcsT&, entt_ext::entity, Type&>, asio::awaitable<void>>) {
+      on_destroy_async_handlers.emplace(id, func);
+    } else {
+      on_destroy_handlers.emplace(id, func);
+    }
     return id;
   }
 
   template <typename FuncT>
   handler_id on_update(FuncT&& func) {
     auto id = next_handler_id++;
-    on_update_handlers.emplace(id, func);
+    if constexpr (std::is_same_v<std::invoke_result_t<FuncT, EcsT&, entt_ext::entity, Type&>, asio::awaitable<void>>) {
+      on_update_async_handlers.emplace(id, func);
+    } else {
+      on_update_handlers.emplace(id, func);
+    }
     return id;
   }
 
   bool on_construct_disconnect(handler_id id) {
     if (auto it = on_construct_handlers.find(id); it != on_construct_handlers.end()) {
       on_construct_handlers.erase(it->first);
+      return true;
+    }
+    if (auto it = on_construct_async_handlers.find(id); it != on_construct_async_handlers.end()) {
+      on_construct_async_handlers.erase(it->first);
       return true;
     }
     return false;
@@ -98,12 +113,20 @@ public:
       on_destroy_handlers.erase(it->first);
       return true;
     }
+    if (auto it = on_destroy_async_handlers.find(id); it != on_destroy_async_handlers.end()) {
+      on_destroy_async_handlers.erase(it->first);
+      return true;
+    }
     return false;
   }
 
   bool on_update_disconnect(handler_id id) {
     if (auto it = on_update_handlers.find(id); it != on_update_handlers.end()) {
       on_update_handlers.erase(it->first);
+      return true;
+    }
+    if (auto it = on_update_async_handlers.find(id); it != on_update_async_handlers.end()) {
+      on_update_async_handlers.erase(it->first);
       return true;
     }
     return false;
@@ -120,6 +143,18 @@ public:
         handler(ecs, entt, t);
       }
     }
+
+    // Handle async handlers by posting them to the ECS's IO context
+    for (auto& [id, handler] : on_construct_async_handlers) {
+      ecs.defer([handler, entt](EcsT& ecs_ref) -> asio::awaitable<void> {
+        if constexpr (entt::component_traits<Type>::page_size > 0u) {
+          co_await handler(ecs_ref, entt, ecs_ref.template get<Type>(entt));
+        } else {
+          Type t;
+          co_await handler(ecs_ref, entt, t);
+        }
+      });
+    }
   }
 
   void dispatch_on_destroy(EcsT& ecs, entt_ext::entity entt) {
@@ -132,6 +167,18 @@ public:
         Type t;
         handler(ecs, entt, t);
       }
+    }
+
+    // Handle async handlers by posting them to the ECS's IO context
+    for (auto& [id, handler] : on_destroy_async_handlers) {
+      ecs.defer([handler, entt](EcsT& ecs_ref) -> asio::awaitable<void> {
+        if constexpr (entt::component_traits<Type>::page_size > 0u) {
+          co_await handler(ecs_ref, entt, ecs_ref.template get<Type>(entt));
+        } else {
+          Type t;
+          co_await handler(ecs_ref, entt, t);
+        }
+      });
     }
   }
 
@@ -146,13 +193,28 @@ public:
         handler(ecs, entt, t);
       }
     }
+
+    // Handle async handlers by posting them to the ECS's IO context
+    for (auto& [id, handler] : on_update_async_handlers) {
+      ecs.defer([handler, entt](EcsT& ecs_ref) -> asio::awaitable<void> {
+        if constexpr (entt::component_traits<Type>::page_size > 0u) {
+          co_await handler(ecs_ref, entt, ecs_ref.template get<Type>(entt));
+        } else {
+          Type t;
+          co_await handler(ecs_ref, entt, t);
+        }
+      });
+    }
   }
 
 private:
-  handler_id                          next_handler_id = 0;
-  index_map<handler_id, handler_type> on_construct_handlers;
-  index_map<handler_id, handler_type> on_destroy_handlers;
-  index_map<handler_id, handler_type> on_update_handlers;
+  handler_id                                next_handler_id = 0;
+  index_map<handler_id, handler_type>       on_construct_handlers;
+  index_map<handler_id, handler_type>       on_destroy_handlers;
+  index_map<handler_id, handler_type>       on_update_handlers;
+  index_map<handler_id, async_handler_type> on_construct_async_handlers;
+  index_map<handler_id, async_handler_type> on_destroy_async_handlers;
+  index_map<handler_id, async_handler_type> on_update_async_handlers;
 };
 
 template <typename Type>
@@ -339,13 +401,14 @@ public:
   version_type destroy(const entity_type entt, const version_type version);
 
   template <typename Type, typename... ArgsT>
-  decltype(auto) component(ArgsT&&... args);
+  decltype(auto) component_observer(ArgsT&&... args);
 
   template <typename Type, typename... Args>
   decltype(auto) emplace(const entity_type entt, Args&&... args);
 
   template <typename Type, typename... Args>
-  auto emplace_if_not_exists(const entity_type entt, Args&&... args) -> decltype(entt::component_traits<Type>::page_size > 0u, std::pair<Type&, bool>{}) {
+  auto emplace_if_not_exists(const entity_type entt, Args&&... args)
+      -> decltype(entt::component_traits<Type>::page_size > 0u, std::pair<Type&, bool>{}) {
     if (auto* component = try_get<Type>(entt); component) {
       return std::make_pair(std::ref(*component), false);
     }
@@ -364,7 +427,10 @@ public:
   template <typename Type, typename It>
   void insert(It first, It last, const Type& value = {});
 
-  template <typename Type, typename EIt, typename CIt, typename = std::enable_if_t<std::is_same_v<typename std::iterator_traits<CIt>::value_type, Type>>>
+  template <typename Type,
+            typename EIt,
+            typename CIt,
+            typename = std::enable_if_t<std::is_same_v<typename std::iterator_traits<CIt>::value_type, Type>>>
   void insert(EIt first, EIt last, CIt from);
 
   template <typename Type, typename... Args>
@@ -532,21 +598,21 @@ public:
 
   template <typename Type>
   void dispatch_on_construct(registry_type& registry, entt_ext::entity entt) {
-    for (auto [_, component] : registry.template view<entt_ext::component<Type, self_type>>().each()) {
+    for (auto [_, component] : registry.template view<entt_ext::component_observer<Type, self_type>>().each()) {
       component.dispatch_on_construct(*this, entt);
     }
   }
 
   template <typename Type>
   void dispatch_on_destroy(registry_type& registry, entt_ext::entity entt) {
-    for (auto [_, component] : registry.template view<entt_ext::component<Type, self_type>>().each()) {
+    for (auto [_, component] : registry.template view<entt_ext::component_observer<Type, self_type>>().each()) {
       component.dispatch_on_destroy(*this, entt);
     }
   }
 
   template <typename Type>
   void dispatch_on_update(registry_type& registry, entt_ext::entity entt) {
-    for (auto [_, component] : registry.template view<entt_ext::component<Type, self_type>>().each()) {
+    for (auto [_, component] : registry.template view<entt_ext::component_observer<Type, self_type>>().each()) {
       component.dispatch_on_update(*this, entt);
     }
   }
@@ -644,7 +710,7 @@ public:
   template <typename FuncT>
   void defer(FuncT&& func) {
     asio::post(main_io_context(), [func = std::move(func), this]() mutable {
-      if constexpr (std::is_same_v<return_type_t<FuncT>, asio::awaitable<void>>) {
+      if constexpr (std::is_same_v<std::invoke_result_t<FuncT, entt_ext::ecs&>, asio::awaitable<void>>) {
         m_defered_tasks.push_back(std::forward<FuncT>(func));
       } else {
         m_defered_tasks.push_back([func = std::move(func)](entt_ext::ecs& ecs) -> asio::awaitable<void> {
@@ -713,67 +779,6 @@ public:
         asio::use_awaitable);
   }
 
-#ifndef __EMSCRIPTEN__
-  auto graph() -> entt_ext::graph<self_type>&;
-  auto graph() const -> const entt_ext::graph<self_type>&;
-
-  template <typename ArchiveT, typename... ComponentsT>
-  asio::awaitable<void> load_graph_snapshot(ArchiveT& ar) {
-
-    auto exectuor = co_await asio::this_coro::executor;
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [&ar, &exectuor, this](auto&& self) {
-          asio::post(exectuor, [self = std::move(self), &ar, &exectuor, this]() mutable {
-            {
-              entt::snapshot_loader{m_registry}.get<entt_ext::entity>(ar).template get<node_descriptor>(ar).template get<pin_descriptor>(ar);
-              graph().load_snapshot(ar);
-              (entt::snapshot_loader{m_registry}.template get<ComponentsT>(ar), ...);
-            }
-            self.complete();
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename ArchiveT, typename... ComponentsT>
-  asio::awaitable<void> save_graph_snapshot(ArchiveT& ar) const {
-    auto exectuor = co_await asio::this_coro::executor;
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [&ar, &exectuor, this](auto&& self) {
-          asio::post(exectuor, [self = std::move(self), &ar, &exectuor, this]() mutable {
-            {
-              entt::snapshot{m_registry}.get<entt_ext::entity>(ar).template get<node_descriptor>(ar).template get<pin_descriptor>(ar);
-              graph().save_snapshot(ar);
-              (entt::snapshot{m_registry}.template get<ComponentsT>(ar), ...);
-            }
-            self.complete();
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename ArchiveT, typename... ComponentsT>
-  asio::awaitable<bool> merge_graph_snapshot(ArchiveT& ar) {
-    auto exectuor = co_await asio::this_coro::executor;
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(bool)>(
-        [&ar, &exectuor, this](auto&& self) {
-          asio::post(exectuor, [self = std::move(self), &ar, &exectuor, this]() mutable {
-            {
-              m_continuous_loader.get<entt_ext::entity>(ar).template get<node_descriptor>(ar).template get<pin_descriptor>(ar);
-              graph().load_snapshot(ar);
-              graph().remap(m_continuous_loader);
-              (m_continuous_loader.template get<ComponentsT>(ar), ...);
-
-              m_continuous_loader.orphans();
-              //(details::remap_relationships<ComponentsT>(m_continuous_loader, *this), ...);
-            }
-            self.complete(true);
-          });
-        },
-        asio::use_awaitable);
-  }
-#endif
-
   template <typename ArchiveT, typename... ComponentsT>
   asio::awaitable<bool> merge_snapshot(ArchiveT& ar) {
     auto exectuor = co_await asio::this_coro::executor;
@@ -793,10 +798,20 @@ public:
         asio::use_awaitable);
   }
 
-  auto create_async() -> asio::awaitable<entity_type>;
+  inline auto create_async() -> asio::awaitable<entity_type> {
+    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(entity_type)>(
+        [this](auto&& self) {
+          asio::post(main_io_context(), [self = std::move(self), this]() mutable {
+            self.complete(create());
+          });
+        },
+        asio::use_awaitable);
+  }
 
   template <typename Type, typename... Args>
-  auto emplace_async(entity_type entt, Args&&... args) -> std::enable_if_t<!std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace<Type>(entt, std::forward<Args>(args)...))>>, asio::awaitable<std::reference_wrapper<Type>>> {
+  auto emplace_async(entity_type entt, Args&&... args) -> std::enable_if_t<
+      !std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace<Type>(entt, std::forward<Args>(args)...))>>,
+      asio::awaitable<std::reference_wrapper<Type>>> {
     co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(std::reference_wrapper<Type>)>(
         [entt, this, ... args = std::forward<Args>(args)](auto&& self) mutable {
           asio::post(main_io_context(), [self = std::move(self), entt, this, ... args = std::forward<Args>(args)]() mutable {
@@ -807,7 +822,9 @@ public:
   }
 
   template <typename Type, typename... Args>
-  auto emplace_async(entity_type entt, Args&&... args) -> std::enable_if_t<std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace<Type>(entt, std::forward<Args>(args)...))>>, asio::awaitable<void>> {
+  auto emplace_async(entity_type entt, Args&&... args)
+      -> std::enable_if_t<std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace<Type>(entt, std::forward<Args>(args)...))>>,
+                          asio::awaitable<void>> {
     co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
         [entt, this, ... args = std::move(args)](auto&& self) {
           asio::post(main_io_context(), [self = std::move(self), entt, this, ... args = move(args)]() mutable {
@@ -819,7 +836,9 @@ public:
   }
 
   template <typename Type, typename... Args>
-  auto emplace_if_not_exists_async(entity_type entt, Args&&... args) -> std::enable_if_t<!std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace_if_not_exists<Type>(entt, std::forward<Args>(args)...))>>, asio::awaitable<void>> {
+  auto emplace_if_not_exists_async(entity_type entt, Args&&... args) -> std::enable_if_t<
+      !std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace_if_not_exists<Type>(entt, std::forward<Args>(args)...))>>,
+      asio::awaitable<void>> {
     co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
         [entt, this, ... args = std::forward<Args>(args)](auto&& self) mutable {
           asio::post(main_io_context(), [self = std::move(self), entt, this, ... args = std::forward<Args>(args)]() mutable {
@@ -831,7 +850,9 @@ public:
   }
 
   template <typename Type>
-  auto get_async(entity_type entt) const -> std::enable_if_t<!std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template get<Type>(entt))>>, asio::awaitable<std::reference_wrapper<Type>>> {
+  auto get_async(entity_type entt) const
+      -> std::enable_if_t<!std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template get<Type>(entt))>>,
+                          asio::awaitable<std::reference_wrapper<Type>>> {
     co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(std::reference_wrapper<Type>)>(
         [entt, this](auto&& self) {
           asio::post(const_cast<ecs*>(this)->main_io_context(), [self = std::move(self), entt, this]() mutable {
@@ -864,7 +885,9 @@ public:
   }
 
   template <typename Type, typename... Args>
-  auto emplace_or_replace_async(entity_type entt, Args... args) -> std::enable_if_t<!std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace_or_replace<Type>(entt, std::forward<Args>(args)...))>>, asio::awaitable<std::reference_wrapper<Type>>> {
+  auto emplace_or_replace_async(entity_type entt, Args... args) -> std::enable_if_t<
+      !std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace_or_replace<Type>(entt, std::forward<Args>(args)...))>>,
+      asio::awaitable<std::reference_wrapper<Type>>> {
     co_await asio::this_coro::executor;
 
     co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(std::reference_wrapper<Type>)>(
@@ -877,11 +900,42 @@ public:
   }
 
   template <typename Type, typename... Args>
-  auto emplace_or_replace_async(entity_type entt, Args&&... args) -> std::enable_if_t<std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace_or_replace<Type>(entt, std::forward<Args>(args)...))>>, asio::awaitable<void>> {
+  auto emplace_or_replace_async(entity_type entt, Args&&... args) -> std::enable_if_t<
+      std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace_or_replace<Type>(entt, std::forward<Args>(args)...))>>,
+      asio::awaitable<void>> {
     co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
         [entt, this, args...](auto&& self) {
           asio::post(main_io_context(), [self = std::move(self), entt, this, args...]() mutable {
             emplace_or_replace<Type>(entt, args...);
+            self.complete();
+          });
+        },
+        asio::use_awaitable);
+  }
+
+  template <typename Type, typename... Args>
+  auto replace_async(entity_type entt, Args... args) -> std::enable_if_t<
+      !std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template replace<Type>(entt, std::forward<Args>(args)...))>>,
+      asio::awaitable<std::reference_wrapper<Type>>> {
+    co_await asio::this_coro::executor;
+
+    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(std::reference_wrapper<Type>)>(
+        [entt, this, args...](auto&& self) {
+          asio::post(main_io_context(), [self = std::move(self), entt, this, args...]() mutable {
+            self.complete(std::ref(replace<Type>(entt, args...)));
+          });
+        },
+        asio::use_awaitable);
+  }
+
+  template <typename Type, typename... Args>
+  auto replace_async(entity_type entt, Args&&... args)
+      -> std::enable_if_t<std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template replace<Type>(entt, std::forward<Args>(args)...))>>,
+                          asio::awaitable<void>> {
+    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
+        [entt, this, args...](auto&& self) {
+          asio::post(main_io_context(), [self = std::move(self), entt, this, args...]() mutable {
+            replace<Type>(entt, args...);
             self.complete();
           });
         },
@@ -909,9 +963,6 @@ private:
   entt_ext::entity        m_concurrent_entity = entt_ext::null;
   entt::continuous_loader m_continuous_loader;
 
-#ifndef __EMSCRIPTEN__
-  entt_ext::graph<self_type> m_graph;
-#endif
   std::vector<std::function<asio::awaitable<void>(entt_ext::ecs&)>> m_defered_tasks;
   bool                                                              m_running = true;
 };
@@ -952,8 +1003,8 @@ inline auto ecs::system() -> system_builder<entt::get_t<ComponentsT...>, entt::e
 
 // Now implement the ecs::component method after the class definition
 template <typename Type, typename... ArgsT>
-inline decltype(auto) ecs::component(ArgsT&&... args) {
-  using component_type = entt_ext::component<Type, self_type>;
+inline decltype(auto) ecs::component_observer(ArgsT&&... args) {
+  using component_type = entt_ext::component_observer<Type, self_type>;
 
   auto view = m_registry.template view<component_type>();
   if (view.begin() == view.end()) {
@@ -971,31 +1022,31 @@ inline decltype(auto) ecs::component(ArgsT&&... args) {
 
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::emplace(const entity_type entt, Args&&... args) {
-  component<Type>();
+  component_observer<Type>();
   return m_registry.template emplace<Type>(entt, std::forward<Args>(args)...);
 }
 
 template <typename Type, typename It>
 inline void ecs::insert(It first, It last, const Type& value) {
-  component<Type>();
+  component_observer<Type>();
   return m_registry.template insert<Type>(std::move(first), std::move(last), value);
 }
 
 template <typename Type, typename EIt, typename CIt, typename>
 inline void ecs::insert(EIt first, EIt last, CIt from) {
-  component<Type>();
+  component_observer<Type>();
   m_registry.template insert<Type>(first, last, from);
 }
 
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::emplace_or_replace(const entity_type entt, Args&&... args) {
-  component<Type>();
+  component_observer<Type>();
   return m_registry.template emplace_or_replace<Type>(entt, std::forward<Args>(args)...);
 }
 
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::get_or_emplace(const entity_type entt, Args&&... args) {
-  component<Type>();
+  component_observer<Type>();
   return m_registry.template get_or_emplace<Type>(entt, std::forward<Args>(args)...);
 }
 inline void ecs::delete_later(const entity_type entt) {

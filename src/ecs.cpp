@@ -22,29 +22,15 @@ ecs::ecs(std::string const& persistance_filename)
 
 ecs::ecs(const allocator_type& allocator, std::string const& persistance_filename)
   : m_registry{allocator}
-  , m_continuous_loader{m_registry}
-#ifndef __EMSCRIPTEN__
-  , m_graph{*this}
-#endif
-{
+  , m_continuous_loader{m_registry} {
   load_state(persistance_filename);
-#ifndef __EMSCRIPTEN__
-  m_graph.init();
-#endif
 }
 
 ecs::ecs(ecs&& other) noexcept
   : m_registry{std::move(other.m_registry)}
   , m_global_entity{std::move(other.m_global_entity)}
   , m_concurrent_entity(other.m_concurrent_entity)
-  , m_continuous_loader{std::move(other.m_continuous_loader)}
-#ifndef __EMSCRIPTEN__
-  , m_graph{*this}
-#endif
-{
-#ifndef __EMSCRIPTEN__
-  m_graph.init();
-#endif
+  , m_continuous_loader{std::move(other.m_continuous_loader)} {
 }
 
 ecs& ecs::operator=(ecs&& other) noexcept {
@@ -53,9 +39,6 @@ ecs& ecs::operator=(ecs&& other) noexcept {
     m_global_entity     = std::move(other.m_global_entity);
     m_concurrent_entity = std::move(other.m_concurrent_entity);
     m_continuous_loader = std::move(other.m_continuous_loader);
-#ifndef __EMSCRIPTEN__
-    m_graph.init();
-#endif
   }
   return *this;
 }
@@ -83,16 +66,6 @@ auto ecs::main_io_context() -> asio::io_context& {
 auto ecs::concurrent_io_context() -> asio::io_context& {
   return get<asio::io_context>(m_concurrent_entity);
 }
-
-#ifndef __EMSCRIPTEN__
-auto ecs::graph() -> entt_ext::graph<self_type>& {
-  return m_graph;
-}
-
-auto ecs::graph() const -> const entt_ext::graph<self_type>& {
-  return m_graph;
-}
-#endif
 
 void ecs::run(int timeout_ms, size_t concurrency) {
   auto& main_io_ctx = main_io_context();
@@ -171,40 +144,56 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
 
   auto outstanding_systems = view<entt_ext::system>(entt::exclude<running<system_tag>, run_once_tag>);
 
+  auto wait_for_systems_to_finish = [&]() -> asio::awaitable<void> {
+    auto systems_running = view<running<system_tag>>();
+    auto each_running    = view<running<each_tag>>();
+
+    while (systems_running.begin() != systems_running.end()) {
+      timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
+      co_await timer.async_wait(use_nothrow_awaitable);
+      // spdlog::debug("waiting for systems to finish");
+    }
+
+    while (each_running.begin() != each_running.end()) {
+      timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
+      co_await timer.async_wait(use_nothrow_awaitable);
+      // spdlog::debug("waiting for parallel each to finish");
+    }
+    co_return;
+  };
+
   while (m_running) {
     timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
 
+    auto last_stage = stage::val::input;
     for (auto [entt, sys] : outstanding_systems.each()) {
 
       auto const diff_time = std::chrono::high_resolution_clock::now() - sys.last_invoke;
       auto const elapsed   = (std::chrono::duration_cast<std::chrono::milliseconds>(diff_time).count() / 1000.0);
       try {
         if (elapsed >= sys.interval && co_await sys.run(sys, *this, elapsed)) {
-          sys.last_invoke = std::chrono::high_resolution_clock::now();
+          sys.last_invoke    = std::chrono::high_resolution_clock::now();
+          auto current_stage = static_cast<stage::val>((sys.stage / 1000) * 1000);
+          if (current_stage != last_stage && m_defered_tasks.size() > 0) {
+
+            co_await wait_for_systems_to_finish();
+            for (auto& task : m_defered_tasks) {
+              try {
+                co_await task(*this);
+              } catch (std::exception const& e) {
+                //  spdlog::error("run_update_loop: {}", e.what());
+              }
+            }
+            m_defered_tasks.clear();
+          }
+          last_stage = current_stage;
         }
+
       } catch (std::exception const& e) {
         // spdlog::error("run_update_loop: {}", e.what());
         sys.last_invoke = std::chrono::high_resolution_clock::now();
       }
     }
-
-    auto wait_for_systems_to_finish = [&]() -> asio::awaitable<void> {
-      auto systems_running = view<running<system_tag>>();
-      auto each_running    = view<running<each_tag>>();
-
-      while (systems_running.begin() != systems_running.end()) {
-        timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
-        co_await timer.async_wait(use_nothrow_awaitable);
-        // spdlog::debug("waiting for systems to finish");
-      }
-
-      while (each_running.begin() != each_running.end()) {
-        timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
-        co_await timer.async_wait(use_nothrow_awaitable);
-        // spdlog::debug("waiting for parallel each to finish");
-      }
-      co_return;
-    };
 
     // Need to sync all systems before we can delete any entities
     auto entities_pending_delete = view<entt_ext::delete_later>();
@@ -262,7 +251,11 @@ void ecs::save_state() {
   if (auto settings_filename_ptr = try_get<settings_filename>(m_global_entity); settings_filename_ptr) {
     std::ofstream                       ofs(settings_filename_ptr->filename, std::ios::binary);
     cereal::PortableBinaryOutputArchive ar(ofs);
-    entt::snapshot{m_registry}.get<entt_ext::entity>(ar).template get<state_persistance_header>(ar).template get<main_context_tag>(ar).template get<concurrent_context_tag>(ar);
+    entt::snapshot{m_registry}
+        .get<entt_ext::entity>(ar)
+        .template get<state_persistance_header>(ar)
+        .template get<main_context_tag>(ar)
+        .template get<concurrent_context_tag>(ar);
   }
 }
 
@@ -274,7 +267,10 @@ void ecs::load_state(std::string const& filename) {
       std::ifstream    ifs(filename, std::ios::binary);
       InputArchiveType ar(ifs);
       // entt::snapshot_loader{m_registry}
-      m_continuous_loader.get<entt_ext::entity>(ar).template get<state_persistance_header>(ar).template get<main_context_tag>(ar).template get<concurrent_context_tag>(ar);
+      m_continuous_loader.get<entt_ext::entity>(ar)
+          .template get<state_persistance_header>(ar)
+          .template get<main_context_tag>(ar)
+          .template get<concurrent_context_tag>(ar);
     } catch (std::exception const& ex) {
       throw;
     }

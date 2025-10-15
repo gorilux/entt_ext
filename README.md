@@ -157,23 +157,23 @@ struct health {
 };
 
 void setup_component_events(entt_ext::ecs& ecs) {
-    // Register component and set up event handlers
-    auto& health_component = ecs.component<health>();
+    // Register component observer and set up event handlers
+    auto& health_observer = ecs.component_observer<health>();
 
     // Handle component construction
-    health_component.on_construct([](entt_ext::ecs& ecs, entt_ext::entity entity, health& h) {
+    health_observer.on_construct([](entt_ext::ecs& ecs, entt_ext::entity entity, health& h) {
         std::cout << "Health component created for entity " << static_cast<uint32_t>(entity) << "\n";
         h.current = h.maximum; // Initialize to full health
     });
 
     // Handle component destruction
-    health_component.on_destroy([](entt_ext::ecs& ecs, entt_ext::entity entity, health& h) {
+    health_observer.on_destroy([](entt_ext::ecs& ecs, entt_ext::entity entity, health& h) {
         std::cout << "Entity " << static_cast<uint32_t>(entity) << " died with "
                   << h.current << " health remaining\n";
     });
 
     // Handle component updates
-    health_component.on_update([](entt_ext::ecs& ecs, entt_ext::entity entity, health& h) {
+    health_observer.on_update([](entt_ext::ecs& ecs, entt_ext::entity entity, health& h) {
         if (h.current <= 0) {
             std::cout << "Entity " << static_cast<uint32_t>(entity) << " has died!\n";
             ecs.delete_later(entity);

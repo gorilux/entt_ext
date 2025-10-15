@@ -6,7 +6,6 @@ boost_dep = dependency('boost')
 entt_ext_sources = [  
   'include/entt_ext/ecs.hpp',
   'include/entt_ext/core.hpp',
-  'include/entt_ext/nodes.hpp',
   'include/entt_ext/settings.hpp',
   'src/ecs.cpp'
 ]
@@ -89,17 +88,8 @@ set_variable('entt_ext_dep', entt_ext_dep)
 # Unit Tests
 # ==========
 
-if not meson.is_subproject() and system != 'emscripten'
-#   add_languages('cpp')
-#  subdir('test')
-
-#   test('all_tests',
-#     executable(
-#       'run_tests',
-#       files(project_test_files),
-#       dependencies : [grlx_dep, test_dep],
-#       install : false
-#     )
-#   )
-endif
+# if system != 'emscripten'
+#   # Enable testing
+#   subdir('test')
+# endif
 
