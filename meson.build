@@ -18,6 +18,9 @@ system = host_machine.system()
 cereal_project = subproject('cereal')
 cereal_dep = cereal_project.get_variable('cereal_dep')
 
+grlx_rpc_project = subproject('grlx-rpc')
+grlx_rpc_dep = grlx_rpc_project.get_variable('grlx_rpc_dep')
+
 # libgrlx_project = subproject('grlx')
 # grlx_dep  = libgrlx_project.get_variable('grlx_dep')
 
@@ -32,7 +35,8 @@ entt_proj_dep = entt_proj.dependency('EnTT')
 entt_ext_deps = [
   cereal_dep,    
   entt_proj_dep,
-  boost_dep
+  boost_dep,
+  grlx_rpc_dep
 ]
 
 if system == 'emscripten'
