@@ -168,6 +168,7 @@ public:
                     type_name<ComponentT>(),
                     static_cast<int>(request.target_entity),
                     std::chrono::duration_cast<std::chrono::milliseconds>(request.sync_version.time_since_epoch()).count());
+
       auto&  client_state  = get_or_create_client_state(request.session_id);
       entity client_entity = request.target_entity;
 
@@ -177,12 +178,12 @@ public:
         server_entity = *existing_server;
         if (!ecs_.valid(server_entity)) {
           // Server entity was destroyed, create new one
-          server_entity = co_await ecs_.create_async();
+          server_entity = ecs_.create();
           client_state.mapping.add_mapping(client_entity, server_entity);
         }
       } else {
         // Create new server entity using ECS
-        server_entity = co_await ecs_.create_async();
+        server_entity = ecs_.create();
         client_state.mapping.add_mapping(client_entity, server_entity);
       }
 
@@ -384,7 +385,7 @@ private:
                    ComponentT&                          component) -> asio::awaitable<void> {
               // Notify all clients about the component update
               co_await notify_component_update_to_all_clients<ComponentT>(e, sync_data.sync_version, component);
-              co_await ecs.template remove_async<local_component_changed<ComponentT>>(e);
+              co_await ecs.template remove_deferred<local_component_changed<ComponentT>>(e);
               co_return;
             },
             entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
@@ -399,9 +400,9 @@ private:
                    component_update_request<ComponentT>& request,
                    ComponentT&                           component) -> asio::awaitable<void> {
               // Notify all clients about the component update
-              co_await ecs.template replace_async<ComponentT>(e, request.component_data);
+              co_await ecs.template replace_deferred<ComponentT>(e, request.component_data);
               co_await notify_component_update_to_other_clients<ComponentT>(e, request.sync_version, component, request.session_id);
-              co_await ecs.template remove_async<component_update_request<ComponentT>>(e);
+              co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
               co_return;
             },
             entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
@@ -412,9 +413,10 @@ private:
             [this](entt_ext::ecs& ecs, entt_ext::system& self, double dt, entt_ext::entity e, component_update_request<ComponentT>& request)
                 -> asio::awaitable<void> {
               // Notify all clients about the component update
-              co_await ecs.template emplace_async<ComponentT>(e, request.component_data);
+              co_await ecs.template emplace_deferred<ComponentT>(e, request.component_data);
+
               co_await notify_component_update_to_other_clients<ComponentT>(e, request.sync_version, request.component_data, request.session_id);
-              co_await ecs.template remove_async<component_update_request<ComponentT>>(e);
+              co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
               co_return;
             },
             entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
@@ -424,9 +426,9 @@ private:
         .each(
             [this](entt_ext::ecs& ecs, entt_ext::system& self, double dt, entt_ext::entity e, component_remove_request<ComponentT>& request)
                 -> asio::awaitable<void> {
-              co_await ecs.template remove_async<ComponentT>(e);
+              co_await ecs.template remove_deferred<ComponentT>(e);
               co_await notify_component_removal_to_other_clients<ComponentT>(e, request.sync_version, request.session_id);
-              co_await ecs.template remove_async<component_remove_request<ComponentT>>(e);
+              co_await ecs.template remove_deferred<component_remove_request<ComponentT>>(e);
               co_return;
             },
             entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
@@ -437,7 +439,7 @@ private:
             [this](entt_ext::ecs& ecs, entt_ext::system& self, double dt, entt_ext::entity e, local_component_removed<ComponentT>& sync_data)
                 -> asio::awaitable<void> {
               co_await notify_component_removal_to_all_clients<ComponentT>(e, sync_data.sync_version);
-              co_await ecs.template remove_async<local_component_removed<ComponentT>>(e);
+              co_await ecs.template remove_deferred<local_component_removed<ComponentT>>(e);
               co_return;
             },
             entt_ext::run_policy_t<entt_ext::run_policy::detached>{})

@@ -80,6 +80,8 @@ public:
         co_return false;
       }
 
+      co_await request_snapshot();
+
       co_return true;
     } catch (...) {
       session_id_.clear(); // Clear session on connection failure
@@ -346,8 +348,8 @@ private:
                    component_update_request<ComponentT>& request,
                    ComponentT&                           component) -> asio::awaitable<void> {
               // Notify all clients about the component update
-              co_await ecs.template replace_async<ComponentT>(e, request.component_data);
-              co_await ecs.template remove_async<component_update_request<ComponentT>>(e);
+              co_await ecs.template replace_deferred<ComponentT>(e, request.component_data);
+              co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
               co_return;
             },
             entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
@@ -358,8 +360,8 @@ private:
             [this](entt_ext::ecs& ecs, entt_ext::system& self, double dt, entt_ext::entity e, component_update_request<ComponentT>& request)
                 -> asio::awaitable<void> {
               // Notify all clients about the component update
-              co_await ecs.template emplace_async<ComponentT>(e, request.component_data);
-              co_await ecs.template remove_async<component_update_request<ComponentT>>(e);
+              co_await ecs.template emplace_deferred<ComponentT>(e, request.component_data);
+              co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
               co_return;
             },
             entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
@@ -369,8 +371,8 @@ private:
         .each(
             [this](entt_ext::ecs& ecs, entt_ext::system& self, double dt, entt_ext::entity e, component_remove_request<ComponentT>& request)
                 -> asio::awaitable<void> {
-              co_await ecs.template remove_async<ComponentT>(e);
-              co_await ecs.template remove_async<component_remove_request<ComponentT>>(e);
+              co_await ecs.template remove_deferred<ComponentT>(e);
+              co_await ecs.template remove_deferred<component_remove_request<ComponentT>>(e);
               co_return;
             },
             entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
@@ -382,7 +384,7 @@ private:
                 -> asio::awaitable<void> {
               co_await notify_component_removal<ComponentT>(e, sync_data.sync_version);
 
-              co_await ecs.template remove_async<local_component_removed<ComponentT>>(e);
+              co_await ecs.template remove_deferred<local_component_removed<ComponentT>>(e);
               co_return;
             },
             entt_ext::run_policy_t<entt_ext::run_policy::detached>{})

@@ -3,6 +3,7 @@
 #include "core.hpp"
 #include "ecs_fwd.hpp"
 
+#include "deferred_operations.hpp"
 #include "index_map.hpp"
 #include "index_set.hpp"
 #include "return_type.hpp"
@@ -15,6 +16,8 @@
 #include <entt/entity/storage.hpp>
 #include <entt/graph/adjacency_matrix.hpp>
 
+#include <boost/asio/experimental/concurrent_channel.hpp>
+
 #include <chrono>
 #include <coroutine>
 #include <fstream>
@@ -26,6 +29,16 @@
 #include <type_traits>
 
 namespace entt_ext {
+
+// Command channel for async deferred operations
+// Define as actual class not type alias to allow forward declaration
+class command_channel
+  : public asio::experimental::concurrent_channel<asio::io_context::executor_type, void(boost::system::error_code, deferred_command)> {
+public:
+  using base_type = asio::experimental::concurrent_channel<asio::io_context::executor_type, void(boost::system::error_code, deferred_command)>;
+
+  using base_type::base_type; // Inherit constructors
+};
 
 struct state_persistance_header {
   std::uint32_t version = 0;
@@ -394,7 +407,7 @@ public:
 
   template <typename It>
   void create(It first, It last) {
-    return m_registry.create(first, last);
+    return registry_.create(first, last);
   }
 
   version_type destroy(const entity_type entt);
@@ -417,7 +430,7 @@ public:
 
   template <typename Type, typename... Args>
   auto emplace_if_not_exists(const entity_type entt, Args&&... args) -> decltype(entt::component_traits<Type>::page_size == 0u, bool{}) {
-    if (m_registry.template storage<Type>().contains(entt)) {
+    if (registry_.template storage<Type>().contains(entt)) {
       return false;
     }
     emplace<Type>(entt, std::forward<Args>(args)...);
@@ -438,63 +451,63 @@ public:
 
   template <typename Type, typename... Func>
   decltype(auto) patch(const entity_type entt, Func&&... func) {
-    return m_registry.template patch<Type>(entt, std::forward<Func>(func)...);
+    return registry_.template patch<Type>(entt, std::forward<Func>(func)...);
   }
 
   template <typename Type, typename... Args>
   decltype(auto) replace(const entity_type entt, Args&&... args) {
-    return m_registry.template replace<Type>(entt, std::forward<Args>(args)...);
+    return registry_.template replace<Type>(entt, std::forward<Args>(args)...);
   }
 
   template <typename Type, typename... Other>
   size_type remove(const entity_type entt) {
-    return m_registry.template remove<Type, Other...>(entt);
+    return registry_.template remove<Type, Other...>(entt);
   }
 
   template <typename Type, typename... Other, typename It>
   size_type remove(It first, It last) {
-    return m_registry.template remove<Type, Other...>(first, last);
+    return registry_.template remove<Type, Other...>(first, last);
   }
 
   template <typename Type, typename... Other>
   void erase(const entity_type entt) {
-    m_registry.template erase<Type, Other...>(entt);
+    registry_.template erase<Type, Other...>(entt);
   }
 
   template <typename Type, typename... Other, typename It>
   void erase(It first, It last) {
-    m_registry.template erase<Type, Other...>(first, last);
+    registry_.template erase<Type, Other...>(first, last);
   }
 
   template <typename Func>
   void erase_if(const entity_type entt, Func func) {
-    m_registry.erase_if(entt, func);
+    registry_.erase_if(entt, func);
   }
 
   template <typename... Type>
   void compact() {
-    return m_registry.template compact<Type...>();
+    return registry_.template compact<Type...>();
   }
 
   template <typename... Type>
   [[nodiscard]] bool all_of(const entity_type entt) const {
-    return m_registry.template all_of<Type...>(entt);
+    return registry_.template all_of<Type...>(entt);
   }
 
   template <typename... Type>
   [[nodiscard]] bool any_of(const entity_type entt) const {
-    return m_registry.template any_of<Type...>(entt);
+    return registry_.template any_of<Type...>(entt);
   }
 
   template <typename... Type>
   [[nodiscard]] decltype(auto) get([[maybe_unused]] const entity_type entt) const {
-    return m_registry.template get<Type...>(entt);
+    return registry_.template get<Type...>(entt);
   }
 
   /*! @copydoc get */
   template <typename... Type>
   [[nodiscard]] decltype(auto) get([[maybe_unused]] const entity_type entt) {
-    return m_registry.template get<Type...>(entt);
+    return registry_.template get<Type...>(entt);
   }
 
   template <typename Type, typename... Args>
@@ -502,98 +515,98 @@ public:
 
   template <typename... Type>
   [[nodiscard]] auto try_get([[maybe_unused]] const entity_type entt) const {
-    return m_registry.template try_get<Type...>(entt);
+    return registry_.template try_get<Type...>(entt);
   }
 
   template <typename... Type>
   [[nodiscard]] auto try_get([[maybe_unused]] const entity_type entt) {
-    return m_registry.template try_get<Type...>(entt);
+    return registry_.template try_get<Type...>(entt);
   }
 
   template <typename... Type>
   void clear() {
-    return m_registry.template clear<Type...>();
+    return registry_.template clear<Type...>();
   }
 
   [[nodiscard]] bool orphan(const entity_type entt) const {
-    return m_registry.orphan(entt);
+    return registry_.orphan(entt);
   }
 
   template <typename Type, typename... Other, typename... Exclude>
   [[nodiscard]] auto view(entt::exclude_t<Exclude...> = entt::exclude_t{}) {
-    return m_registry.template view<Type, Other...>(entt::exclude_t<Exclude...>{});
+    return registry_.template view<Type, Other...>(entt::exclude_t<Exclude...>{});
   }
 
   template <typename Type, typename... Other, typename... Exclude>
   [[nodiscard]] auto view(entt::exclude_t<Exclude...> = entt::exclude_t{}) const {
-    return m_registry.template view<Type, Other...>(entt::exclude_t<Exclude...>{});
+    return registry_.template view<Type, Other...>(entt::exclude_t<Exclude...>{});
   }
 
   template <typename... Owned, typename... Get, typename... Exclude>
   auto group(entt::get_t<Get...> = entt::get_t{}, entt::exclude_t<Exclude...> = entt::exclude_t{}) {
-    return m_registry.template group<Owned...>(entt::get_t<Get...>{}, entt::exclude_t<Exclude...>{});
+    return registry_.template group<Owned...>(entt::get_t<Get...>{}, entt::exclude_t<Exclude...>{});
   }
 
   template <typename Type, typename... ArgsT>
   decltype(auto) get_or_emplace(ArgsT&&... args) {
-    return get_or_emplace<Type>(m_global_entity, std::forward<ArgsT>(args)...);
+    return get_or_emplace<Type>(global_entity_, std::forward<ArgsT>(args)...);
   }
 
   template <typename Type>
   bool contains() const {
-    return m_registry.template any_of<Type>(m_global_entity);
+    return registry_.template any_of<Type>(global_entity_);
   }
 
   template <typename Type>
   decltype(auto) get() const {
-    return m_registry.template get<Type>(m_global_entity);
+    return registry_.template get<Type>(global_entity_);
   }
 
   template <typename Type>
   decltype(auto) get() {
-    return m_registry.template get<Type>(m_global_entity);
+    return registry_.template get<Type>(global_entity_);
   }
 
   void delete_later(const entity_type entt);
 
   size_t index(const entity_type entt) const {
-    return m_registry.template storage<entity_type>()->index(entt);
+    return registry_.template storage<entity_type>()->index(entt);
   }
 
   entity_type at(size_t pos) const {
-    return m_registry.template storage<entity_type>()->data()[pos];
+    return registry_.template storage<entity_type>()->data()[pos];
   }
 
   entt::registry& registry() {
-    return m_registry;
+    return registry_;
   }
 
   const entt::registry& registry() const {
-    return m_registry;
+    return registry_;
   }
 
   entt_ext::entity get_global_entity() const {
-    return m_global_entity;
+    return global_entity_;
   }
 
   template <typename Type, typename Compare, typename Sort = entt::std_sort, typename... Args>
   void sort(Compare compare, Sort algo = Sort{}, Args&&... args) {
-    m_registry.template sort<Type>(compare, algo, std::forward<Args>(args)...);
+    registry_.template sort<Type>(compare, algo, std::forward<Args>(args)...);
   }
 
   template <typename To, typename From>
   void sort() {
-    m_registry.template sort<To, From>();
+    registry_.template sort<To, From>();
   }
 
   template <typename Type, typename It>
   void sort_as(It first, It last) {
-    auto& storage = m_registry.template storage<Type>();
+    auto& storage = registry_.template storage<Type>();
     storage.sort_as(first, last);
   }
 
   [[nodiscard]] bool valid(const entity_type entt) const {
-    return m_registry.valid(entt);
+    return registry_.valid(entt);
   }
 
   template <typename Type>
@@ -709,36 +722,57 @@ public:
 
   template <typename FuncT>
   void defer(FuncT&& func) {
-    asio::post(main_io_context(), [func = std::move(func), this]() mutable {
-      if constexpr (std::is_same_v<std::invoke_result_t<FuncT, entt_ext::ecs&>, asio::awaitable<void>>) {
-        m_defered_tasks.push_back(std::forward<FuncT>(func));
-      } else {
-        m_defered_tasks.push_back([func = std::move(func)](entt_ext::ecs& ecs) -> asio::awaitable<void> {
-          func(ecs);
+    asio::co_spawn(
+        concurrent_io_context(),
+        [this, func = std::move(func)]() -> asio::awaitable<void> {
+          deferred_command cmd{.operation      = deferred_command::op_type::custom,
+                               .entity         = entt_ext::null,
+                               .component_type = 0,
+                               .executor       = [func = std::move(func)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
+                                 if constexpr (std::is_same_v<std::invoke_result_t<FuncT, entt_ext::ecs&>, asio::awaitable<void>>) {
+                                   co_await func(ecs_ref);
+                                   co_return;
+                                 } else {
+                                   func(ecs_ref);
+                                   co_return;
+                                 }
+                               }};
+
+          co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
           co_return;
-        });
-      }
-    });
-  }
-
-  template <typename Type, typename... Other>
-  void remove_deferred(const entity_type entt) {
-    defer([this, entt](entt_ext::ecs& ecs) {
-      ecs.template remove<Type, Other...>(entt);
-    });
-  }
-
-  template <typename Type, typename... Other, typename It>
-  void remove_deferred(It first, It last) {
-    defer([this, first, last](entt_ext::ecs& ecs) {
-      ecs.template remove<Type, Other...>(first, last);
-    });
+        },
+        asio::detached);
   }
 
   void run(int timeout_ms = 10, size_t concurrency = std::thread::hardware_concurrency());
   void stop();
   auto main_io_context() -> asio::io_context&;
+  auto main_io_context() const -> const asio::io_context&;
   auto concurrent_io_context() -> asio::io_context&;
+
+  // ============= Deferred Operations API ============
+
+  // Deferred structural operations
+  entity_type create_deferred();
+  auto        destroy_deferred(const entity_type entt) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Args>
+  auto emplace_deferred(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Args>
+  auto emplace_or_replace_deferred(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Args>
+  auto emplace_if_not_exists_deferred(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Args>
+  auto replace_deferred(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Other>
+  auto remove_deferred(const entity_type entt) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Func>
+  auto patch_deferred(const entity_type entt, Func&&... func) -> asio::awaitable<void>;
 
   template <typename... ComponentsT, typename... ExcludeT>
   auto system(entt::exclude_t<ExcludeT...>) -> system_builder<entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>;
@@ -748,14 +782,12 @@ public:
 
   template <typename ArchiveT, typename... ComponentsT>
   asio::awaitable<void> load_snapshot(ArchiveT& ar) {
-
-    auto exectuor = co_await asio::this_coro::executor;
     co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [&ar, &exectuor, this](auto&& self) {
-          asio::post(exectuor, [self = std::move(self), &ar, &exectuor, this]() mutable {
+        [&ar, this](auto&& self) {
+          asio::post(main_io_context(), [self = std::move(self), &ar, this]() mutable {
             {
-              entt::snapshot_loader{m_registry}.get<entt_ext::entity>(ar);
-              (entt::snapshot_loader{m_registry}.template get<ComponentsT>(ar), ...);
+              entt::snapshot_loader{registry_}.get<entt_ext::entity>(ar);
+              (entt::snapshot_loader{registry_}.template get<ComponentsT>(ar), ...);
             }
             self.complete();
           });
@@ -765,13 +797,12 @@ public:
 
   template <typename ArchiveT, typename... ComponentsT>
   asio::awaitable<void> save_snapshot(ArchiveT& ar) const {
-    auto exectuor = co_await asio::this_coro::executor;
     co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [&ar, &exectuor, this](auto&& self) {
-          asio::post(exectuor, [self = std::move(self), &ar, &exectuor, this]() mutable {
+        [&ar, this](auto&& self) {
+          asio::post(const_cast<asio::io_context&>(main_io_context()), [self = std::move(self), &ar, this]() mutable {
             {
-              entt::snapshot{m_registry}.get<entt_ext::entity>(ar);
-              (entt::snapshot{m_registry}.template get<ComponentsT>(ar), ...);
+              entt::snapshot{registry_}.get<entt_ext::entity>(ar);
+              (entt::snapshot{registry_}.template get<ComponentsT>(ar), ...);
             }
             self.complete();
           });
@@ -781,16 +812,15 @@ public:
 
   template <typename ArchiveT, typename... ComponentsT>
   asio::awaitable<bool> merge_snapshot(ArchiveT& ar) {
-    auto exectuor = co_await asio::this_coro::executor;
     co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(bool)>(
-        [&ar, &exectuor, this](auto&& self) {
-          asio::post(exectuor, [self = std::move(self), &ar, &exectuor, this]() mutable {
+        [&ar, this](auto&& self) {
+          asio::post(main_io_context(), [self = std::move(self), &ar, this]() mutable {
             {
-              m_continuous_loader.get<entt_ext::entity>(ar);
-              (m_continuous_loader.template get<ComponentsT>(ar), ...);
+              continuous_loader_.get<entt_ext::entity>(ar);
+              (continuous_loader_.template get<ComponentsT>(ar), ...);
 
-              m_continuous_loader.orphans();
-              //(details::remap_relationships<ComponentsT>(m_continuous_loader, *this), ...);
+              // continuous_loader_.orphans();
+              //(details::remap_relationships<ComponentsT>(continuous_loader_, *this), ...);
             }
             self.complete(true);
           });
@@ -798,149 +828,9 @@ public:
         asio::use_awaitable);
   }
 
-  inline auto create_async() -> asio::awaitable<entity_type> {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(entity_type)>(
-        [this](auto&& self) {
-          asio::post(main_io_context(), [self = std::move(self), this]() mutable {
-            self.complete(create());
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename Type, typename... Args>
-  auto emplace_async(entity_type entt, Args&&... args) -> std::enable_if_t<
-      !std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace<Type>(entt, std::forward<Args>(args)...))>>,
-      asio::awaitable<std::reference_wrapper<Type>>> {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(std::reference_wrapper<Type>)>(
-        [entt, this, ... args = std::forward<Args>(args)](auto&& self) mutable {
-          asio::post(main_io_context(), [self = std::move(self), entt, this, ... args = std::forward<Args>(args)]() mutable {
-            self.complete(std::ref(emplace<Type>(entt, std::forward<Args>(args)...)));
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename Type, typename... Args>
-  auto emplace_async(entity_type entt, Args&&... args)
-      -> std::enable_if_t<std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace<Type>(entt, std::forward<Args>(args)...))>>,
-                          asio::awaitable<void>> {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [entt, this, ... args = std::move(args)](auto&& self) {
-          asio::post(main_io_context(), [self = std::move(self), entt, this, ... args = move(args)]() mutable {
-            emplace<Type>(entt, std::forward<Args>(args)...);
-            self.complete();
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename Type, typename... Args>
-  auto emplace_if_not_exists_async(entity_type entt, Args&&... args) -> std::enable_if_t<
-      !std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace_if_not_exists<Type>(entt, std::forward<Args>(args)...))>>,
-      asio::awaitable<void>> {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [entt, this, ... args = std::forward<Args>(args)](auto&& self) mutable {
-          asio::post(main_io_context(), [self = std::move(self), entt, this, ... args = std::forward<Args>(args)]() mutable {
-            emplace_if_not_exists<Type>(entt, std::forward<Args>(args)...);
-            self.complete();
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename Type>
-  auto get_async(entity_type entt) const
-      -> std::enable_if_t<!std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template get<Type>(entt))>>,
-                          asio::awaitable<std::reference_wrapper<Type>>> {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(std::reference_wrapper<Type>)>(
-        [entt, this](auto&& self) {
-          asio::post(const_cast<ecs*>(this)->main_io_context(), [self = std::move(self), entt, this]() mutable {
-            self.complete(std::ref(get<Type>(entt)));
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename Type, typename... Args>
-  asio::awaitable<size_t> remove_async(entity_type entt) {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(size_t)>(
-        [entt, this](auto&& self) {
-          asio::post(main_io_context(), [self = std::move(self), entt, this]() mutable {
-            self.complete(remove<Type, Args...>(entt));
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename Type, typename... Other, typename It>
-  asio::awaitable<size_t> remove_async(It first, It last) {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(size_t)>(
-        [first, last, this](auto&& self) {
-          asio::post(main_io_context(), [self = std::move(self), first, last, this]() mutable {
-            self.complete(remove<Type, Other...>(first, last));
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename Type, typename... Args>
-  auto emplace_or_replace_async(entity_type entt, Args... args) -> std::enable_if_t<
-      !std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace_or_replace<Type>(entt, std::forward<Args>(args)...))>>,
-      asio::awaitable<std::reference_wrapper<Type>>> {
-    co_await asio::this_coro::executor;
-
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(std::reference_wrapper<Type>)>(
-        [entt, this, args...](auto&& self) {
-          asio::post(main_io_context(), [self = std::move(self), entt, this, args...]() mutable {
-            self.complete(std::ref(emplace_or_replace<Type>(entt, args...)));
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename Type, typename... Args>
-  auto emplace_or_replace_async(entity_type entt, Args&&... args) -> std::enable_if_t<
-      std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template emplace_or_replace<Type>(entt, std::forward<Args>(args)...))>>,
-      asio::awaitable<void>> {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [entt, this, args...](auto&& self) {
-          asio::post(main_io_context(), [self = std::move(self), entt, this, args...]() mutable {
-            emplace_or_replace<Type>(entt, args...);
-            self.complete();
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename Type, typename... Args>
-  auto replace_async(entity_type entt, Args... args) -> std::enable_if_t<
-      !std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template replace<Type>(entt, std::forward<Args>(args)...))>>,
-      asio::awaitable<std::reference_wrapper<Type>>> {
-    co_await asio::this_coro::executor;
-
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(std::reference_wrapper<Type>)>(
-        [entt, this, args...](auto&& self) {
-          asio::post(main_io_context(), [self = std::move(self), entt, this, args...]() mutable {
-            self.complete(std::ref(replace<Type>(entt, args...)));
-          });
-        },
-        asio::use_awaitable);
-  }
-
-  template <typename Type, typename... Args>
-  auto replace_async(entity_type entt, Args&&... args)
-      -> std::enable_if_t<std::is_same_v<void, std::decay_t<decltype(std::declval<ecs>().template replace<Type>(entt, std::forward<Args>(args)...))>>,
-                          asio::awaitable<void>> {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [entt, this, args...](auto&& self) {
-          asio::post(main_io_context(), [self = std::move(self), entt, this, args...]() mutable {
-            replace<Type>(entt, args...);
-            self.complete();
-          });
-        },
-        asio::use_awaitable);
-  }
+public:
+  // Channel processor coroutine (public so systems can spawn their own processors)
+  asio::awaitable<void> process_command_channel();
 
 private:
   struct main_context_tag {};
@@ -958,13 +848,14 @@ private:
   auto run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable<void>;
 
 private:
-  registry_type           m_registry;
-  entt_ext::entity        m_global_entity     = entt_ext::null;
-  entt_ext::entity        m_concurrent_entity = entt_ext::null;
-  entt::continuous_loader m_continuous_loader;
-
-  std::vector<std::function<asio::awaitable<void>(entt_ext::ecs&)>> m_defered_tasks;
-  bool                                                              m_running = true;
+  registry_type                                                     registry_;
+  entt_ext::entity                                                  global_entity_ = entt_ext::null;
+  entt::continuous_loader                                           continuous_loader_;
+  asio::io_context                                                  main_io_context_       = asio::io_context{};
+  asio::io_context                                                  concurrent_io_context_ = asio::io_context{};
+  std::vector<std::function<asio::awaitable<void>(entt_ext::ecs&)>> defered_tasks_;
+  bool                                                              running_         = true;
+  command_channel                                                   command_channel_ = command_channel{main_io_context(), 1000};
 };
 
 template <typename T, typename... ArgsT>
@@ -1006,14 +897,14 @@ template <typename Type, typename... ArgsT>
 inline decltype(auto) ecs::component_observer(ArgsT&&... args) {
   using component_type = entt_ext::component_observer<Type, self_type>;
 
-  auto view = m_registry.template view<component_type>();
+  auto view = registry_.template view<component_type>();
   if (view.begin() == view.end()) {
     // spdlog::debug("Registering component {}", type_name<Type>());
     auto           entity    = create();
-    decltype(auto) component = m_registry.template emplace<component_type>(entity, *this, entity, std::forward<ArgsT>(args)...);
-    m_registry.template on_construct<Type>().template connect<&ecs::dispatch_on_construct<Type>>(*this);
-    m_registry.template on_destroy<Type>().template connect<&ecs::dispatch_on_destroy<Type>>(*this);
-    m_registry.template on_update<Type>().template connect<&ecs::dispatch_on_update<Type>>(*this);
+    decltype(auto) component = registry_.template emplace<component_type>(entity, *this, entity, std::forward<ArgsT>(args)...);
+    registry_.template on_construct<Type>().template connect<&ecs::dispatch_on_construct<Type>>(*this);
+    registry_.template on_destroy<Type>().template connect<&ecs::dispatch_on_destroy<Type>>(*this);
+    registry_.template on_update<Type>().template connect<&ecs::dispatch_on_update<Type>>(*this);
 
     return component;
   }
@@ -1023,33 +914,169 @@ inline decltype(auto) ecs::component_observer(ArgsT&&... args) {
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::emplace(const entity_type entt, Args&&... args) {
   component_observer<Type>();
-  return m_registry.template emplace<Type>(entt, std::forward<Args>(args)...);
+  return registry_.template emplace<Type>(entt, std::forward<Args>(args)...);
 }
 
 template <typename Type, typename It>
 inline void ecs::insert(It first, It last, const Type& value) {
   component_observer<Type>();
-  return m_registry.template insert<Type>(std::move(first), std::move(last), value);
+  return registry_.template insert<Type>(std::move(first), std::move(last), value);
 }
 
 template <typename Type, typename EIt, typename CIt, typename>
 inline void ecs::insert(EIt first, EIt last, CIt from) {
   component_observer<Type>();
-  m_registry.template insert<Type>(first, last, from);
+  registry_.template insert<Type>(first, last, from);
 }
 
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::emplace_or_replace(const entity_type entt, Args&&... args) {
   component_observer<Type>();
-  return m_registry.template emplace_or_replace<Type>(entt, std::forward<Args>(args)...);
+
+  // Note: emplace_or_replace() does NOT auto-defer due to return type complications
+  // Use emplace_or_replace_deferred() explicitly in deferred contexts (e.g., systems)
+
+  return registry_.template emplace_or_replace<Type>(entt, std::forward<Args>(args)...);
 }
 
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::get_or_emplace(const entity_type entt, Args&&... args) {
   component_observer<Type>();
-  return m_registry.template get_or_emplace<Type>(entt, std::forward<Args>(args)...);
+  return registry_.template get_or_emplace<Type>(entt, std::forward<Args>(args)...);
 }
 inline void ecs::delete_later(const entity_type entt) {
   return emplace<entt_ext::delete_later>(entt);
+}
+
+// ============= Deferred Operations Template Implementations =============
+
+template <typename Type, typename... Args>
+inline auto ecs::emplace_deferred(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+  auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
+
+  deferred_command cmd{.operation      = deferred_command::op_type::emplace,
+                       .entity         = entt,
+                       .component_type = entt::type_hash<Type>::value(),
+                       .executor       = [entt, args_tuple = std::move(args_tuple)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
+                         std::apply(
+                             [&](auto&&... args) {
+                               ecs_ref.template emplace<Type>(entt, std::forward<decltype(args)>(args)...);
+                             },
+                             std::move(args_tuple));
+                         co_return;
+                       }};
+
+  co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
+
+  co_return;
+}
+
+template <typename Type, typename... Args>
+inline auto ecs::emplace_or_replace_deferred(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+  // Always defer - this is the explicit _deferred API
+  auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
+
+  deferred_command cmd{.operation      = deferred_command::op_type::emplace,
+                       .entity         = entt,
+                       .component_type = entt::type_hash<Type>::value(),
+                       .executor       = [entt, args_tuple = std::move(args_tuple)](ecs& ecs_ref) mutable {
+                         std::apply(
+                             [&](auto&&... args) {
+                               ecs_ref.template emplace_or_replace<Type>(entt, std::forward<decltype(args)>(args)...);
+                             },
+                             std::move(args_tuple));
+                         co_return;
+                       }};
+
+  co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
+  co_return;
+}
+
+template <typename Type, typename... Args>
+inline auto ecs::emplace_if_not_exists_deferred(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+  auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
+
+  deferred_command cmd{.operation      = deferred_command::op_type::emplace_if_not_exists,
+                       .entity         = entt,
+                       .component_type = entt::type_hash<Type>::value(),
+                       .executor       = [entt, args_tuple = std::move(args_tuple)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
+                         std::apply(
+                             [&](auto&&... args) {
+                               ecs_ref.template emplace_if_not_exists<Type>(entt, std::forward<decltype(args)>(args)...);
+                             },
+                             std::move(args_tuple));
+                         co_return;
+                       }};
+
+  co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
+  co_return;
+}
+
+template <typename Type, typename... Args>
+inline auto ecs::replace_deferred(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+
+  auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
+
+  deferred_command cmd{.operation      = deferred_command::op_type::emplace_or_replace,
+                       .entity         = entt,
+                       .component_type = entt::type_hash<Type>::value(),
+                       .executor       = [entt, args_tuple = std::move(args_tuple)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
+                         std::apply(
+                             [&](auto&&... args) {
+                               ecs_ref.template replace<Type>(entt, std::forward<decltype(args)>(args)...);
+                             },
+                             std::move(args_tuple));
+                         co_return;
+                       }};
+
+  co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
+
+  co_return;
+}
+
+template <typename Type, typename... Other>
+inline auto ecs::remove_deferred(const entity_type entt) -> asio::awaitable<void> {
+  deferred_command cmd{.operation      = deferred_command::op_type::remove,
+                       .entity         = entt,
+                       .component_type = entt::type_hash<Type>::value(),
+                       .executor       = [entt](ecs& ecs_ref) -> asio::awaitable<void> {
+                         ecs_ref.template remove<Type, Other...>(entt);
+                         co_return;
+                       }};
+
+  co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
+
+  co_return;
+}
+
+template <typename Type, typename... Func>
+inline auto ecs::patch_deferred(const entity_type entt, Func&&... func) -> asio::awaitable<void> {
+
+  auto funcs_tuple = std::make_tuple(std::forward<Func>(func)...);
+
+  deferred_command cmd{.operation      = deferred_command::op_type::patch,
+                       .entity         = entt,
+                       .component_type = entt::type_hash<Type>::value(),
+                       .executor       = [entt, funcs_tuple = std::move(funcs_tuple)](ecs& ecs_ref) -> asio::awaitable<void> {
+                         std::apply(
+                             [&](auto&&... funcs) {
+                               ecs_ref.template patch<Type>(entt, std::forward<decltype(funcs)>(funcs)...);
+                             },
+                             std::move(funcs_tuple));
+                         co_return;
+                       }};
+
+  co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
+
+  co_return;
+}
+
+inline auto ecs::destroy_deferred(const entity_type entt) -> asio::awaitable<void> {
+  deferred_command cmd{.operation = deferred_command::op_type::destroy, .entity = entt, .executor = [entt](ecs& ecs_ref) -> asio::awaitable<void> {
+                         ecs_ref.destroy(entt);
+                         co_return;
+                       }};
+  co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
+  co_return;
 }
 } // namespace entt_ext

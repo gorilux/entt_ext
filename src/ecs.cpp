@@ -21,50 +21,52 @@ ecs::ecs(std::string const& persistance_filename)
 }
 
 ecs::ecs(const allocator_type& allocator, std::string const& persistance_filename)
-  : m_registry{allocator}
-  , m_continuous_loader{m_registry} {
+  : registry_{allocator}
+  , continuous_loader_{registry_} {
   load_state(persistance_filename);
 }
 
 ecs::ecs(ecs&& other) noexcept
-  : m_registry{std::move(other.m_registry)}
-  , m_global_entity{std::move(other.m_global_entity)}
-  , m_concurrent_entity(other.m_concurrent_entity)
-  , m_continuous_loader{std::move(other.m_continuous_loader)} {
+  : registry_{std::move(other.registry_)}
+  , global_entity_{std::move(other.global_entity_)}
+  , continuous_loader_{std::move(other.continuous_loader_)} {
 }
 
 ecs& ecs::operator=(ecs&& other) noexcept {
   if (this != &other) {
-    m_registry          = std::move(other.m_registry);
-    m_global_entity     = std::move(other.m_global_entity);
-    m_concurrent_entity = std::move(other.m_concurrent_entity);
-    m_continuous_loader = std::move(other.m_continuous_loader);
+    registry_          = std::move(other.registry_);
+    global_entity_     = std::move(other.global_entity_);
+    continuous_loader_ = std::move(other.continuous_loader_);
   }
   return *this;
 }
 
 ecs::entity_type ecs::create() {
-  return m_registry.create();
+  return registry_.create();
 }
 
 ecs::entity_type ecs::create(const entity_type hint) {
-  return m_registry.create(hint);
+  return registry_.create(hint);
 }
 
 ecs::version_type ecs::destroy(const entity_type entt) {
-  return m_registry.destroy(entt);
+  return registry_.destroy(entt);
 }
 
 ecs::version_type ecs::destroy(const entity_type entt, const version_type version) {
-  return m_registry.destroy(entt, version);
+  return registry_.destroy(entt, version);
 }
 
 auto ecs::main_io_context() -> asio::io_context& {
-  return get<asio::io_context>(m_global_entity);
+  return main_io_context_;
+}
+
+auto ecs::main_io_context() const -> const asio::io_context& {
+  return main_io_context_;
 }
 
 auto ecs::concurrent_io_context() -> asio::io_context& {
-  return get<asio::io_context>(m_concurrent_entity);
+  return concurrent_io_context_;
 }
 
 void ecs::run(int timeout_ms, size_t concurrency) {
@@ -87,10 +89,13 @@ void ecs::run(int timeout_ms, size_t concurrency) {
     return lhs.stage < rhs.stage;
   });
 
+  // Spawn global channel processor
+  asio::co_spawn(main_io_ctx, process_command_channel(), asio::detached);
+
   asio::co_spawn(main_io_ctx, run_update_loop(timeout_ms, concurrency), asio::detached);
 
   if (concurrency > 1) {
-    auto& thread_pool = emplace<asio::thread_pool>(m_concurrent_entity, concurrency);
+    auto& thread_pool = emplace<asio::thread_pool>(global_entity_, concurrency);
     for (auto i = 0u; i < concurrency; i++) {
       boost::asio::post(thread_pool, [&concurrent_io_ctx]() {
         concurrent_io_ctx.run();
@@ -103,7 +108,7 @@ void ecs::run(int timeout_ms, size_t concurrency) {
   main_io_ctx.run();
   signals.cancel();
   dummy_timer.cancel();
-  remove<asio::thread_pool>(m_concurrent_entity);
+  remove<asio::thread_pool>(global_entity_);
 
   clear();
 
@@ -162,7 +167,7 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
     co_return;
   };
 
-  while (m_running) {
+  while (running_) {
     timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
 
     auto last_stage = stage::val::input;
@@ -174,17 +179,17 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
         if (elapsed >= sys.interval && co_await sys.run(sys, *this, elapsed)) {
           sys.last_invoke    = std::chrono::high_resolution_clock::now();
           auto current_stage = static_cast<stage::val>((sys.stage / 1000) * 1000);
-          if (current_stage != last_stage && m_defered_tasks.size() > 0) {
+          if (current_stage != last_stage && defered_tasks_.size() > 0) {
 
             co_await wait_for_systems_to_finish();
-            for (auto& task : m_defered_tasks) {
+            for (auto& task : defered_tasks_) {
               try {
                 co_await task(*this);
               } catch (std::exception const& e) {
                 //  spdlog::error("run_update_loop: {}", e.what());
               }
             }
-            m_defered_tasks.clear();
+            defered_tasks_.clear();
           }
           last_stage = current_stage;
         }
@@ -197,19 +202,19 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
 
     // Need to sync all systems before we can delete any entities
     auto entities_pending_delete = view<entt_ext::delete_later>();
-    if (entities_pending_delete.begin() != entities_pending_delete.end() || m_defered_tasks.size() > 0) {
+    if (entities_pending_delete.begin() != entities_pending_delete.end() || defered_tasks_.size() > 0) {
 
       co_await wait_for_systems_to_finish();
 
-      // spdlog::info("Running {} defered tasks", m_defered_tasks.size());
-      for (auto& task : m_defered_tasks) {
+      // spdlog::info("Running {} defered tasks", defered_tasks_.size());
+      for (auto& task : defered_tasks_) {
         try {
           co_await task(*this);
         } catch (std::exception const& e) {
           //  spdlog::error("run_update_loop: {}", e.what());
         }
       }
-      m_defered_tasks.clear();
+      defered_tasks_.clear();
 
       // spdlog::info("Deleting {} entities", entities_pending_delete.size());
       for (auto [delete_entity] : entities_pending_delete.each()) {
@@ -218,7 +223,7 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
       }
     }
 
-    if (!m_running) {
+    if (!running_) {
       // spdlog::info("Stopping update loop");
       co_await wait_for_systems_to_finish();
       asio::post(main_io_context(), [this]() {
@@ -244,18 +249,45 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
 }
 
 void ecs::stop() {
-  m_running = false;
+  running_ = false;
+}
+
+// ============= Deferred Operations Implementation =============
+
+// Channel processor coroutine - runs on main executor
+asio::awaitable<void> ecs::process_command_channel() {
+  while (running_) {
+    auto [ec, cmd] = co_await command_channel_.async_receive(asio::as_tuple(asio::use_awaitable));
+
+    if (ec) {
+      if (ec == asio::error::operation_aborted || ec == asio::experimental::error::channel_closed) {
+        break; // Channel closed, exit gracefully
+      }
+      // Handle other errors
+      continue;
+    }
+
+    // Execute command on main executor
+    try {
+      co_await cmd.executor(*this);
+    } catch (std::exception const& e) {
+      // Log error if needed, but continue processing
+      // spdlog::error("Error executing deferred command: {}", e.what());
+    }
+  }
+}
+
+// Legacy deferred operations (simplified - channels handle everything now)
+ecs::entity_type ecs::create_deferred() {
+  // Just create immediately - no context tracking needed
+  return create();
 }
 
 void ecs::save_state() {
-  if (auto settings_filename_ptr = try_get<settings_filename>(m_global_entity); settings_filename_ptr) {
+  if (auto settings_filename_ptr = try_get<settings_filename>(global_entity_); settings_filename_ptr) {
     std::ofstream                       ofs(settings_filename_ptr->filename, std::ios::binary);
     cereal::PortableBinaryOutputArchive ar(ofs);
-    entt::snapshot{m_registry}
-        .get<entt_ext::entity>(ar)
-        .template get<state_persistance_header>(ar)
-        .template get<main_context_tag>(ar)
-        .template get<concurrent_context_tag>(ar);
+    entt::snapshot{registry_}.get<entt_ext::entity>(ar).template get<state_persistance_header>(ar).template get<main_context_tag>(ar);
   }
 }
 
@@ -266,42 +298,27 @@ void ecs::load_state(std::string const& filename) {
     try {
       std::ifstream    ifs(filename, std::ios::binary);
       InputArchiveType ar(ifs);
-      // entt::snapshot_loader{m_registry}
-      m_continuous_loader.get<entt_ext::entity>(ar)
-          .template get<state_persistance_header>(ar)
-          .template get<main_context_tag>(ar)
-          .template get<concurrent_context_tag>(ar);
+      // entt::snapshot_loader{registry_}
+      continuous_loader_.get<entt_ext::entity>(ar).template get<state_persistance_header>(ar).template get<main_context_tag>(ar);
     } catch (std::exception const& ex) {
       throw;
     }
 
     for (auto [entt] : view<main_context_tag>().each()) {
-      m_global_entity = entt;
-      break;
-    }
-    for (auto [entt] : view<concurrent_context_tag>().each()) {
-      m_concurrent_entity = entt;
+      global_entity_ = entt;
       break;
     }
   }
 
-  if (m_global_entity == entt_ext::null) {
-    m_global_entity = create();
-    emplace<state_persistance_header>(m_global_entity);
-    emplace<main_context_tag>(m_global_entity);
-  }
-
-  if (m_concurrent_entity == entt_ext::null) {
-    m_concurrent_entity = create();
-    emplace<concurrent_context_tag>(m_concurrent_entity);
+  if (global_entity_ == entt_ext::null) {
+    global_entity_ = create();
+    emplace<state_persistance_header>(global_entity_);
+    emplace<main_context_tag>(global_entity_);
   }
 
   if (!filename.empty()) {
-    emplace<settings_filename>(m_global_entity, filename);
+    emplace<settings_filename>(global_entity_, filename);
   }
-
-  emplace<asio::io_context>(m_global_entity);
-  emplace<asio::io_context>(m_concurrent_entity);
 }
 
 } // namespace entt_ext

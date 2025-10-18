@@ -67,11 +67,10 @@ struct system {
         asio::co_spawn(
             cfg.concurrent_io_ctx,
             [entity = cfg.entity, &main_io_ctx = cfg.main_io_ctx, &ecs, &self, dt, handler = cfg.handler, view]() mutable -> asio::awaitable<void> {
-              auto executor = co_await asio::this_coro::executor;
+              co_await asio::this_coro::executor;
+
               co_await std::apply(handler, std::tie(ecs, self, dt, view));
-              asio::post(main_io_ctx, [&ecs, entity]() {
-                ecs.template remove<running<system_tag>>(entity);
-              });
+              co_await ecs.remove_deferred<running<system_tag>>(entity);
               co_return;
             },
             asio::detached);
@@ -182,10 +181,9 @@ struct system {
           [&main_executor, entity, &ecs, &self, dt, handler, entry]() -> asio::awaitable<void> {
             co_await asio::this_coro::executor;
             co_await std::apply(handler, std::tuple_cat(std::tie(ecs, self, dt), entry));
-            asio::post(main_executor, [&ecs, entity]() {
-              ecs.template remove<running<each_tag>>(entity);
-              ecs.template remove<running<FuncT, each_tag>>(entity);
-            });
+
+            co_await ecs.remove_deferred<running<each_tag>>(entity);
+            co_await ecs.remove_deferred<running<FuncT, each_tag>>(entity);
             co_return;
           },
           asio::detached);
@@ -217,33 +215,33 @@ struct system {
 template <>
 struct system_builder<entt::get_t<>, entt::exclude_t<>> {
   explicit system_builder(entt_ext::ecs& ecs, asio::io_context& main_io_ctx, asio::io_context& concurrent_io_ctx)
-    : m_ecs(ecs)
-    , m_main_io_context(main_io_ctx)
-    , m_concurrent_io_context(concurrent_io_ctx)
-    , m_entity(ecs.create()) {
+    : ecs_(ecs)
+    , main_io_context_(main_io_ctx)
+    , concurrent_io_context_(concurrent_io_ctx)
+    , entity_(ecs.create()) {
   }
 
   template <typename FuncT, run_policy Policy = run_policy::automatic>
   system_builder& run(FuncT&& func, run_policy_t<Policy> = {}) {
-    m_ecs.template emplace<system>(m_entity, typename system::each_config<FuncT, Policy, void, void>{.handler = std::forward<FuncT>(func)}, m_ecs);
+    ecs_.template emplace<system>(entity_, typename system::each_config<FuncT, Policy, void, void>{.handler = std::forward<FuncT>(func)}, ecs_);
     return *this;
   }
 
   system_builder& interval(double value) {
-    m_ecs.template get<system>(m_entity).interval = value;
+    ecs_.template get<system>(entity_).interval = value;
     return *this;
   }
 
   system_builder& stage(uint32_t value) {
-    m_ecs.template get<system>(m_entity).stage = value;
+    ecs_.template get<system>(entity_).stage = value;
     return *this;
   }
 
 private:
-  entt_ext::ecs&    m_ecs;
-  asio::io_context& m_main_io_context;
-  asio::io_context& m_concurrent_io_context;
-  entt_ext::entity  m_entity;
+  entt_ext::ecs&    ecs_;
+  asio::io_context& main_io_context_;
+  asio::io_context& concurrent_io_context_;
+  entt_ext::entity  entity_;
 };
 
 template <typename... ComponentsT, typename... ExcludeT>
@@ -251,34 +249,34 @@ struct system_builder<entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>
   using ViewT = decltype(std::declval<entt_ext::ecs>().template view<ComponentsT...>(entt::exclude_t<ExcludeT...>{}));
 
   explicit system_builder(entt_ext::ecs& ecs, asio::io_context& main_io_ctx, asio::io_context& concurrent_io_ctx)
-    : m_ecs(ecs)
-    , m_main_io_context(main_io_ctx)
-    , m_concurrent_io_context(concurrent_io_ctx)
-    , m_entity(ecs.create()) {
+    : ecs_(ecs)
+    , main_io_context_(main_io_ctx)
+    , concurrent_io_context_(concurrent_io_ctx)
+    , entity_(ecs.create()) {
   }
 
   template <typename FuncT, run_policy Policy = run_policy::automatic>
   system_builder& each(FuncT&& func, run_policy_t<Policy> = {}) {
-    m_ecs.template emplace<system>(m_entity,
-                                   typename system::each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>{
-                                       .entity            = m_entity,
-                                       .handler           = func,
-                                       .main_io_ctx       = m_main_io_context,
-                                       .concurrent_io_ctx = m_concurrent_io_context},
-                                   m_ecs);
+    ecs_.template emplace<system>(entity_,
+                                  typename system::each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>{
+                                      .entity            = entity_,
+                                      .handler           = func,
+                                      .main_io_ctx       = main_io_context_,
+                                      .concurrent_io_ctx = concurrent_io_context_},
+                                  ecs_);
 
     return *this;
   }
 
   template <typename FuncT>
   system_builder& each_once(FuncT&& func) {
-    m_ecs.template emplace<system>(m_entity,
-                                   typename system::each_config<FuncT, run_policy::once, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>{
-                                       .entity            = m_entity,
-                                       .handler           = func,
-                                       .main_io_ctx       = m_main_io_context,
-                                       .concurrent_io_ctx = m_concurrent_io_context},
-                                   m_ecs);
+    ecs_.template emplace<system>(entity_,
+                                  typename system::each_config<FuncT, run_policy::once, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>{
+                                      .entity            = entity_,
+                                      .handler           = func,
+                                      .main_io_ctx       = main_io_context_,
+                                      .concurrent_io_ctx = concurrent_io_context_},
+                                  ecs_);
 
     return *this;
   }
@@ -313,12 +311,12 @@ struct system_builder<entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>
   }
 
   system_builder& interval(double value) {
-    m_ecs.template get<system>(m_entity).interval = value;
+    ecs_.template get<system>(entity_).interval = value;
     return *this;
   }
 
   system_builder& stage(uint32_t value) {
-    m_ecs.template get<system>(m_entity).stage = value;
+    ecs_.template get<system>(entity_).stage = value;
     return *this;
   }
 
@@ -326,19 +324,19 @@ private:
   template <typename FuncT, run_policy Policy>
   system_builder& run_impl(FuncT&& func, run_policy_t<Policy> = {}) {
 
-    m_ecs.template emplace<system>(m_entity,
-                                   typename system::run_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>{
-                                       .entity            = m_entity,
-                                       .handler           = func,
-                                       .main_io_ctx       = m_main_io_context,
-                                       .concurrent_io_ctx = m_concurrent_io_context},
-                                   m_ecs);
+    ecs_.template emplace<system>(entity_,
+                                  typename system::run_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>{
+                                      .entity            = entity_,
+                                      .handler           = func,
+                                      .main_io_ctx       = main_io_context_,
+                                      .concurrent_io_ctx = concurrent_io_context_},
+                                  ecs_);
     return *this;
   }
 
 private:
-  entt_ext::ecs&    m_ecs;
-  asio::io_context& m_main_io_context;
-  asio::io_context& m_concurrent_io_context;
-  entt_ext::entity  m_entity;
+  entt_ext::ecs&    ecs_;
+  asio::io_context& main_io_context_;
+  asio::io_context& concurrent_io_context_;
+  entt_ext::entity  entity_;
 };

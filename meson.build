@@ -7,7 +7,9 @@ entt_ext_sources = [
   'include/entt_ext/ecs.hpp',
   'include/entt_ext/core.hpp',
   'include/entt_ext/settings.hpp',
-  'src/ecs.cpp'
+  'include/entt_ext/deferred_operations.hpp',
+  'src/ecs.cpp',
+  'src/deferred_operations.cpp'
 ]
 
 cpp = meson.get_compiler('cpp')
