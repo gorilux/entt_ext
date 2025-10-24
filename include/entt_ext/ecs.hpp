@@ -3,6 +3,7 @@
 #include "core.hpp"
 #include "ecs_fwd.hpp"
 
+#include "continuous_loader_with_mapping.hpp"
 #include "deferred_operations.hpp"
 #include "index_map.hpp"
 #include "index_set.hpp"
@@ -816,16 +817,26 @@ public:
         [&ar, this](auto&& self) {
           asio::post(main_io_context(), [self = std::move(self), &ar, this]() mutable {
             {
+
+              // Load entities
               continuous_loader_.get<entt_ext::entity>(ar);
+
+              // Load components
               (continuous_loader_.template get<ComponentsT>(ar), ...);
 
               continuous_loader_.orphans();
-              //(details::remap_relationships<ComponentsT>(continuous_loader_, *this), ...);
             }
             self.complete(true);
           });
         },
         asio::use_awaitable);
+  }
+
+  // Extract entity mappings from the continuous_loader (server entity -> client entity)
+  // This uses the continuous_loader to get all server->client entity mappings
+  // Note: This should be called after merge_snapshot to get the mappings created during loading
+  std::unordered_map<entity, entity> extract_entity_mappings() {
+    return continuous_loader_.extract_mappings();
   }
 
 public:
@@ -850,7 +861,7 @@ private:
 private:
   registry_type                                                     registry_;
   entt_ext::entity                                                  global_entity_ = entt_ext::null;
-  entt::continuous_loader                                           continuous_loader_;
+  continuous_loader_with_mapping<registry_type>                     continuous_loader_;
   asio::io_context                                                  main_io_context_       = asio::io_context{};
   asio::io_context                                                  concurrent_io_context_ = asio::io_context{};
   std::vector<std::function<asio::awaitable<void>(entt_ext::ecs&)>> defered_tasks_;

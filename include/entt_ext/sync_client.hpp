@@ -219,10 +219,21 @@ public:
       cereal::PortableBinaryInputArchive archive(istream);
 
       // Use continuous loader to merge entities without conflicts
-      // Note: The snapshot already contains client entity IDs, so we can merge directly
+      // Note: The snapshot contains server entity IDs that get mapped to client entity IDs
       loading_snapshot_ = true;
       co_await ecs_.template merge_snapshot<cereal::PortableBinaryInputArchive, SyncComponentsT...>(archive);
       loading_snapshot_ = false;
+
+      // Extract the entity mappings created by the continuous_loader
+      // and send them to the server so it can update its client_state.mapping
+      auto server_to_client_mappings = ecs_.extract_entity_mappings();
+      if (!server_to_client_mappings.empty()) {
+        bool mapping_synced = co_await sync_entity_mappings(server_to_client_mappings);
+        if (!mapping_synced) {
+          spdlog::warn("Failed to sync entity mappings to server");
+        }
+      }
+
       // Update sync state
       auto& state     = ecs_.template get<sync_state>();
       state.last_sync = response.server_timestamp;
@@ -452,6 +463,34 @@ private:
       throw std::runtime_error("Component removal sync failed: " + response.error_message);
     }
     co_return;
+  }
+
+  // Sync entity mappings to server
+  asio::awaitable<bool> sync_entity_mappings(std::unordered_map<entity, entity> const& server_to_client_mappings) {
+    try {
+      if (!rpc_client_.is_connected() || session_id_.empty()) {
+        co_return false;
+      }
+
+      entity_mapping_update_request request{.session_id = session_id_, .server_to_client_mapping = server_to_client_mappings};
+
+      auto response = co_await rpc_client_.template invoke<entity_mapping_update_response>("entity_mapping_update", std::move(request));
+
+      if (!response.success) {
+        spdlog::error("Entity mapping sync failed: {}", response.error_message);
+        co_return false;
+      }
+
+      spdlog::debug("Successfully synced {} entity mappings to server", server_to_client_mappings.size());
+      co_return true;
+
+    } catch (std::exception const& ex) {
+      spdlog::error("Exception during entity mapping sync: {}", ex.what());
+      co_return false;
+    } catch (...) {
+      spdlog::error("Unknown exception during entity mapping sync");
+      co_return false;
+    }
   }
 
   // Check if entity has any pending sync changes

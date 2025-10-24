@@ -213,4 +213,25 @@ struct sync_state {
   }
 };
 
+// Entity mapping sync messages
+struct entity_mapping_update_request {
+  std::string                        session_id;               // Session ID from handshake
+  std::unordered_map<entity, entity> server_to_client_mapping; // Server entity -> Client entity
+
+  template <typename Archive>
+  void serialize(Archive& archive) {
+    archive(session_id, server_to_client_mapping);
+  }
+};
+
+struct entity_mapping_update_response {
+  bool        success;
+  std::string error_message;
+
+  template <typename Archive>
+  void serialize(Archive& archive) {
+    archive(success, error_message);
+  }
+};
+
 } // namespace entt_ext::sync

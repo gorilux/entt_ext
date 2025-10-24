@@ -84,6 +84,26 @@ public:
     co_await rpc_server_.stop();
   }
 
+  // Entity mapping update endpoint
+  asio::awaitable<entity_mapping_update_response> handle_entity_mapping_update(entity_mapping_update_request const& request) {
+    try {
+      auto& client_state = get_or_create_client_state(request.session_id);
+
+      // Update the client's entity mapping with the received mappings
+      for (auto const& [server_entity, client_entity] : request.server_to_client_mapping) {
+        client_state.mapping.add_mapping(client_entity, server_entity);
+      }
+
+      spdlog::info("Updated entity mapping for session {}: {} mappings", request.session_id, request.server_to_client_mapping.size());
+
+      co_return entity_mapping_update_response{.success = true, .error_message = ""};
+
+    } catch (std::exception const& ex) {
+      spdlog::error("Error updating entity mapping: {}", ex.what());
+      co_return entity_mapping_update_response{.success = false, .error_message = std::string("Exception: ") + ex.what()};
+    }
+  }
+
   // Handshake endpoint for session creation
   asio::awaitable<handshake_response> handle_handshake_request(handshake_request const& request) {
     try {
@@ -674,6 +694,12 @@ private:
       // In a more complete implementation, you'd extract session_id from request or connection context
       co_return co_await handle_sync_request(request);
     });
+
+    // Register entity mapping update endpoint
+    rpc_server_.attach("entity_mapping_update",
+                       [this](entity_mapping_update_request const& request) -> asio::awaitable<entity_mapping_update_response> {
+                         co_return co_await handle_entity_mapping_update(request);
+                       });
 
     // Register component-specific endpoints using fold expression
     (register_component_endpoints<SyncComponentsT>(ecs), ...);
