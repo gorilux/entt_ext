@@ -220,8 +220,9 @@ public:
 
       // Use continuous loader to merge entities without conflicts
       // Note: The snapshot already contains client entity IDs, so we can merge directly
+      loading_snapshot_ = true;
       co_await ecs_.template merge_snapshot<cereal::PortableBinaryInputArchive, SyncComponentsT...>(archive);
-
+      loading_snapshot_ = false;
       // Update sync state
       auto& state     = ecs_.template get<sync_state>();
       state.last_sync = response.server_timestamp;
@@ -229,6 +230,7 @@ public:
       co_return true;
 
     } catch (...) {
+      loading_snapshot_ = false;
       co_return false;
     }
   }
@@ -282,6 +284,9 @@ private:
 
     // When a sync component is added, mark it for sync
     observer.on_construct([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) {
+      if (loading_snapshot_) {
+        return;
+      }
       if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
         return;
       }
@@ -291,6 +296,9 @@ private:
 
     // When a sync component is updated, mark it for sync
     observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) {
+      if (loading_snapshot_) {
+        return;
+      }
       spdlog::debug("Client-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
       if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
         return;
@@ -301,11 +309,20 @@ private:
 
     // When a sync component is removed, mark it for removal sync
     observer.on_destroy([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) {
+      if (loading_snapshot_) {
+        return;
+      }
       if (auto request = ecs.template try_get<component_remove_request<ComponentT>>(e); request != nullptr) {
         return;
       }
+      spdlog::debug("Client-side component destroyed: {} {}", type_name<ComponentT>(), static_cast<int>(e));
       auto sync_version = std::chrono::steady_clock::now();
-      ecs.template emplace_or_replace<local_component_removed<ComponentT>>(e, sync_version);
+      asio::co_spawn(
+          ecs.concurrent_io_context(), // or rpc_client_.get_executor()
+          [this, e, sync_version]() -> asio::awaitable<void> {
+            co_await notify_component_removal<ComponentT>(e, sync_version);
+          },
+          asio::detached);
     });
 
     // Set up system to process component changes
@@ -322,10 +339,7 @@ private:
                 // Send this specific component to server
                 co_await send_component_to_server<ComponentT>(e, component, sync_data.sync_version);
 
-                // Remove the change marker after successful sync
-                ecs.post([this, e](entt_ext::ecs& ecs) {
-                  ecs.template remove<local_component_changed<ComponentT>>(e);
-                });
+                co_await ecs.template remove_deferred<local_component_changed<ComponentT>>(e);
 
               } catch (std::exception const& e) {
                 spdlog::error("Error sending component to server: {}", e.what());
@@ -486,6 +500,7 @@ private:
   rpc_client  rpc_client_;
   std::string session_id_;       // Session ID obtained from handshake
   std::string protocol_version_; // Protocol version based on component types
+  bool        loading_snapshot_ = false;
 };
 
 } // namespace entt_ext::sync

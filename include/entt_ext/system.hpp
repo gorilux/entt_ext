@@ -36,10 +36,9 @@ struct system {
 
     // using ViewT = decltype(std::declval<entt_ext::ecs>().template view<ComponentsT...>(entt::exclude_t<ExcludeT...>{}));
 
-    run = [cfg  = std::move(cfg),
-           view = ecs.template view<ComponentsT...>(entt::exclude_t<ExcludeT...>{}),
-           this](entt_ext::system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
+    run = [cfg = std::move(cfg), this](entt_ext::system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
       auto executor = co_await asio::this_coro::executor;
+      auto view     = ecs.template view<ComponentsT...>(entt::exclude_t<delete_later, ExcludeT...>{});
 
       constexpr run_policy spawn_policy =
           (Policy == run_policy::automatic || Policy == run_policy::once)
@@ -85,10 +84,10 @@ struct system {
   system(each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>&& cfg, ecs_type& ecs) {
     // using ViewT = decltype(std::declval<entt_ext::ecs>().template view<ComponentsT...>(entt::exclude_t<ExcludeT...>{}));
 
-    run = [cfg  = std::move(cfg),
-           view = ecs.template view<ComponentsT...>(entt::exclude_t<running<FuncT>, running<FuncT, run_once_tag>, ExcludeT...>{}),
-           this](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
+    run = [cfg = std::move(cfg), this](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
       auto executor = co_await asio::this_coro::executor;
+
+      auto view = ecs.template view<ComponentsT...>(entt::exclude_t<running<FuncT>, delete_later, running<FuncT, run_once_tag>, ExcludeT...>{});
 
       constexpr run_policy spawn_policy =
           (Policy == run_policy::automatic || Policy == run_policy::once)
@@ -167,7 +166,7 @@ struct system {
     for (auto entry : view.each()) {
       auto entity = std::get<0>(entry);
 
-      if (ecs.template any_of<running<FuncT, each_tag>, running<each_tag>>(entity)) {
+      if (!ecs.valid(entity) || ecs.template any_of<running<FuncT, each_tag>, running<each_tag>>(entity)) {
         continue;
       }
 

@@ -819,7 +819,7 @@ public:
               continuous_loader_.get<entt_ext::entity>(ar);
               (continuous_loader_.template get<ComponentsT>(ar), ...);
 
-              // continuous_loader_.orphans();
+              continuous_loader_.orphans();
               //(details::remap_relationships<ComponentsT>(continuous_loader_, *this), ...);
             }
             self.complete(true);
@@ -932,9 +932,6 @@ inline void ecs::insert(EIt first, EIt last, CIt from) {
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::emplace_or_replace(const entity_type entt, Args&&... args) {
   component_observer<Type>();
-
-  // Note: emplace_or_replace() does NOT auto-defer due to return type complications
-  // Use emplace_or_replace_deferred() explicitly in deferred contexts (e.g., systems)
 
   return registry_.template emplace_or_replace<Type>(entt, std::forward<Args>(args)...);
 }

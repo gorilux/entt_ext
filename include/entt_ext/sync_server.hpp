@@ -225,6 +225,7 @@ public:
       auto&  client_state  = get_or_create_client_state(request.session_id);
       entity client_entity = request.target_entity;
 
+      spdlog::debug("Handling component removal: {} {} {}", type_name<ComponentT>(), request.session_id, static_cast<int>(client_entity));
       // Map client entity to server entity
       auto server_entity_opt = client_state.mapping.get_server_entity(client_entity);
       if (!server_entity_opt) {
@@ -238,7 +239,11 @@ public:
         co_return component_remove_response<ComponentT>{.success = false, .error_message = "Server entity does not exist"};
       }
 
-      ecs_.template emplace_or_replace<component_remove_request<ComponentT>>(server_entity, request);
+      spdlog::debug("Removing component {} from server entity: {}->{}",
+                    type_name<ComponentT>(),
+                    static_cast<int>(server_entity),
+                    static_cast<int>(client_entity));
+      co_await ecs_.template remove_deferred<ComponentT>(server_entity);
 
       co_return component_remove_response<ComponentT>{.success = true, .error_message = ""};
 

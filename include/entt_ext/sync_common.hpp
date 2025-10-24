@@ -195,8 +195,9 @@ struct local_component_removed {
 };
 
 // Tag components for sync management
-struct server_authority {}; // Mark components that only server can modify
-struct dirty_client {};     // Mark entities that have been modified locally and need to be pushed
+struct server_authority {};  // Mark components that only server can modify
+struct dirty_client {};      // Mark entities that have been modified locally and need to be pushed
+struct merge_in_progress {}; // Mark entities that are being merged from the server
 
 // Sync state tracking
 struct sync_state {
