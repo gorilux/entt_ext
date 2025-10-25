@@ -832,13 +832,6 @@ public:
         asio::use_awaitable);
   }
 
-  // Extract entity mappings from the continuous_loader (server entity -> client entity)
-  // This uses the continuous_loader to get all server->client entity mappings
-  // Note: This should be called after merge_snapshot to get the mappings created during loading
-  std::unordered_map<entity, entity> extract_entity_mappings() {
-    return continuous_loader_.extract_mappings();
-  }
-
 public:
   // Channel processor coroutine (public so systems can spawn their own processors)
   asio::awaitable<void> process_command_channel();

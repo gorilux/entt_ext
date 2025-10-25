@@ -169,13 +169,11 @@ struct component_update_request {
 template <typename ComponentT>
 struct component_update_response {
   bool        success;
-  entity      resulting_entity;
-  entity      server_entity; // Server-side entity ID (for mapping)
   std::string error_message;
 
   template <typename Archive>
   void serialize(Archive& archive) {
-    archive(success, resulting_entity, server_entity, error_message);
+    archive(success, error_message);
   }
 };
 
@@ -210,6 +208,28 @@ struct sync_state {
   template <typename Archive>
   void serialize(Archive& archive) {
     archive(last_sync, last_push, dirty_entities, client_dirty, synchronized_component_types);
+  }
+};
+
+// Entity creation request - clients use this to request server entities
+struct entity_create_request {
+  std::string session_id;    // Session ID from handshake
+  entity      client_entity; // Client's local entity ID
+
+  template <typename Archive>
+  void serialize(Archive& archive) {
+    archive(session_id, client_entity);
+  }
+};
+
+struct entity_create_response {
+  bool        success;
+  entity      server_entity; // The server entity that was created
+  std::string error_message;
+
+  template <typename Archive>
+  void serialize(Archive& archive) {
+    archive(success, server_entity, error_message);
   }
 };
 

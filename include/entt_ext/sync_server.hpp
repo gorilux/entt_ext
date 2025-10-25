@@ -40,11 +40,10 @@ struct client_sync_state {
   std::chrono::steady_clock::time_point last_push;
   std::unordered_set<entity>            dirty_entities; // Entities that changed since last sync to this client
   std::string                           client_id;
-  entity_mapping                        mapping; // Entity mapping for this client
 
   template <typename Archive>
   void serialize(Archive& archive) {
-    archive(last_sync, last_push, dirty_entities, client_id, mapping);
+    archive(last_sync, last_push, dirty_entities, client_id);
   }
 };
 
@@ -84,23 +83,22 @@ public:
     co_await rpc_server_.stop();
   }
 
-  // Entity mapping update endpoint
-  asio::awaitable<entity_mapping_update_response> handle_entity_mapping_update(entity_mapping_update_request const& request) {
+  // Entity creation endpoint - clients request server entities
+  asio::awaitable<entity_create_response> handle_entity_create(entity_create_request const& request) {
     try {
-      auto& client_state = get_or_create_client_state(request.session_id);
+      // Create new server entity
+      entity server_entity = ecs_.create();
 
-      // Update the client's entity mapping with the received mappings
-      for (auto const& [server_entity, client_entity] : request.server_to_client_mapping) {
-        client_state.mapping.add_mapping(client_entity, server_entity);
-      }
+      spdlog::info("Created server entity {} for client entity {} (session {})",
+                   static_cast<int>(server_entity),
+                   static_cast<int>(request.client_entity),
+                   request.session_id);
 
-      spdlog::info("Updated entity mapping for session {}: {} mappings", request.session_id, request.server_to_client_mapping.size());
-
-      co_return entity_mapping_update_response{.success = true, .error_message = ""};
+      co_return entity_create_response{.success = true, .server_entity = server_entity, .error_message = ""};
 
     } catch (std::exception const& ex) {
-      spdlog::error("Error updating entity mapping: {}", ex.what());
-      co_return entity_mapping_update_response{.success = false, .error_message = std::string("Exception: ") + ex.what()};
+      spdlog::error("Error creating entity: {}", ex.what());
+      co_return entity_create_response{.success = false, .server_entity = entt_ext::null, .error_message = std::string("Exception: ") + ex.what()};
     }
   }
 
@@ -189,52 +187,26 @@ public:
                     static_cast<int>(request.target_entity),
                     std::chrono::duration_cast<std::chrono::milliseconds>(request.sync_version.time_since_epoch()).count());
 
-      auto&  client_state  = get_or_create_client_state(request.session_id);
-      entity client_entity = request.target_entity;
+      // target_entity is always the server entity
+      entity server_entity = request.target_entity;
 
-      // Check if we already have a server entity for this client entity
-      entity server_entity;
-      if (auto existing_server = client_state.mapping.get_server_entity(client_entity)) {
-        server_entity = *existing_server;
-        if (!ecs_.valid(server_entity)) {
-          // Server entity was destroyed, create new one
-          server_entity = ecs_.create();
-          client_state.mapping.add_mapping(client_entity, server_entity);
-        }
-      } else {
-        // Create new server entity using ECS
-        server_entity = ecs_.create();
-        client_state.mapping.add_mapping(client_entity, server_entity);
+      // Validate server entity exists
+      if (!ecs_.valid(server_entity)) {
+        co_return component_update_response<ComponentT>{.success = false, .error_message = "Server entity does not exist"};
       }
-
-      // if (auto sync_state = ecs_.template try_get<sync_component_state<ComponentT>>(server_entity); sync_state != nullptr) {
-      //   if (sync_state->sync_version >= request.sync_version) {
-      //     co_return component_update_response<ComponentT>{.success          = false,
-      //                                                     .resulting_entity = client_entity,
-      //                                                     .server_entity    = server_entity,
-      //                                                     .error_message    = "Sync version is already up to date"};
-      //   }
-      // }
 
       ecs_.template emplace_or_replace<component_update_request<ComponentT>>(server_entity, request);
 
-      spdlog::debug("Component {} update handled: {} {} {}",
+      spdlog::debug("Component {} update handled: {} {}",
                     type_name<ComponentT>(),
-                    static_cast<int>(client_entity),
                     static_cast<int>(server_entity),
                     std::chrono::duration_cast<std::chrono::milliseconds>(request.sync_version.time_since_epoch()).count());
 
-      co_return component_update_response<ComponentT>{.success          = true,
-                                                      .resulting_entity = client_entity,
-                                                      .server_entity    = server_entity,
-                                                      .error_message    = ""};
+      co_return component_update_response<ComponentT>{.success = true, .error_message = ""};
 
     } catch (std::exception const& ex) {
       spdlog::error("Error handling component {} update:  {}", type_name<ComponentT>(), ex.what());
-      co_return component_update_response<ComponentT>{.success          = false,
-                                                      .resulting_entity = entt_ext::null,
-                                                      .server_entity    = entt_ext::null,
-                                                      .error_message    = std::string("Exception: ") + ex.what()};
+      co_return component_update_response<ComponentT>{.success = false, .error_message = std::string("Exception: ") + ex.what()};
     }
   }
 
@@ -242,27 +214,17 @@ public:
   template <typename ComponentT>
   asio::awaitable<component_remove_response<ComponentT>> handle_component_remove(component_remove_request<ComponentT> const& request) {
     try {
-      auto&  client_state  = get_or_create_client_state(request.session_id);
-      entity client_entity = request.target_entity;
+      // target_entity is always the server entity
+      entity server_entity = request.target_entity;
 
-      spdlog::debug("Handling component removal: {} {} {}", type_name<ComponentT>(), request.session_id, static_cast<int>(client_entity));
-      // Map client entity to server entity
-      auto server_entity_opt = client_state.mapping.get_server_entity(client_entity);
-      if (!server_entity_opt) {
-        co_return component_remove_response<ComponentT>{.success = false, .error_message = "Entity mapping not found"};
-      }
-
-      entity server_entity = *server_entity_opt;
+      spdlog::debug("Handling component removal: {} {} {}", type_name<ComponentT>(), request.session_id, static_cast<int>(server_entity));
 
       // Validate server entity exists
       if (!ecs_.valid(server_entity)) {
         co_return component_remove_response<ComponentT>{.success = false, .error_message = "Server entity does not exist"};
       }
 
-      spdlog::debug("Removing component {} from server entity: {}->{}",
-                    type_name<ComponentT>(),
-                    static_cast<int>(server_entity),
-                    static_cast<int>(client_entity));
+      spdlog::debug("Removing component {} from server entity: {}", type_name<ComponentT>(), static_cast<int>(server_entity));
       co_await ecs_.template remove_deferred<ComponentT>(server_entity);
 
       co_return component_remove_response<ComponentT>{.success = true, .error_message = ""};
@@ -277,17 +239,9 @@ public:
     mark_entity_dirty_for_all_clients(entt);
   }
 
-  // Create server entity and ensure it gets mapped for all clients
+  // Create server entity
   entity create_server_entity() {
     entity server_entity = ecs_.create();
-
-    // Create client entity mappings for all connected clients
-    for (auto& [client_id, client_state] : client_states_) {
-      // Use server entity ID as client entity ID for simplicity
-      // (clients will handle any ID conflicts during merge)
-      client_state.mapping.add_mapping(server_entity, server_entity);
-    }
-
     return server_entity;
   }
 
@@ -336,29 +290,10 @@ public:
   void remove_client(std::string const& client_id) {
     auto it = client_states_.find(client_id);
     if (it != client_states_.end()) {
-      // Get all server entities owned by this client
-      auto server_entities = it->second.mapping.get_server_entities();
-
-      // Optionally destroy client entities when client disconnects
-      for (auto server_entity : server_entities) {
-        if (ecs_.valid(server_entity)) {
-          // Option 1: Destroy the entity completely
-          // ecs_.destroy(server_entity);
-
-          // Option 2: Keep entity (it becomes server-managed)
-          // Do nothing - entity remains in server ECS
-        }
-      }
-
       // Remove client state
       client_states_.erase(it);
+      spdlog::info("Removed client: {}", client_id);
     }
-  }
-
-  // Get entity mapping for a specific client (for debugging)
-  entity_mapping const* get_client_mapping(std::string const& client_id) const {
-    auto it = client_states_.find(client_id);
-    return it != client_states_.end() ? &it->second.mapping : nullptr;
   }
 
 private:
@@ -481,35 +416,31 @@ private:
     std::string component_name    = std::string(type_name<ComponentT>());
     std::string notification_name = "component_updated_" + component_name;
 
-    // Notify all clients
+    // Notify all clients with server entity ID
     for (auto& [client_id, client_state] : client_states_) {
-      // Map server entity to client entity for this client
-      if (auto client_entity_opt = client_state.mapping.get_client_entity(server_entity)) {
-        entity client_entity = *client_entity_opt;
-
-        // Send notification with client entity ID and component data
-        try {
-          co_await notify_component_update_to_client(client_entity, sync_version, component_data, client_id);
-        } catch (...) {
-          // Log error or handle notification failure
-          // Continue with other clients
-        }
+      try {
+        co_await notify_component_update_to_client(server_entity, sync_version, component_data, client_id);
+      } catch (...) {
+        // Log error or handle notification failure
+        // Continue with other clients
       }
     }
   }
 
   template <typename ComponentT>
-  asio::awaitable<void> notify_component_update_to_client(entity e, version_type sync_version, ComponentT& component, std::string const& client_id) {
-    spdlog::debug("Notifying component update to client: {} {} {} {}",
+  asio::awaitable<void>
+  notify_component_update_to_client(entity server_entity, version_type sync_version, ComponentT const& component, std::string const& client_id) {
+    spdlog::debug("Notifying component update to client: {} server_entity={} client={} {}",
                   type_name<ComponentT>(),
-                  static_cast<int>(e),
+                  static_cast<int>(server_entity),
                   client_id,
                   std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
     std::string endpoint_name = "component_updated_" + std::string(type_name<ComponentT>());
 
+    // Send server entity in target_entity field
     component_update_request<ComponentT> request{.session_id     = client_id,
                                                  .sync_version   = sync_version,
-                                                 .target_entity  = e,
+                                                 .target_entity  = server_entity,
                                                  .component_data = component};
 
     co_await rpc_server_.notify(endpoint_name, std::move(request));
@@ -518,17 +449,18 @@ private:
   }
 
   template <typename ComponentT>
-  asio::awaitable<void> notify_component_removal_to_client(entity e, version_type sync_version, std::string const& client_id) {
-    spdlog::debug("Notifying component removal to client: {} {} {} {}",
+  asio::awaitable<void> notify_component_removal_to_client(entity server_entity, version_type sync_version, std::string const& client_id) {
+    spdlog::debug("Notifying component removal to client: {} server_entity={} client={} {}",
                   type_name<ComponentT>(),
-                  static_cast<int>(e),
+                  static_cast<int>(server_entity),
                   client_id,
                   std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
 
     std::string component_name    = std::string(type_name<ComponentT>());
     std::string notification_name = "component_removed_" + component_name;
 
-    component_remove_request<ComponentT> request{.session_id = client_id, .sync_version = sync_version, .target_entity = e};
+    // Send server entity in target_entity field
+    component_remove_request<ComponentT> request{.session_id = client_id, .sync_version = sync_version, .target_entity = server_entity};
 
     try {
       co_await rpc_server_.notify(notification_name, std::move(request));
@@ -548,21 +480,14 @@ private:
     std::string component_name    = std::string(type_name<ComponentT>());
     std::string notification_name = "component_removed_" + component_name;
 
-    // Notify all clients
+    // Notify all clients with server entity ID
     for (auto& [client_id, client_state] : client_states_) {
-      // Map server entity to client entity for this client
-      if (auto client_entity_opt = client_state.mapping.get_client_entity(server_entity)) {
-        entity client_entity = *client_entity_opt;
-
-        // Send notification with client entity ID
-
-        component_remove_request<ComponentT> request{.session_id = client_id, .sync_version = sync_version, .target_entity = client_entity};
-        try {
-          co_await rpc_server_.notify(notification_name, std::move(request));
-        } catch (...) {
-          // Log error or handle notification failure
-          // Continue with other clients
-        }
+      component_remove_request<ComponentT> request{.session_id = client_id, .sync_version = sync_version, .target_entity = server_entity};
+      try {
+        co_await rpc_server_.notify(notification_name, std::move(request));
+      } catch (...) {
+        // Log error or handle notification failure
+        // Continue with other clients
       }
     }
   }
@@ -580,27 +505,22 @@ private:
     std::string component_name    = std::string(type_name<ComponentT>());
     std::string notification_name = "component_updated_" + component_name;
 
-    // Notify each client (except the one that made the change)
+    // Notify each client (except the one that made the change) with server entity ID
     for (auto& [client_id, client_state] : client_states_) {
       if (client_id == except_client_id)
         continue;
 
-      // Map server entity to client entity for this client
-      if (auto client_entity_opt = client_state.mapping.get_client_entity(server_entity)) {
-        entity client_entity = *client_entity_opt;
+      // Send notification with server entity ID and component data
+      component_update_request<ComponentT> request{.session_id     = client_id,
+                                                   .sync_version   = sync_version,
+                                                   .target_entity  = server_entity,
+                                                   .component_data = component_data};
 
-        // Send notification with client entity ID and component data
-        component_update_request<ComponentT> request{.session_id     = client_id,
-                                                     .sync_version   = sync_version,
-                                                     .target_entity  = client_entity,
-                                                     .component_data = component_data};
-
-        try {
-          co_await rpc_server_.notify(notification_name, std::move(request));
-        } catch (...) {
-          // Log error or handle notification failure
-          // Continue with other clients
-        }
+      try {
+        co_await rpc_server_.notify(notification_name, std::move(request));
+      } catch (...) {
+        // Log error or handle notification failure
+        // Continue with other clients
       }
     }
   }
@@ -616,23 +536,18 @@ private:
     std::string component_name    = std::string(type_name<ComponentT>());
     std::string notification_name = "component_removed_" + component_name;
 
-    // Notify each client (except the one that made the change)
+    // Notify each client (except the one that made the change) with server entity ID
     for (auto& [client_id, client_state] : client_states_) {
       if (client_id == except_client_id)
         continue;
 
-      // Map server entity to client entity for this client
-      if (auto client_entity_opt = client_state.mapping.get_client_entity(server_entity)) {
-        entity client_entity = *client_entity_opt;
-
-        // Send notification with client entity ID
-        component_remove_request<ComponentT> request{.session_id = client_id, .sync_version = sync_version, .target_entity = client_entity};
-        try {
-          co_await rpc_server_.notify(notification_name, std::move(request));
-        } catch (...) {
-          // Log error or handle notification failure
-          // Continue with other clients
-        }
+      // Send notification with server entity ID
+      component_remove_request<ComponentT> request{.session_id = client_id, .sync_version = sync_version, .target_entity = server_entity};
+      try {
+        co_await rpc_server_.notify(notification_name, std::move(request));
+      } catch (...) {
+        // Log error or handle notification failure
+        // Continue with other clients
       }
     }
   }
@@ -695,11 +610,10 @@ private:
       co_return co_await handle_sync_request(request);
     });
 
-    // Register entity mapping update endpoint
-    rpc_server_.attach("entity_mapping_update",
-                       [this](entity_mapping_update_request const& request) -> asio::awaitable<entity_mapping_update_response> {
-                         co_return co_await handle_entity_mapping_update(request);
-                       });
+    // Register entity creation endpoint
+    rpc_server_.attach("entity_create", [this](entity_create_request const& request) -> asio::awaitable<entity_create_response> {
+      co_return co_await handle_entity_create(request);
+    });
 
     // Register component-specific endpoints using fold expression
     (register_component_endpoints<SyncComponentsT>(ecs), ...);

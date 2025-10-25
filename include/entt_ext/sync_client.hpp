@@ -41,18 +41,13 @@ class sync_client {
 public:
   explicit sync_client(ecs& ecs_instance)
     : ecs_(ecs_instance)
-    , protocol_version_(sync_component_list<SyncComponentsT...>::generate_protocol_version()) {
+    , protocol_version_(sync_component_list<SyncComponentsT...>::generate_protocol_version())
+    , continuous_loader_(ecs_.registry()) {
 
     // Initialize sync state if not present
     if (!ecs_.template contains<sync_state>()) {
       ecs_.template get_or_emplace<sync_state>();
     }
-
-    // Initialize entity mapping component if not present
-    if (!ecs_.template contains<entity_mapping_component>()) {
-      ecs_.template get_or_emplace<entity_mapping_component>();
-    }
-
     // Set up automatic synchronization for each component type
     (setup_automatic_sync<SyncComponentsT>(), ...);
 
@@ -98,10 +93,6 @@ public:
     }
     session_id_.clear(); // Clear session on disconnect
 
-    if (clear_mapping) {
-      clear_entity_mapping();
-    }
-
     co_return;
   }
 
@@ -120,35 +111,19 @@ public:
     return session_id_;
   }
 
-  // Get access to entity mapping (for debugging/inspection)
-  entity_mapping const& get_entity_mapping() const {
-    return ecs_.template get<entity_mapping_component>().mapping;
-  }
-
-  // Clear entity mapping (useful when reconnecting)
-  void clear_entity_mapping() {
-    auto& mapping_component = ecs_.template get<entity_mapping_component>();
-    mapping_component.mapping.clear();
-  }
-
   // Get server entity for a client entity (returns null if not mapped)
   entity get_server_entity(entity client_entity) const {
-    const auto& mapping           = ecs_.template get<entity_mapping_component>().mapping;
-    auto        server_entity_opt = mapping.get_server_entity(client_entity);
-    return server_entity_opt ? *server_entity_opt : entt_ext::null;
+    return continuous_loader_.to_remote(client_entity);
   }
 
   // Get client entity for a server entity (returns null if not mapped)
   entity get_client_entity(entity server_entity) const {
-    const auto& mapping           = ecs_.template get<entity_mapping_component>().mapping;
-    auto        client_entity_opt = mapping.get_client_entity(server_entity);
-    return client_entity_opt ? *client_entity_opt : entt_ext::null;
+    return continuous_loader_.map(server_entity);
   }
 
   // Check if entity is mapped to server
-  bool is_entity_mapped(entity client_entity) const {
-    const auto& mapping = ecs_.template get<entity_mapping_component>().mapping;
-    return mapping.has_client_entity(client_entity);
+  bool is_entity_mapped(entity server_entity) const {
+    return continuous_loader_.contains(server_entity);
   }
 
   // Get count of pending sync operations (useful for UI feedback)
@@ -214,25 +189,25 @@ public:
         co_return false;
       }
 
-      // Load the snapshot into our ECS
-      grlx::rpc::ibufferstream           istream(&response.snapshot_data[0], response.snapshot_data.size());
-      cereal::PortableBinaryInputArchive archive(istream);
+      ecs_.defer([this, response](entt_ext::ecs& ecs) -> asio::awaitable<void> {
+        // Load the snapshot into our ECS
+        // Use continuous loader to merge entities without conflicts
+        // Note: The snapshot contains server entity IDs that get mapped to client entity IDs
+        loading_snapshot_ = true;
+        grlx::rpc::ibufferstream           istream(&response.snapshot_data[0], response.snapshot_data.size());
+        cereal::PortableBinaryInputArchive archive(istream);
+        // load entities
+        continuous_loader_.get<entt_ext::entity>(archive);
 
-      // Use continuous loader to merge entities without conflicts
-      // Note: The snapshot contains server entity IDs that get mapped to client entity IDs
-      loading_snapshot_ = true;
-      co_await ecs_.template merge_snapshot<cereal::PortableBinaryInputArchive, SyncComponentsT...>(archive);
-      loading_snapshot_ = false;
+        // Load components
+        (continuous_loader_.template get<SyncComponentsT>(archive), ...);
 
-      // Extract the entity mappings created by the continuous_loader
-      // and send them to the server so it can update its client_state.mapping
-      auto server_to_client_mappings = ecs_.extract_entity_mappings();
-      if (!server_to_client_mappings.empty()) {
-        bool mapping_synced = co_await sync_entity_mappings(server_to_client_mappings);
-        if (!mapping_synced) {
-          spdlog::warn("Failed to sync entity mappings to server");
-        }
-      }
+        continuous_loader_.orphans();
+
+        loading_snapshot_ = false;
+
+        co_return;
+      });
 
       // Update sync state
       auto& state     = ecs_.template get<sync_state>();
@@ -265,11 +240,24 @@ private:
       if (request.session_id != session_id_)
         return;
 
+      // request.target_entity contains the server entity
+      entity server_entity = request.target_entity;
+
+      // Map server entity to local client entity
+      auto client_entity = continuous_loader_.to_local(server_entity);
+
+      if (client_entity == entt_ext::null) {
+        spdlog::debug("Received component update for unmapped server entity {} ({})", static_cast<int>(server_entity), type_name<ComponentT>());
+        return; // Entity not mapped yet, ignore
+      }
+
       // Apply component update directly WITHOUT triggering observers (prevent loops)
-      if (ecs_.valid(request.target_entity)) {
-        // Use silent update to avoid triggering sync observers
-        spdlog::debug("received_component_update: {} {}", type_name<ComponentT>(), static_cast<int>(request.target_entity));
-        ecs_.template emplace_or_replace<component_update_request<ComponentT>>(request.target_entity, request);
+      if (ecs_.valid(client_entity)) {
+        spdlog::debug("received_component_update: {} server={} client={}",
+                      type_name<ComponentT>(),
+                      static_cast<int>(server_entity),
+                      static_cast<int>(client_entity));
+        ecs_.template emplace_or_replace<component_update_request<ComponentT>>(client_entity, request);
       }
     });
 
@@ -279,10 +267,24 @@ private:
       if (request.session_id != session_id_)
         return;
 
+      // request.target_entity contains the server entity
+      entity server_entity = request.target_entity;
+
+      // Map server entity to local client entity
+      auto client_entity = continuous_loader_.to_local(server_entity);
+
+      if (client_entity == entt_ext::null) {
+        spdlog::debug("Received component removal for unmapped server entity {} ({})", static_cast<int>(server_entity), type_name<ComponentT>());
+        return; // Entity not mapped yet, ignore
+      }
+
       // Remove component directly WITHOUT triggering observers (prevent loops)
-      if (ecs_.valid(request.target_entity)) {
-        spdlog::debug("received_component_removal: {} {}", type_name<ComponentT>(), static_cast<int>(request.target_entity));
-        ecs_.template emplace_or_replace<component_remove_request<ComponentT>>(request.target_entity, request);
+      if (ecs_.valid(client_entity)) {
+        spdlog::debug("received_component_removal: {} server={} client={}",
+                      type_name<ComponentT>(),
+                      static_cast<int>(server_entity),
+                      static_cast<int>(client_entity));
+        ecs_.template emplace_or_replace<component_remove_request<ComponentT>>(client_entity, request);
       }
     });
   }
@@ -416,18 +418,61 @@ private:
         .stage(entt_ext::stage::update);
   }
 
+  // Request a server entity for a client entity
+  asio::awaitable<entity> request_server_entity(entity client_entity) {
+    if (!rpc_client_.is_connected() || session_id_.empty()) {
+      co_return entt_ext::null;
+    }
+
+    try {
+      entity_create_request request{.session_id = session_id_, .client_entity = client_entity};
+
+      auto response = co_await rpc_client_.template invoke<entity_create_response>("entity_create", std::move(request));
+
+      if (!response.success) {
+        spdlog::error("Entity creation failed: {}", response.error_message);
+        co_return entt_ext::null;
+      }
+
+      continuous_loader_.insert_mapping(response.server_entity, client_entity);
+
+      spdlog::debug("Requested server entity {} for client entity {}", static_cast<int>(response.server_entity), static_cast<int>(client_entity));
+
+      co_return response.server_entity;
+
+    } catch (std::exception const& ex) {
+      spdlog::error("Exception requesting server entity: {}", ex.what());
+      co_return entt_ext::null;
+    }
+  }
+
   // Send a specific component to the server using type-safe endpoints (insert or update)
   template <typename ComponentT>
   asio::awaitable<void> send_component_to_server(entity e, ComponentT& component, version_type sync_version) {
-    spdlog::debug("Sending component to server: {} {} {}",
+    // Get or request server entity for this client entity
+    auto server_entity = continuous_loader_.to_remote(e);
+
+    if (server_entity == entt_ext::null) {
+      // Request a new server entity
+      server_entity = co_await request_server_entity(e);
+      if (server_entity == entt_ext::null) {
+        spdlog::error("Failed to get server entity for client entity {}", static_cast<int>(e));
+        throw std::runtime_error("Failed to get server entity");
+      }
+    }
+
+    spdlog::debug("Sending component to server: {} client={} server={} {}",
                   type_name<ComponentT>(),
                   static_cast<int>(e),
+                  static_cast<int>(server_entity),
                   std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
+
     std::string endpoint_name = "component_updated_" + std::string(type_name<ComponentT>());
 
+    // target_entity is now the server entity
     component_update_request<ComponentT> request{.session_id     = session_id_,
                                                  .sync_version   = sync_version,
-                                                 .target_entity  = e,
+                                                 .target_entity  = server_entity,
                                                  .component_data = component};
 
     auto response = co_await rpc_client_.template invoke<component_update_response<ComponentT>>(endpoint_name, std::move(request));
@@ -437,14 +482,10 @@ private:
       throw std::runtime_error("Component sync failed: " + response.error_message);
     }
 
-    // Update entity mapping if we got a server entity back
-    if (response.server_entity != entt_ext::null) {
-      auto& mapping_component = ecs_.template get<entity_mapping_component>();
-      mapping_component.mapping.add_mapping(e, response.server_entity);
-    }
-    spdlog::debug("Component sent to server: {} {} {}",
+    spdlog::debug("Component sent to server: {} client={} server={} {}",
                   type_name<ComponentT>(),
                   static_cast<int>(e),
+                  static_cast<int>(server_entity),
                   std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
 
     co_return;
@@ -453,9 +494,19 @@ private:
   // Notify server about component removal using type-safe endpoints
   template <typename ComponentT>
   asio::awaitable<void> notify_component_removal(entity e, version_type sync_version) {
+    // Get server entity for this client entity
+    auto server_entity = continuous_loader_.map(e);
+
+    if (server_entity == entt_ext::null) {
+      // No server entity mapping exists, nothing to remove on server
+      spdlog::debug("No server entity mapping for client entity {} during component removal", static_cast<int>(e));
+      co_return;
+    }
+
     std::string endpoint_name = "component_removed_" + std::string(type_name<ComponentT>());
 
-    component_remove_request<ComponentT> request{.session_id = session_id_, .sync_version = sync_version, .target_entity = e};
+    // target_entity is now the server entity
+    component_remove_request<ComponentT> request{.session_id = session_id_, .sync_version = sync_version, .target_entity = server_entity};
 
     auto response = co_await rpc_client_.template invoke<component_remove_response<ComponentT>>(endpoint_name, std::move(request));
 
@@ -463,34 +514,6 @@ private:
       throw std::runtime_error("Component removal sync failed: " + response.error_message);
     }
     co_return;
-  }
-
-  // Sync entity mappings to server
-  asio::awaitable<bool> sync_entity_mappings(std::unordered_map<entity, entity> const& server_to_client_mappings) {
-    try {
-      if (!rpc_client_.is_connected() || session_id_.empty()) {
-        co_return false;
-      }
-
-      entity_mapping_update_request request{.session_id = session_id_, .server_to_client_mapping = server_to_client_mappings};
-
-      auto response = co_await rpc_client_.template invoke<entity_mapping_update_response>("entity_mapping_update", std::move(request));
-
-      if (!response.success) {
-        spdlog::error("Entity mapping sync failed: {}", response.error_message);
-        co_return false;
-      }
-
-      spdlog::debug("Successfully synced {} entity mappings to server", server_to_client_mappings.size());
-      co_return true;
-
-    } catch (std::exception const& ex) {
-      spdlog::error("Exception during entity mapping sync: {}", ex.what());
-      co_return false;
-    } catch (...) {
-      spdlog::error("Unknown exception during entity mapping sync");
-      co_return false;
-    }
   }
 
   // Check if entity has any pending sync changes
@@ -535,11 +558,12 @@ private:
   }
 
 private:
-  ecs&        ecs_;
-  rpc_client  rpc_client_;
-  std::string session_id_;       // Session ID obtained from handshake
-  std::string protocol_version_; // Protocol version based on component types
-  bool        loading_snapshot_ = false;
+  ecs&                                           ecs_;
+  rpc_client                                     rpc_client_;
+  std::string                                    session_id_;       // Session ID obtained from handshake
+  std::string                                    protocol_version_; // Protocol version based on component types
+  bool                                           loading_snapshot_ = false;
+  continuous_loader_with_mapping<entt::registry> continuous_loader_;
 };
 
 } // namespace entt_ext::sync
