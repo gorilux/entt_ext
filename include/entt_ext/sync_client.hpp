@@ -20,7 +20,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/use_awaitable.hpp>
 
-#include <spdlog/spdlog.h>
+// #include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <unordered_map>
@@ -42,6 +42,7 @@ public:
   explicit sync_client(ecs& ecs_instance)
     : ecs_(ecs_instance)
     , protocol_version_(sync_component_list<SyncComponentsT...>::generate_protocol_version())
+    //, protocol_version_("sync_v1_")
     , continuous_loader_(ecs_.registry()) {
 
     // Initialize sync state if not present
@@ -51,7 +52,7 @@ public:
     // Set up automatic synchronization for each component type
     (setup_automatic_sync<SyncComponentsT>(), ...);
 
-    spdlog::info("Sync client initialized with protocol version: {}", protocol_version_);
+    // spdlog::info("Sync client initialized with protocol version: {}", protocol_version_);
   }
 
   // Connect to the sync server and perform handshake
@@ -126,18 +127,6 @@ public:
     return continuous_loader_.contains(server_entity);
   }
 
-  // Get count of pending sync operations (useful for UI feedback)
-  size_t get_pending_sync_count() const {
-    size_t count      = 0;
-    auto   dirty_view = ecs_.template view<dirty_client>();
-    for (auto [entity] : dirty_view.each()) {
-      if (has_pending_sync_changes(entity)) {
-        count++;
-      }
-    }
-    return count;
-  }
-
   // Request ECS snapshot from server
   asio::awaitable<bool> request_snapshot(std::vector<entity> const& entities_of_interest = {}) {
     if (!rpc_client_.is_connected()) {
@@ -189,7 +178,7 @@ public:
         co_return false;
       }
 
-      ecs_.defer([this, response](entt_ext::ecs& ecs) -> asio::awaitable<void> {
+      ecs_.defer_async([this, response](entt_ext::ecs& ecs) -> asio::awaitable<void> {
         // Load the snapshot into our ECS
         // Use continuous loader to merge entities without conflicts
         // Note: The snapshot contains server entity IDs that get mapped to client entity IDs
@@ -199,10 +188,13 @@ public:
         // load entities
         continuous_loader_.get<entt_ext::entity>(archive);
 
-        // Load components
-        (continuous_loader_.template get<SyncComponentsT>(archive), ...);
+        // Load components (including hierarchy components)
+        (load_component_and_hierarchy<SyncComponentsT>(archive), ...);
 
         continuous_loader_.orphans();
+
+        // Remap entity references inside components after loading (including hierarchy components)
+        (co_await remap_component_and_hierarchy<SyncComponentsT>(), ...);
 
         loading_snapshot_ = false;
 
@@ -231,6 +223,19 @@ private:
   // Set up notification handlers for a specific component type
   template <typename ComponentT>
   void setup_component_notification_handlers() {
+    // Set up for the component itself
+    setup_component_notification_handlers_impl<ComponentT>();
+
+    // // Also set up for hierarchy components if not already a hierarchy component
+    if constexpr (!is_hierarchy_component<ComponentT>::value) {
+      setup_component_notification_handlers_impl<entt_ext::parent<ComponentT>>();
+      setup_component_notification_handlers_impl<entt_ext::children<ComponentT>>();
+    }
+  }
+
+  // Implementation of notification handler setup for a single component
+  template <typename ComponentT>
+  void setup_component_notification_handlers_impl() {
 
     std::string component_name = std::string(type_name<ComponentT>());
 
@@ -248,7 +253,9 @@ private:
 
       if (client_entity == entt_ext::null) {
         spdlog::debug("Received component update for unmapped server entity {} ({})", static_cast<int>(server_entity), type_name<ComponentT>());
-        return; // Entity not mapped yet, ignore
+        client_entity = ecs_.create();
+        continuous_loader_.insert_mapping(server_entity, client_entity);
+        spdlog::debug("Created new client entity {} for server entity {}", static_cast<int>(client_entity), static_cast<int>(server_entity));
       }
 
       // Apply component update directly WITHOUT triggering observers (prevent loops)
@@ -292,11 +299,26 @@ private:
   // Set up automatic sync for a specific component type
   template <typename ComponentT>
   void setup_automatic_sync() {
+    // Set up for the component itself
+    setup_automatic_sync_impl<ComponentT>();
+
+    // // Also set up for hierarchy components if not already a hierarchy component
+    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
+    //   setup_automatic_sync_impl<entt_ext::parent<ComponentT>>();
+    //   setup_automatic_sync_impl<entt_ext::children<ComponentT>>();
+    // }
+  }
+
+  // Implementation of automatic sync setup for a single component
+  template <typename ComponentT>
+  void setup_automatic_sync_impl() {
     // Set up component observer to track changes
     auto& observer = ecs_.component_observer<ComponentT>();
 
     // When a sync component is added, mark it for sync
     observer.on_construct([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) {
+      spdlog::debug("Client-side component added: {} {}", type_name<ComponentT>(), static_cast<int>(e));
+
       if (loading_snapshot_) {
         return;
       }
@@ -309,10 +331,11 @@ private:
 
     // When a sync component is updated, mark it for sync
     observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) {
+      spdlog::debug("Client-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
+
       if (loading_snapshot_) {
         return;
       }
-      spdlog::debug("Client-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
       if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
         return;
       }
@@ -374,6 +397,10 @@ private:
                    entt_ext::entity                      e,
                    component_update_request<ComponentT>& request,
                    ComponentT&                           component) -> asio::awaitable<void> {
+              // Map entity references from remote to local IDs
+              if constexpr (is_hierarchy_component<ComponentT>::value) {
+                co_await map_entities_async(request.component_data);
+              }
               // Notify all clients about the component update
               co_await ecs.template replace_deferred<ComponentT>(e, request.component_data);
               co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
@@ -386,6 +413,10 @@ private:
         .each(
             [this](entt_ext::ecs& ecs, entt_ext::system& self, double dt, entt_ext::entity e, component_update_request<ComponentT>& request)
                 -> asio::awaitable<void> {
+              if constexpr (is_hierarchy_component<ComponentT>::value) {
+                co_await map_entities_async(request.component_data);
+              }
+
               // Notify all clients about the component update
               co_await ecs.template emplace_deferred<ComponentT>(e, request.component_data);
               co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
@@ -419,7 +450,7 @@ private:
   }
 
   // Request a server entity for a client entity
-  asio::awaitable<entity> request_server_entity(entity client_entity) {
+  auto request_server_entity(entity client_entity) -> asio::awaitable<entity> {
     if (!rpc_client_.is_connected() || session_id_.empty()) {
       co_return entt_ext::null;
     }
@@ -448,7 +479,7 @@ private:
 
   // Send a specific component to the server using type-safe endpoints (insert or update)
   template <typename ComponentT>
-  asio::awaitable<void> send_component_to_server(entity e, ComponentT& component, version_type sync_version) {
+  auto send_component_to_server(entity e, ComponentT& component, version_type sync_version) -> asio::awaitable<void> {
     // Get or request server entity for this client entity
     auto server_entity = continuous_loader_.to_remote(e);
 
@@ -467,13 +498,20 @@ private:
                   static_cast<int>(server_entity),
                   std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
 
+    // Create a copy of the component for mapping
+    ComponentT component_to_send = component;
+
+    if constexpr (is_hierarchy_component<ComponentT>::value) {
+      co_await map_component_entities_to_remote_async(component_to_send);
+    }
+
     std::string endpoint_name = "component_updated_" + std::string(type_name<ComponentT>());
 
     // target_entity is now the server entity
     component_update_request<ComponentT> request{.session_id     = session_id_,
                                                  .sync_version   = sync_version,
                                                  .target_entity  = server_entity,
-                                                 .component_data = component};
+                                                 .component_data = component_to_send};
 
     auto response = co_await rpc_client_.template invoke<component_update_response<ComponentT>>(endpoint_name, std::move(request));
 
@@ -493,7 +531,7 @@ private:
 
   // Notify server about component removal using type-safe endpoints
   template <typename ComponentT>
-  asio::awaitable<void> notify_component_removal(entity e, version_type sync_version) {
+  auto notify_component_removal(entity e, version_type sync_version) -> asio::awaitable<void> {
     // Get server entity for this client entity
     auto server_entity = continuous_loader_.map(e);
 
@@ -516,14 +554,100 @@ private:
     co_return;
   }
 
-  // Check if entity has any pending sync changes
-  bool has_pending_sync_changes(entity e) const {
-    return (ecs_.template any_of<local_component_changed<SyncComponentsT>>(e) || ...) ||
-           (ecs_.template any_of<local_component_removed<SyncComponentsT>>(e) || ...);
+  // Helper to load component and its hierarchy components from archive
+  template <typename ComponentT>
+  void load_component_and_hierarchy(cereal::PortableBinaryInputArchive& archive) {
+    // Load the component itself
+    continuous_loader_.template get<ComponentT>(archive);
+
+    // Also load hierarchy components if not already a hierarchy component
+    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
+    //   continuous_loader_.template get<entt_ext::parent<ComponentT>>(archive);
+    //   continuous_loader_.template get<entt_ext::children<ComponentT>>(archive);
+    // }
+  }
+
+  // Helper to remap component and its hierarchy components
+  template <typename ComponentT>
+  auto remap_component_and_hierarchy() -> asio::awaitable<void> {
+    if constexpr (is_hierarchy_component<ComponentT>::value) {
+      co_await remap_component_entities<ComponentT>();
+    }
+    // else {
+    //   co_await remap_component_entities<entt_ext::parent<ComponentT>>();
+    //   co_await remap_component_entities<entt_ext::children<ComponentT>>();
+    // }
+    co_return;
+  }
+
+  // Helper to remap entity references in components after loading from snapshot
+  template <typename ComponentT>
+  auto remap_component_entities() -> asio::awaitable<void> {
+    auto view = ecs_.view<ComponentT>();
+    for (auto entity : view) {
+      auto& component = view.template get<ComponentT>(entity);
+      co_await map_entities_async(component);
+    }
+    co_return;
+  }
+
+  template <typename Type>
+  auto map_entities_async(parent<Type>& parent) -> asio::awaitable<void> {
+    auto local_entity = continuous_loader_.map(parent.entity);
+    if (local_entity == entt_ext::null) {
+      local_entity = ecs_.create();
+      continuous_loader_.insert_mapping(parent.entity, local_entity);
+    }
+    parent.entity = local_entity;
+    co_return;
+  }
+
+  template <typename Type>
+  auto map_entities_async(children<Type>& child_set) -> asio::awaitable<void> {
+    children<Type> mapped_set;
+    for (auto child_entity : child_set) {
+      auto local_entity = continuous_loader_.map(child_entity);
+      if (local_entity == entt_ext::null) {
+        local_entity = ecs_.create();
+        continuous_loader_.insert_mapping(child_entity, local_entity);
+      }
+      mapped_set.insert(local_entity);
+    }
+    child_set.swap(mapped_set);
+    co_return;
+  }
+
+  // Helper to map entity references to remote (server) IDs before sending
+  // If any referenced entities don't have server mappings, request them first
+  template <typename ComponentT>
+  auto map_component_entities_to_remote_async(parent<ComponentT>& component) -> asio::awaitable<void> {
+    // First, ensure all referenced entities have server mappings
+    auto server_entity = continuous_loader_.to_remote(component.entity);
+    if (server_entity == entt_ext::null) {
+      server_entity = co_await request_server_entity(component.entity);
+      continuous_loader_.insert_mapping(server_entity, component.entity);
+    }
+    component.entity = server_entity;
+    co_return;
+  }
+
+  template <typename ComponentT>
+  auto map_component_entities_to_remote_async(children<ComponentT>& component) -> asio::awaitable<void> {
+    children<ComponentT> mapped_set;
+    for (auto child_entity : component) {
+      auto server_entity = continuous_loader_.to_remote(child_entity);
+      if (server_entity == entt_ext::null) {
+        server_entity = co_await request_server_entity(child_entity);
+        continuous_loader_.insert_mapping(server_entity, child_entity);
+      }
+      mapped_set.insert(server_entity);
+    }
+    component.swap(mapped_set);
+    co_return;
   }
 
   // Perform handshake with server to get session ID
-  asio::awaitable<bool> perform_handshake(std::string const& client_name, std::string const& client_version) {
+  auto perform_handshake(std::string const& client_name, std::string const& client_version) -> asio::awaitable<bool> {
     try {
       handshake_request request{.client_name = client_name, .client_version = client_version, .protocol_version = protocol_version_};
 

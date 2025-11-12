@@ -5,6 +5,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cereal/cereal.hpp>
+#include <cereal/types/unordered_map.hpp>
+#include <cereal/types/vector.hpp>
+
 namespace entt_ext {
 
 template <typename K, typename... Tag>
@@ -434,6 +438,12 @@ public:
     for (size_t i = 0; i < elements.size(); ++i) {
       index_map[elements[i]] = i;
     }
+  }
+
+  // Serialization support for persistence and sync
+  template <typename Archive>
+  void serialize(Archive& archive) {
+    archive(elements, index_map);
   }
 
 private:

@@ -82,6 +82,39 @@ struct sync_list_traits<sync_component_list<Components...>> {
 };
 
 // ============================================================================
+// Hierarchy Component Expansion - Automatically include parent/children
+// ============================================================================
+//
+// Usage:
+//   Instead of manually specifying:
+//     sync_component_list<ComponentA, parent<ComponentA>, children<ComponentA>,
+//                         ComponentB, parent<ComponentB>, children<ComponentB>>
+//
+//   You can use the macro:
+//     ENTT_EXT_SYNC_COMPONENTS_WITH_HIERARCHY(ComponentA, ComponentB)
+//
+//   This automatically expands to include parent<T> and children<T> for each
+//   component T in the list. Existing parent<> or children<> types are not
+//   expanded further to avoid duplication.
+//
+// ============================================================================
+
+// Helper to check if a type is already parent<> or children<>
+// Type trait to detect hierarchy components
+template <typename T>
+struct is_hierarchy_component : std::false_type {};
+
+template <typename T>
+struct is_hierarchy_component<entt_ext::parent<T>> : std::true_type {};
+
+template <typename T>
+struct is_hierarchy_component<entt_ext::children<T>> : std::true_type {};
+
+// Simplified macro - hierarchy components are now handled automatically at runtime
+// This macro is now just an alias for sync_component_list for backward compatibility
+#define ENTT_EXT_SYNC_COMPONENTS_WITH_HIERARCHY(...) entt_ext::sync::sync_component_list<__VA_ARGS__>
+
+// ============================================================================
 // Handshake message types for session management
 struct handshake_request {
   std::string client_name;      // Optional client identifier

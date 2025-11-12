@@ -162,7 +162,7 @@ public:
 
       // Serialize the temporary registry
       entt::snapshot{ecs_.registry()}.get<entity>(archive);
-      (entt::snapshot{ecs_.registry()}.template get<SyncComponentsT>(archive), ...);
+      (save_component_and_hierarchy<SyncComponentsT>(archive), ...);
 
       ostream.swap_vector(snapshot_buffer);
 
@@ -300,6 +300,19 @@ private:
   // Set up automatic sync for a specific component type (server-side changes)
   template <typename ComponentT>
   void setup_automatic_sync(entt_ext::ecs& ecs) {
+    // Set up for the component itself
+    setup_automatic_sync_impl<ComponentT>(ecs);
+
+    // // Also set up for hierarchy components if not already a hierarchy component
+    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
+    //   setup_automatic_sync_impl<entt_ext::parent<ComponentT>>(ecs);
+    //   setup_automatic_sync_impl<entt_ext::children<ComponentT>>(ecs);
+    // }
+  }
+
+  // Implementation of automatic sync setup for a single component
+  template <typename ComponentT>
+  void setup_automatic_sync_impl(entt_ext::ecs& ecs) {
     // Set up component observer to track server-side changes
     auto& observer = ecs.component_observer<ComponentT>();
 
@@ -575,14 +588,39 @@ private:
 
   std::vector<entity> get_sync_enabled_entities() {
     std::vector<entity> entities;
-    // Get all entities that have any of the sync components
-    (collect_entities_with_component<SyncComponentsT>(entities), ...);
+    // Get all entities that have any of the sync components (including hierarchy)
+    (collect_component_and_hierarchy_entities<SyncComponentsT>(entities), ...);
 
     // Remove duplicates
     std::sort(entities.begin(), entities.end());
     entities.erase(std::unique(entities.begin(), entities.end()), entities.end());
 
     return entities;
+  }
+
+  // Helper to save component and its hierarchy components to archive
+  template <typename ComponentT>
+  void save_component_and_hierarchy(cereal::PortableBinaryOutputArchive& archive) {
+    // Save the component itself
+    entt::snapshot{ecs_.registry()}.template get<ComponentT>(archive);
+
+    // // Also save hierarchy components if not already a hierarchy component
+    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
+    //   entt::snapshot{ecs_.registry()}.template get<entt_ext::parent<ComponentT>>(archive);
+    //   entt::snapshot{ecs_.registry()}.template get<entt_ext::children<ComponentT>>(archive);
+    // }
+  }
+
+  template <typename ComponentT>
+  void collect_component_and_hierarchy_entities(std::vector<entity>& entities) {
+    // Collect entities with the component itself
+    collect_entities_with_component<ComponentT>(entities);
+
+    // Also collect entities with hierarchy components if not already a hierarchy component
+    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
+    //   collect_entities_with_component<entt_ext::parent<ComponentT>>(entities);
+    //   collect_entities_with_component<entt_ext::children<ComponentT>>(entities);
+    // }
   }
 
   template <typename ComponentT>
@@ -594,7 +632,21 @@ private:
 
   // Check if entity has any of the sync components
   bool has_sync_components(entity entt) const {
-    return (ecs_.template any_of<SyncComponentsT>(entt) || ...);
+    return (has_component_or_hierarchy<SyncComponentsT>(entt) || ...);
+  }
+
+  // Check if entity has a specific component or its hierarchy components
+  template <typename ComponentT>
+  bool has_component_or_hierarchy(entity entt) const {
+    // Check the component itself
+    bool has_comp = ecs_.template any_of<ComponentT>(entt);
+
+    // Also check hierarchy components if not already a hierarchy component
+    if constexpr (!is_hierarchy_component<ComponentT>::value) {
+      has_comp = has_comp || ecs_.template any_of<entt_ext::parent<ComponentT>>(entt) || ecs_.template any_of<entt_ext::children<ComponentT>>(entt);
+    }
+
+    return has_comp;
   }
 
   void setup_rpc_endpoints(entt_ext::ecs& ecs) {
@@ -621,6 +673,18 @@ private:
 
   template <typename ComponentT>
   void register_component_endpoints(entt_ext::ecs& ecs) {
+    // Register for the component itself
+    register_component_endpoints_impl<ComponentT>(ecs);
+
+    // // Also register for hierarchy components if not already a hierarchy component
+    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
+    //   register_component_endpoints_impl<entt_ext::parent<ComponentT>>(ecs);
+    //   register_component_endpoints_impl<entt_ext::children<ComponentT>>(ecs);
+    // }
+  }
+
+  template <typename ComponentT>
+  void register_component_endpoints_impl(entt_ext::ecs& ecs) {
     std::string component_name = std::string(type_name<ComponentT>());
 
     // Register update endpoint: "update_component_Position", "update_component_Velocity", etc.

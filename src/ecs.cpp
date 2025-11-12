@@ -1,5 +1,7 @@
 #include "entt_ext/ecs.hpp"
 
+#include <boost/asio/deadline_timer.hpp>
+
 #include <functional>
 
 #ifdef __EMSCRIPTEN__
@@ -296,11 +298,14 @@ void ecs::load_state(std::string const& filename) {
 
   if (!filename.empty()) {
     try {
+      is_loading_ = true;
       std::ifstream    ifs(filename, std::ios::binary);
       InputArchiveType ar(ifs);
       // entt::snapshot_loader{registry_}
       continuous_loader_.get<entt_ext::entity>(ar).template get<state_persistance_header>(ar).template get<main_context_tag>(ar);
+      is_loading_ = false;
     } catch (std::exception const& ex) {
+      is_loading_ = false;
       throw;
     }
 
