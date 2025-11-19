@@ -227,10 +227,10 @@ private:
     setup_component_notification_handlers_impl<ComponentT>();
 
     // // Also set up for hierarchy components if not already a hierarchy component
-    if constexpr (!is_hierarchy_component<ComponentT>::value) {
-      setup_component_notification_handlers_impl<entt_ext::parent<ComponentT>>();
-      setup_component_notification_handlers_impl<entt_ext::children<ComponentT>>();
-    }
+    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
+    //   setup_component_notification_handlers_impl<entt_ext::parent<ComponentT>>();
+    //   setup_component_notification_handlers_impl<entt_ext::children<ComponentT>>();
+    // }
   }
 
   // Implementation of notification handler setup for a single component
@@ -316,40 +316,42 @@ private:
     auto& observer = ecs_.component_observer<ComponentT>();
 
     // When a sync component is added, mark it for sync
-    observer.on_construct([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) {
+    observer.on_construct([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
       spdlog::debug("Client-side component added: {} {}", type_name<ComponentT>(), static_cast<int>(e));
 
       if (loading_snapshot_) {
-        return;
+        co_return;
       }
       if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
-        return;
+        co_return;
       }
       auto sync_version = std::chrono::steady_clock::now();
       ecs.template emplace_or_replace<local_component_changed<ComponentT>>(e, sync_version);
+      co_return;
     });
 
     // When a sync component is updated, mark it for sync
-    observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) {
+    observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
       spdlog::debug("Client-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
 
       if (loading_snapshot_) {
-        return;
+        co_return;
       }
       if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
-        return;
+        co_return;
       }
       auto sync_version = std::chrono::steady_clock::now();
       ecs.template emplace_or_replace<local_component_changed<ComponentT>>(e, sync_version);
+      co_return;
     });
 
     // When a sync component is removed, mark it for removal sync
-    observer.on_destroy([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) {
+    observer.on_destroy([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
       if (loading_snapshot_) {
-        return;
+        co_return;
       }
       if (auto request = ecs.template try_get<component_remove_request<ComponentT>>(e); request != nullptr) {
-        return;
+        co_return;
       }
       spdlog::debug("Client-side component destroyed: {} {}", type_name<ComponentT>(), static_cast<int>(e));
       auto sync_version = std::chrono::steady_clock::now();

@@ -345,8 +345,8 @@ private:
       using children_view_types = typename extract_children_views<ComponentsT...>::type;
 
       return create_each_detached_impl_with_children<FuncT, Policy, IsOnce>(std::move(cfg),
-                                                                            regular_components{},
-                                                                            children_view_types{},
+                                                                            static_cast<regular_components*>(nullptr),
+                                                                            static_cast<children_view_types*>(nullptr),
                                                                             entt::exclude_t<ExcludeT...>{});
     } else {
       return [cfg = std::move(cfg)](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
@@ -365,8 +365,8 @@ private:
   template <typename FuncT, run_policy Policy, bool IsOnce, typename... RegularComponents, typename... ChildViewTypes, typename... ExcludeT>
   static auto create_each_detached_impl_with_children(
       each_config<FuncT, Policy, entt::get_t<RegularComponents..., ChildViewTypes...>, entt::exclude_t<ExcludeT...>>&& cfg,
-      std::tuple<RegularComponents...>,
-      std::tuple<ChildViewTypes...>,
+      std::tuple<RegularComponents...>*,
+      std::tuple<ChildViewTypes...>*,
       entt::exclude_t<ExcludeT...>) {
 
     return [cfg = std::move(cfg)](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {

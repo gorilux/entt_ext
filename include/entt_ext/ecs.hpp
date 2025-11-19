@@ -66,6 +66,18 @@ struct parent final {
 template <typename Type>
 using children = index_set<entt_ext::entity, Type>;
 
+// Type trait to detect if a type is a children<T> (index_set<entity, T>)
+template <typename>
+struct is_children : std::false_type {};
+
+template <typename Type>
+struct is_children<index_set<entt_ext::entity, Type>> : std::true_type {
+  using child_type = Type;
+};
+
+template <typename T>
+inline constexpr bool is_children_v = is_children<T>::value;
+
 // Marker type for system component declarations to inject children views
 template <typename Type, typename... Others>
 struct children_view {};
@@ -165,13 +177,19 @@ public:
       return it != other.it;
     }
 
+    template <typename... Components>
+    auto make_component_refs() {
+      return std::tuple_cat([this]() {
+        if constexpr (entt::component_traits<Components>::page_size > 0u) {
+          return std::forward_as_tuple(ecs.template get<Components>(*it));
+        } else {
+          return std::tuple<>{};
+        }
+      }()...);
+    }
+
     auto operator*() {
-      // Types... are used only for filtering, we only return Type
-      if constexpr (entt::component_traits<Type>::page_size > 0u) {
-        return std::make_tuple(*it, std::ref(ecs.template get<Type>(*it)));
-      } else {
-        return std::make_tuple(*it);
-      }
+      return std::tuple_cat(std::make_tuple(*it), make_component_refs<Type, Types...>());
     }
   };
 
@@ -216,6 +234,7 @@ struct running {};
 struct each_tag {};
 struct system_tag {};
 struct run_once_tag {};
+struct loading_tag {};
 
 template <auto Policy>
 struct run_policy_t {
@@ -455,7 +474,7 @@ public:
   }
 
   bool is_loading() const {
-    return is_loading_;
+    return registry_.template any_of<loading_tag>(global_entity_);
   }
 
   template <typename Type, typename Compare, typename Sort = entt::std_sort, typename... Args>
@@ -590,10 +609,10 @@ public:
   }
 
   // Defers a synchronous function to be executed on the ECS command queue
-  inline void defer(std::function<void(ecs&)> func) {
+  inline void defer(std::move_only_function<void(ecs&)> func) {
     asio::co_spawn(
         concurrent_io_context(),
-        [this, func = std::move(func)]() -> asio::awaitable<void> {
+        [this, func = std::move(func)]() mutable -> asio::awaitable<void> {
           deferred_command cmd{.operation      = deferred_command::op_type::custom,
                                .entity         = entt_ext::null,
                                .component_type = 0,
@@ -609,10 +628,10 @@ public:
   }
 
   // Defers an async function to be executed on the ECS command queue
-  inline void defer_async(std::function<asio::awaitable<void>(ecs&)> func) {
+  inline void defer_async(std::move_only_function<asio::awaitable<void>(ecs&)> func) {
     asio::co_spawn(
         concurrent_io_context(),
-        [this, func = std::move(func)]() -> asio::awaitable<void> {
+        [this, func = std::move(func)]() mutable -> asio::awaitable<void> {
           deferred_command cmd{.operation      = deferred_command::op_type::custom,
                                .entity         = entt_ext::null,
                                .component_type = 0,
@@ -661,72 +680,13 @@ public:
   auto system() -> system_builder<entt::get_t<ComponentsT...>, entt::exclude_t<>>;
 
   template <typename ArchiveT, typename... ComponentsT>
-  asio::awaitable<void> load_snapshot(ArchiveT& ar) {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [&ar, this](auto&& self) {
-          asio::post(main_io_context(), [self = std::move(self), &ar, this]() mutable {
-            {
-              is_loading_ = true;
-              entt::snapshot_loader{registry_}.get<entt_ext::entity>(ar);
-              (entt::snapshot_loader{registry_}.template get<ComponentsT>(ar), ...);
-              // (entt::snapshot{registry_}.template get<entt_ext::parent<ComponentsT>>(ar), ...);
-              // (entt::snapshot{registry_}.template get<entt_ext::children<ComponentsT>>(ar), ...);
-              is_loading_ = false;
-            }
-            self.complete();
-          });
-        },
-        asio::use_awaitable);
-  }
+  asio::awaitable<void> load_snapshot(ArchiveT& ar);
 
   template <typename ArchiveT, typename... ComponentsT>
-  asio::awaitable<void> save_snapshot(ArchiveT& ar) const {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [&ar, this](auto&& self) {
-          asio::post(const_cast<asio::io_context&>(main_io_context()), [self = std::move(self), &ar, this]() mutable {
-            {
-
-              entt::snapshot{registry_}.get<entt_ext::entity>(ar);
-              (entt::snapshot{registry_}.template get<ComponentsT>(ar), ...);
-              // (entt::snapshot{registry_}.template get<entt_ext::parent<ComponentsT>>(ar), ...);
-              // (entt::snapshot{registry_}.template get<entt_ext::children<ComponentsT>>(ar), ...);
-            }
-            self.complete();
-          });
-        },
-        asio::use_awaitable);
-  }
+  asio::awaitable<void> save_snapshot(ArchiveT& ar) const;
 
   template <typename ArchiveT, typename... ComponentsT>
-  asio::awaitable<bool> merge_snapshot(ArchiveT& ar) {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(bool)>(
-        [&ar, this](auto&& self) {
-          asio::post(main_io_context(), [self = std::move(self), &ar, this]() mutable {
-            {
-              is_loading_ = true;
-
-              // Load entities
-              continuous_loader_.get<entt_ext::entity>(ar);
-
-              // Load components
-              (continuous_loader_.template get<ComponentsT>(ar), ...);
-              // (continuous_loader_.template get<entt_ext::parent<ComponentsT>>(ar), ...);
-              // (continuous_loader_.template get<entt_ext::children<ComponentsT>>(ar), ...);
-
-              continuous_loader_.orphans();
-
-              // Remap entity references inside components after loading
-              (remap_component_entities<ComponentsT>(), ...);
-              // (remap_component_entities<entt_ext::parent<ComponentsT>>(), ...);
-              // (remap_component_entities<entt_ext::children<ComponentsT>>(), ...);
-
-              is_loading_ = false;
-            }
-            self.complete(true);
-          });
-        },
-        asio::use_awaitable);
-  }
+  asio::awaitable<bool> merge_snapshot(ArchiveT& ar);
 
 public:
   // Channel processor coroutine (public so systems can spawn their own processors)
@@ -845,19 +805,69 @@ inline decltype(auto) ecs::component_observer() {
 
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::emplace(const entity_type entt, Args&&... args) {
-  component_observer<Type>();
+  auto& observer = component_observer<Type>();
+
+  // If this is a children<> component, register automatic cleanup on destroy
+  if constexpr (is_children_v<Type>) {
+    // Check if we already have a destroy handler registered for this component type
+    static bool cleanup_registered = [&observer]() {
+      observer.on_destroy([](ecs& ecs_ref, entity_type parent_entity, Type& children_set) {
+        // Mark all children for deletion when parent is destroyed
+        for (auto child_entity : children_set) {
+          if (ecs_ref.valid(child_entity)) {
+            ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
+          }
+        }
+      });
+      return true;
+    }();
+    (void)cleanup_registered; // Suppress unused variable warning
+  }
+
   return registry_.template emplace<Type>(entt, std::forward<Args>(args)...);
 }
 
 template <typename Type, typename It>
 inline void ecs::insert(It first, It last, const Type& value) {
   component_observer<Type>();
+
+  // If this is a children<> component, register automatic cleanup on destroy
+  if constexpr (is_children_v<Type>) {
+    static bool cleanup_registered = [this]() {
+      component_observer<Type>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, Type& children_set) {
+        for (auto child_entity : children_set) {
+          if (ecs_ref.valid(child_entity)) {
+            ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
+          }
+        }
+      });
+      return true;
+    }();
+    (void)cleanup_registered;
+  }
+
   return registry_.template insert<Type>(std::move(first), std::move(last), value);
 }
 
 template <typename Type, typename EIt, typename CIt, typename>
 inline void ecs::insert(EIt first, EIt last, CIt from) {
   component_observer<Type>();
+
+  // If this is a children<> component, register automatic cleanup on destroy
+  if constexpr (is_children_v<Type>) {
+    static bool cleanup_registered = [this]() {
+      component_observer<Type>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, Type& children_set) {
+        for (auto child_entity : children_set) {
+          if (ecs_ref.valid(child_entity)) {
+            ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
+          }
+        }
+      });
+      return true;
+    }();
+    (void)cleanup_registered;
+  }
+
   registry_.template insert<Type>(first, last, from);
 }
 
@@ -865,12 +875,43 @@ template <typename Type, typename... Args>
 inline decltype(auto) ecs::emplace_or_replace(const entity_type entt, Args&&... args) {
   component_observer<Type>();
 
+  // If this is a children<> component, register automatic cleanup on destroy
+  if constexpr (is_children_v<Type>) {
+    static bool cleanup_registered = [this]() {
+      component_observer<Type>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, Type& children_set) {
+        for (auto child_entity : children_set) {
+          if (ecs_ref.valid(child_entity)) {
+            ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
+          }
+        }
+      });
+      return true;
+    }();
+    (void)cleanup_registered;
+  }
+
   return registry_.template emplace_or_replace<Type>(entt, std::forward<Args>(args)...);
 }
 
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::get_or_emplace(const entity_type entt, Args&&... args) {
   component_observer<Type>();
+
+  // If this is a children<> component, register automatic cleanup on destroy
+  if constexpr (is_children_v<Type>) {
+    static bool cleanup_registered = [this]() {
+      component_observer<Type>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, Type& children_set) {
+        for (auto child_entity : children_set) {
+          if (ecs_ref.valid(child_entity)) {
+            ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
+          }
+        }
+      });
+      return true;
+    }();
+    (void)cleanup_registered;
+  }
+
   return registry_.template get_or_emplace<Type>(entt, std::forward<Args>(args)...);
 }
 inline void ecs::delete_later(const entity_type entt) {
@@ -1007,5 +1048,78 @@ inline auto ecs::destroy_deferred(const entity_type entt) -> asio::awaitable<voi
                        }};
   co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
   co_return;
+}
+
+// Snapshot functionality
+
+template <typename ArchiveT, typename... ComponentsT>
+asio::awaitable<void> ecs::load_snapshot(ArchiveT& ar) {
+
+  co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
+      [&ar, this](auto&& self) {
+        asio::post(main_io_context(), [self = std::move(self), &ar, this]() mutable {
+          {
+            emplace<loading_tag>(global_entity_);
+            entt::snapshot_loader{registry_}.get<entt_ext::entity>(ar);
+            (entt::snapshot_loader{registry_}.template get<ComponentsT>(ar), ...);
+            // (entt::snapshot{registry_}.template get<entt_ext::parent<ComponentsT>>(ar), ...);
+            // (entt::snapshot{registry_}.template get<entt_ext::children<ComponentsT>>(ar), ...);
+            remove<loading_tag>(global_entity_);
+          }
+          self.complete();
+        });
+      },
+      asio::use_awaitable);
+
+  co_return;
+}
+
+template <typename ArchiveT, typename... ComponentsT>
+asio::awaitable<void> ecs::save_snapshot(ArchiveT& ar) const {
+  co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
+      [&ar, this](auto&& self) {
+        asio::post(const_cast<asio::io_context&>(main_io_context()), [self = std::move(self), &ar, this]() mutable {
+          {
+
+            entt::snapshot{registry_}.get<entt_ext::entity>(ar);
+            (entt::snapshot{registry_}.template get<ComponentsT>(ar), ...);
+            // (entt::snapshot{registry_}.template get<entt_ext::parent<ComponentsT>>(ar), ...);
+            // (entt::snapshot{registry_}.template get<entt_ext::children<ComponentsT>>(ar), ...);
+          }
+          self.complete();
+        });
+      },
+      asio::use_awaitable);
+}
+
+template <typename ArchiveT, typename... ComponentsT>
+asio::awaitable<bool> ecs::merge_snapshot(ArchiveT& ar) {
+  co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(bool)>(
+      [&ar, this](auto&& self) {
+        asio::post(main_io_context(), [self = std::move(self), &ar, this]() mutable {
+          {
+            emplace<loading_tag>(global_entity_);
+
+            // Load entities
+            continuous_loader_.get<entt_ext::entity>(ar);
+
+            // Load components
+            (continuous_loader_.template get<ComponentsT>(ar), ...);
+            // (continuous_loader_.template get<entt_ext::parent<ComponentsT>>(ar), ...);
+            // (continuous_loader_.template get<entt_ext::children<ComponentsT>>(ar), ...);
+
+            continuous_loader_.orphans();
+
+            // Remap entity references inside components after loading
+            (remap_component_entities<ComponentsT>(), ...);
+            // (remap_component_entities<entt_ext::parent<ComponentsT>>(), ...);
+            // (remap_component_entities<entt_ext::children<ComponentsT>>(), ...);
+
+            remove<loading_tag>(global_entity_);
+          }
+          self.complete(true);
+        });
+      },
+      asio::use_awaitable);
 }
 } // namespace entt_ext
