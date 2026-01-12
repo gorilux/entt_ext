@@ -287,4 +287,26 @@ struct entity_mapping_update_response {
   }
 };
 
+// Entity destruction request - clients notify server when entities are destroyed
+struct entity_destroy_request {
+  std::string  session_id;    // Session ID from handshake
+  entity       server_entity; // The server entity to destroy
+  version_type sync_version;
+
+  template <typename Archive>
+  void serialize(Archive& archive) {
+    archive(session_id, server_entity, sync_version);
+  }
+};
+
+struct entity_destroy_response {
+  bool        success;
+  std::string error_message;
+
+  template <typename Archive>
+  void serialize(Archive& archive) {
+    archive(success, error_message);
+  }
+};
+
 } // namespace entt_ext::sync

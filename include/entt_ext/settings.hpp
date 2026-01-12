@@ -119,12 +119,16 @@ asio::awaitable<entt_ext::ecs> load(std::string const& filename) {
     co_return ecs;
   }
 
-  std::ifstream    ifs(filename, std::ios::binary);
-  InputArchiveType archive(ifs);
-  settings_header  header;
-  archive(header);
-
-  co_await SettingsCollectionT::load(header.version, archive, ecs);
+  try {
+    std::ifstream    ifs(filename, std::ios::binary);
+    InputArchiveType archive(ifs);
+    settings_header  header;
+    archive(header);
+    co_await SettingsCollectionT::load(header.version, archive, ecs);
+  } catch (std::exception const& ex) {
+    spdlog::error("Failed to load settings: {}", ex.what());
+    co_return ecs;
+  }
 
   co_return ecs;
 }
@@ -135,12 +139,15 @@ asio::awaitable<bool> merge(std::string const& filename, entt_ext::ecs& ecs) {
   if (!std::filesystem::exists(filename)) {
     co_return false;
   }
-
-  std::ifstream    ifs(filename, std::ios::binary);
-  InputArchiveType archive(ifs);
-  settings_header  header;
-  archive(header);
-
-  co_return co_await SettingsCollectionT::merge(header.version, archive, ecs);
+  try {
+    std::ifstream    ifs(filename, std::ios::binary);
+    InputArchiveType archive(ifs);
+    settings_header  header;
+    archive(header);
+    co_return co_await SettingsCollectionT::merge(header.version, archive, ecs);
+  } catch (std::exception const& ex) {
+    spdlog::error("Failed to load settings: {}", ex.what());
+    co_return false;
+  }
 }
 } // namespace entt_ext

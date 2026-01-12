@@ -102,6 +102,45 @@ public:
     }
   }
 
+  // Entity destruction endpoint - clients notify server about entity destruction
+  asio::awaitable<entity_destroy_response> handle_entity_destroy(entity_destroy_request const& request) {
+    try {
+      entity server_entity = request.server_entity;
+
+      spdlog::info("Destroying server entity {} (session {}, version {})",
+                   static_cast<int>(server_entity),
+                   request.session_id,
+                   std::chrono::duration_cast<std::chrono::milliseconds>(request.sync_version.time_since_epoch()).count());
+
+      // Validate server entity exists
+      if (!ecs_.valid(server_entity)) {
+        std::string error_msg = "Server entity does not exist";
+        spdlog::warn("{}: {}", error_msg, static_cast<int>(server_entity));
+        co_return entity_destroy_response{.success = false, .error_message = error_msg};
+      }
+
+      // Notify other clients about the entity destruction before destroying it
+      try {
+        co_await notify_entity_destruction_to_other_clients(server_entity, request.sync_version, request.session_id);
+      } catch (std::exception const& ex) {
+        spdlog::error("Error notifying entity destruction to other clients: {}", ex.what());
+      } catch (...) {
+        spdlog::error("Error notifying entity destruction to other clients: unknown exception");
+      }
+
+      // Destroy the server entity
+      co_await ecs_.destroy_deferred(server_entity);
+
+      spdlog::debug("Server entity {} destroyed successfully", static_cast<int>(server_entity));
+
+      co_return entity_destroy_response{.success = true, .error_message = ""};
+
+    } catch (std::exception const& ex) {
+      spdlog::error("Error destroying entity: {}", ex.what());
+      co_return entity_destroy_response{.success = false, .error_message = std::string("Exception: ") + ex.what()};
+    }
+  }
+
   // Handshake endpoint for session creation
   asio::awaitable<handshake_response> handle_handshake_request(handshake_request const& request) {
     try {
@@ -195,7 +234,7 @@ public:
         co_return component_update_response<ComponentT>{.success = false, .error_message = "Server entity does not exist"};
       }
 
-      ecs_.template emplace_or_replace<component_update_request<ComponentT>>(server_entity, request);
+      co_await ecs_.template emplace_or_replace_deferred<component_update_request<ComponentT>>(server_entity, request);
 
       spdlog::debug("Component {} update handled: {} {}",
                     type_name<ComponentT>(),
@@ -316,107 +355,111 @@ private:
     // Set up component observer to track server-side changes
     auto& observer = ecs.component_observer<ComponentT>();
 
-    // When a sync component is added by the server, notify all clients
-    observer.on_construct([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> void {
+    // When a sync component is added by the server, notify all clients immediately
+    observer.on_construct([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
       spdlog::debug("Server-side component added: {} {}", type_name<ComponentT>(), static_cast<int>(e));
       if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
-        return;
+        co_return;
       }
+
       auto sync_version = std::chrono::steady_clock::now();
-      ecs.template emplace_or_replace<local_component_changed<ComponentT>>(e, sync_version);
+
+      try {
+        co_await notify_component_update_to_all_clients<ComponentT>(e, sync_version, component);
+      } catch (std::exception const& ex) {
+        spdlog::error("Error notifying component update to all clients: {}", ex.what());
+      } catch (...) {
+        spdlog::error("Error notifying component update to all clients: unknown exception");
+      }
+
+      co_return;
     });
 
-    // When a sync component is updated by the server, notify all clients
-    observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> void {
+    // When a sync component is updated by the server, notify all clients immediately
+    observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
       spdlog::debug("Server-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
       if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
-        return;
+        co_return;
       }
+
       auto sync_version = std::chrono::steady_clock::now();
-      ecs.template emplace_or_replace<local_component_changed<ComponentT>>(e, sync_version);
+
+      try {
+        co_await notify_component_update_to_all_clients<ComponentT>(e, sync_version, component);
+      } catch (std::exception const& ex) {
+        spdlog::error("Error notifying component update to all clients: {}", ex.what());
+      } catch (...) {
+        spdlog::error("Error notifying component update to all clients: unknown exception");
+      }
+
+      co_return;
     });
 
-    // When a sync component is removed by the server, notify all clients
-    observer.on_destroy([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> void {
+    // When a sync component is removed by the server, notify all clients immediately
+    observer.on_destroy([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
       spdlog::debug("Server-side component removed: {} {}", type_name<ComponentT>(), static_cast<int>(e));
-      // Notify all clients about the component removal
       if (auto request = ecs.template try_get<component_remove_request<ComponentT>>(e); request != nullptr) {
-        return;
+        co_return;
       }
+
       auto sync_version = std::chrono::steady_clock::now();
-      ecs.template emplace_or_replace<local_component_removed<ComponentT>>(e, sync_version);
+
+      try {
+        co_await notify_component_removal_to_all_clients<ComponentT>(e, sync_version);
+      } catch (std::exception const& ex) {
+        spdlog::error("Error notifying component removal to all clients: {}", ex.what());
+      } catch (...) {
+        spdlog::error("Error notifying component removal to all clients: unknown exception");
+      }
+
+      co_return;
     });
 
-    // Set up system to process component changes
-    ecs.system<local_component_changed<ComponentT>, ComponentT>(entt::exclude<component_update_request<ComponentT>>)
-        .each(
-            [this](entt_ext::ecs&                       ecs,
-                   entt_ext::system&                    self,
-                   double                               dt,
-                   entt_ext::entity                     e,
-                   local_component_changed<ComponentT>& sync_data,
-                   ComponentT&                          component) -> asio::awaitable<void> {
-              // Notify all clients about the component update
-              co_await notify_component_update_to_all_clients<ComponentT>(e, sync_data.sync_version, component);
-              co_await ecs.template remove_deferred<local_component_changed<ComponentT>>(e);
-              co_return;
-            },
-            entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
-        .stage(entt_ext::stage::update);
+    // Set up observer for component_update_request to apply updates from clients
+    auto& update_request_observer = ecs.component_observer<component_update_request<ComponentT>>();
 
-    ecs.system<component_update_request<ComponentT>, ComponentT>(entt::exclude<local_component_changed<ComponentT>>)
-        .each(
-            [this](entt_ext::ecs&                        ecs,
-                   entt_ext::system&                     self,
-                   double                                dt,
-                   entt_ext::entity                      e,
-                   component_update_request<ComponentT>& request,
-                   ComponentT&                           component) -> asio::awaitable<void> {
-              // Notify all clients about the component update
-              co_await ecs.template replace_deferred<ComponentT>(e, request.component_data);
-              co_await notify_component_update_to_other_clients<ComponentT>(e, request.sync_version, component, request.session_id);
-              co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
-              co_return;
-            },
-            entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
-        .stage(entt_ext::stage::update);
+    update_request_observer.on_construct(
+        [this](entt_ext::ecs& ecs, entt_ext::entity e, component_update_request<ComponentT>& request) -> asio::awaitable<void> {
+          try {
+            // Apply the component update
+            spdlog::debug("Applying component update request: {} server={} client={} version={}",
+                          type_name<ComponentT>(),
+                          static_cast<int>(e),
+                          std::chrono::duration_cast<std::chrono::milliseconds>(request.sync_version.time_since_epoch()).count(),
+                          request.session_id);
+            ecs.template emplace_or_replace<ComponentT>(e, request.component_data);
 
-    ecs.system<component_update_request<ComponentT>>(entt::exclude<ComponentT>)
-        .each(
-            [this](entt_ext::ecs& ecs, entt_ext::system& self, double dt, entt_ext::entity e, component_update_request<ComponentT>& request)
-                -> asio::awaitable<void> {
-              // Notify all clients about the component update
-              co_await ecs.template emplace_deferred<ComponentT>(e, request.component_data);
+            // Notify all other clients about the component update
+            co_await notify_component_update_to_other_clients<ComponentT>(e, request.sync_version, request.component_data, request.session_id);
 
-              co_await notify_component_update_to_other_clients<ComponentT>(e, request.sync_version, request.component_data, request.session_id);
-              co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
-              co_return;
-            },
-            entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
-        .stage(entt_ext::stage::update);
+            // Remove the request marker
+            co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
+          } catch (std::exception const& ex) {
+            spdlog::error("Error applying component update request: {}", ex.what());
+          } catch (...) {
+            spdlog::error("Error applying component update request: unknown exception");
+          }
 
-    ecs.system<component_remove_request<ComponentT>>(entt::exclude<local_component_removed<ComponentT>>)
-        .each(
-            [this](entt_ext::ecs& ecs, entt_ext::system& self, double dt, entt_ext::entity e, component_remove_request<ComponentT>& request)
-                -> asio::awaitable<void> {
-              co_await ecs.template remove_deferred<ComponentT>(e);
-              co_await notify_component_removal_to_other_clients<ComponentT>(e, request.sync_version, request.session_id);
-              co_await ecs.template remove_deferred<component_remove_request<ComponentT>>(e);
-              co_return;
-            },
-            entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
-        .stage(entt_ext::stage::update);
+          co_return;
+        });
 
-    ecs.system<local_component_removed<ComponentT>>(entt::exclude<component_remove_request<ComponentT>>)
-        .each(
-            [this](entt_ext::ecs& ecs, entt_ext::system& self, double dt, entt_ext::entity e, local_component_removed<ComponentT>& sync_data)
-                -> asio::awaitable<void> {
-              co_await notify_component_removal_to_all_clients<ComponentT>(e, sync_data.sync_version);
-              co_await ecs.template remove_deferred<local_component_removed<ComponentT>>(e);
-              co_return;
-            },
-            entt_ext::run_policy_t<entt_ext::run_policy::detached>{})
-        .stage(entt_ext::stage::update);
+    // Set up observer for component_remove_request to apply removals from clients
+    auto& remove_request_observer = ecs.component_observer<component_remove_request<ComponentT>>();
+
+    remove_request_observer.on_construct(
+        [this](entt_ext::ecs& ecs, entt_ext::entity e, component_remove_request<ComponentT>& request) -> asio::awaitable<void> {
+          try {
+            ecs.template remove<ComponentT>(e);
+            co_await notify_component_removal_to_other_clients<ComponentT>(e, request.sync_version, request.session_id);
+            co_await ecs.template remove_deferred<component_remove_request<ComponentT>>(e);
+          } catch (std::exception const& ex) {
+            spdlog::error("Error applying component remove request: {}", ex.what());
+          } catch (...) {
+            spdlog::error("Error applying component remove request: unknown exception");
+          }
+
+          co_return;
+        });
   }
 
   // Send component update notification to all clients (server-initiated changes)
@@ -523,6 +566,12 @@ private:
       if (client_id == except_client_id)
         continue;
 
+      spdlog::debug("Notifying component update to other client: {} server={} client={} except={} version={}",
+                    type_name<ComponentT>(),
+                    static_cast<int>(server_entity),
+                    client_id,
+                    except_client_id,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
       // Send notification with server entity ID and component data
       component_update_request<ComponentT> request{.session_id     = client_id,
                                                    .sync_version   = sync_version,
@@ -563,6 +612,99 @@ private:
         // Continue with other clients
       }
     }
+  }
+
+  // ============================================================================
+  // Entity Destruction Notification Functions
+  // ============================================================================
+
+  // Send entity destruction notification to a specific client
+  asio::awaitable<void> notify_entity_destruction_to_client(entity server_entity, version_type sync_version, std::string const& client_id) {
+    spdlog::debug("Notifying entity destruction to client: server_entity={} client={} version={}",
+                  static_cast<int>(server_entity),
+                  client_id,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
+
+    std::string notification_name = "entity_destroyed";
+
+    // Send server entity in the request
+    entity_destroy_request request{.session_id = client_id, .server_entity = server_entity, .sync_version = sync_version};
+
+    try {
+      co_await rpc_server_.notify(notification_name, std::move(request));
+    } catch (std::exception const& ex) {
+      spdlog::error("Error notifying entity destruction to client {}: {}", client_id, ex.what());
+    } catch (...) {
+      spdlog::error("Error notifying entity destruction to client {}: unknown exception", client_id);
+    }
+    co_return;
+  }
+
+  // Send entity destruction notification to all clients (server-initiated changes)
+  asio::awaitable<void> notify_entity_destruction_to_all_clients(entity server_entity, version_type sync_version) {
+    if (!notifications_enabled_) {
+      co_return; // Skip notifications if disabled
+    }
+
+    std::string notification_name = "entity_destroyed";
+
+    spdlog::debug("Notifying entity destruction to all clients: server_entity={} version={}",
+                  static_cast<int>(server_entity),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
+
+    // Notify all clients with server entity ID
+    for (auto& [client_id, client_state] : client_states_) {
+      entity_destroy_request request{.session_id = client_id, .server_entity = server_entity, .sync_version = sync_version};
+      try {
+        co_await rpc_server_.notify(notification_name, std::move(request));
+      } catch (std::exception const& ex) {
+        spdlog::error("Error notifying entity destruction to client {}: {}", client_id, ex.what());
+        // Continue with other clients
+      } catch (...) {
+        spdlog::error("Error notifying entity destruction to client {}: unknown exception", client_id);
+        // Continue with other clients
+      }
+    }
+    co_return;
+  }
+
+  // Send entity destruction notification to all other clients (except the one that initiated it)
+  asio::awaitable<void>
+  notify_entity_destruction_to_other_clients(entity server_entity, version_type sync_version, std::string const& except_client_id) {
+    if (!notifications_enabled_) {
+      co_return; // Skip notifications if disabled
+    }
+
+    std::string notification_name = "entity_destroyed";
+
+    spdlog::debug("Notifying entity destruction to other clients: server_entity={} except_client={} version={}",
+                  static_cast<int>(server_entity),
+                  except_client_id,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
+
+    // Notify each client (except the one that made the change) with server entity ID
+    for (auto& [client_id, client_state] : client_states_) {
+      if (client_id == except_client_id)
+        continue;
+
+      spdlog::debug("Notifying entity destruction to client: server_entity={} client={} version={}",
+                    static_cast<int>(server_entity),
+                    client_id,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
+
+      // Send notification with server entity ID
+      entity_destroy_request request{.session_id = client_id, .server_entity = server_entity, .sync_version = sync_version};
+      try {
+        co_await rpc_server_.notify(notification_name, std::move(request));
+      } catch (std::exception const& ex) {
+        spdlog::error("Error notifying entity destruction to client {}: {}", client_id, ex.what());
+        // Continue with other clients
+      } catch (...) {
+        spdlog::error("Error notifying entity destruction to client {}: unknown exception", client_id);
+        // Continue with other clients
+      }
+    }
+    co_return;
   }
 
   template <typename ComponentT>
@@ -665,6 +807,11 @@ private:
     // Register entity creation endpoint
     rpc_server_.attach("entity_create", [this](entity_create_request const& request) -> asio::awaitable<entity_create_response> {
       co_return co_await handle_entity_create(request);
+    });
+
+    // Register entity destruction endpoint
+    rpc_server_.attach("entity_destroy", [this](entity_destroy_request const& request) -> asio::awaitable<entity_destroy_response> {
+      co_return co_await handle_entity_destroy(request);
     });
 
     // Register component-specific endpoints using fold expression

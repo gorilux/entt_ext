@@ -520,16 +520,14 @@ public:
 
   template <typename ParentType, typename ChildType, typename... ArgsT>
   decltype(auto) emplace_child(entt_ext::entity prnt, entt_ext::entity chld, ArgsT&&... args) {
-    get_or_emplace<children<ChildType>>(prnt).insert(chld);
-
+    register_child_relationship<ParentType, ChildType>(prnt, chld);
     emplace<parent<ParentType>>(chld, prnt);
     return emplace<ChildType>(chld, std::forward<ArgsT>(args)...);
   }
 
   template <typename ParentType, typename ChildType, typename... ArgsT>
   decltype(auto) emplace_or_replace_child(entt_ext::entity prnt, entt_ext::entity chld, ArgsT&&... args) {
-    get_or_emplace<children<ChildType>>(prnt).insert(chld);
-
+    register_child_relationship<ParentType, ChildType>(prnt, chld);
     emplace_or_replace<parent<ParentType>>(chld, prnt);
     return emplace_or_replace<ChildType>(chld, std::forward<ArgsT>(args)...);
   }
@@ -541,7 +539,7 @@ public:
 
   template <typename ParentType, typename ChildType>
   void assign_child(entt_ext::entity prnt, entt_ext::entity chld) {
-    get_or_emplace<children<ChildType>>(prnt).insert(chld);
+    register_child_relationship<ParentType, ChildType>(prnt, chld);
 
     if (auto parent_ptr = try_get<parent<ParentType>>(chld); parent_ptr) {
       if (parent_ptr->entity == prnt) {
@@ -554,6 +552,13 @@ public:
     } else {
       emplace<parent<ParentType>>(chld, prnt);
     }
+  }
+
+  template <typename ParentType, typename ChildType>
+  void destroy_child(entt_ext::entity prnt, entt_ext::entity chld) {
+    // Destroy the child entity
+    // The parent<ParentType> component observer will automatically remove it from parent's children set
+    destroy(chld);
   }
 
   template <typename Type, typename... Others, typename FuncT>
@@ -643,7 +648,7 @@ public:
         asio::detached);
   }
 
-  void run(int timeout_ms = 10, size_t concurrency = std::thread::hardware_concurrency());
+  void run(int timeout_ms = 16, size_t concurrency = std::thread::hardware_concurrency());
   void stop();
   auto main_io_context() -> asio::io_context&;
   auto main_io_context() const -> const asio::io_context&;
@@ -693,6 +698,46 @@ public:
   asio::awaitable<void> process_command_channel();
 
 private:
+  // Helper to register cleanup and add child to parent's children set
+  template <typename ParentType, typename ChildType>
+  void register_child_relationship(entt_ext::entity prnt, entt_ext::entity chld) {
+    // Register automatic cleanup when parent is destroyed
+    if (!any_of<children<ChildType>>(prnt)) {
+      static bool cleanup_registered = [this]() {
+        component_observer<children<ChildType>>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, children<ChildType>& children_set) {
+          for (auto child_entity : children_set) {
+            if (ecs_ref.valid(child_entity)) {
+              ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
+            }
+          }
+        });
+        return true;
+      }();
+      (void)cleanup_registered;
+
+      emplace<children<ChildType>>(prnt, children<ChildType>{chld});
+    } else {
+      patch<children<ChildType>>(prnt, [chld](auto& children_set) {
+        children_set.insert(chld);
+      });
+    }
+
+    // Register automatic removal from parent's children set when child is destroyed
+    static bool child_cleanup_registered = [this]() {
+      component_observer<parent<ParentType>>().on_destroy([](ecs& ecs_ref, entity_type child_entity, parent<ParentType>& parent_comp) {
+        // Remove child from parent's children set when child is destroyed
+        if (ecs_ref.valid(parent_comp.entity)) {
+          if (auto children_ptr = ecs_ref.template try_get<children<ChildType>>(parent_comp.entity);
+              children_ptr && children_ptr->contains(child_entity)) {
+            children_ptr->erase(child_entity);
+          }
+        }
+      });
+      return true;
+    }();
+    (void)child_cleanup_registered;
+  }
+
   // Helper to remap entity references in components after loading from snapshot
   template <typename ComponentT>
   void remap_component_entities() {
@@ -896,22 +941,6 @@ inline decltype(auto) ecs::emplace_or_replace(const entity_type entt, Args&&... 
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::get_or_emplace(const entity_type entt, Args&&... args) {
   component_observer<Type>();
-
-  // If this is a children<> component, register automatic cleanup on destroy
-  if constexpr (is_children_v<Type>) {
-    static bool cleanup_registered = [this]() {
-      component_observer<Type>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, Type& children_set) {
-        for (auto child_entity : children_set) {
-          if (ecs_ref.valid(child_entity)) {
-            ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
-          }
-        }
-      });
-      return true;
-    }();
-    (void)cleanup_registered;
-  }
-
   return registry_.template get_or_emplace<Type>(entt, std::forward<Args>(args)...);
 }
 inline void ecs::delete_later(const entity_type entt) {
@@ -949,7 +978,7 @@ inline auto ecs::emplace_or_replace_deferred(const entity_type entt, Args&&... a
   deferred_command cmd{.operation      = deferred_command::op_type::emplace,
                        .entity         = entt,
                        .component_type = entt::type_hash<Type>::value(),
-                       .executor       = [entt, args_tuple = std::move(args_tuple)](ecs& ecs_ref) mutable {
+                       .executor       = [entt, args_tuple = std::move(args_tuple)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
                          std::apply(
                              [&](auto&&... args) {
                                ecs_ref.template emplace_or_replace<Type>(entt, std::forward<decltype(args)>(args)...);

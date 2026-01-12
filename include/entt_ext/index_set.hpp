@@ -138,6 +138,42 @@ public:
   index_set()  = default;
   ~index_set() = default;
 
+  // Initializer list constructor
+  index_set(std::initializer_list<K> init) {
+    elements.reserve(init.size());
+    for (const auto& key : init) {
+      if (index_map.find(key) == index_map.end()) {
+        size_t index   = elements.size();
+        index_map[key] = index;
+        elements.push_back(key);
+      }
+    }
+  }
+
+  // Copy constructor
+  index_set(const index_set& other) = default;
+
+  // Move constructor
+  index_set(index_set&& other) noexcept = default;
+
+  // Copy assignment operator
+  index_set& operator=(const index_set& other) {
+    if (this != &other) {
+      elements  = other.elements;
+      index_map = other.index_map;
+    }
+    return *this;
+  }
+
+  // Move assignment operator
+  index_set& operator=(index_set&& other) noexcept {
+    if (this != &other) {
+      elements  = std::move(other.elements);
+      index_map = std::move(other.index_map);
+    }
+    return *this;
+  }
+
   // Insert a key into the set at the end.
   // Returns true if the key was inserted; false if the key already exists.
   bool insert(const K& key) {

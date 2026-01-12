@@ -55,11 +55,30 @@ public:
   template <typename FuncT>
   handler_id on_destroy(FuncT&& func) {
     auto id = next_handler_id++;
-    if constexpr (std::is_same_v<std::invoke_result_t<FuncT, EcsT&, entt_ext::entity, Type&>, asio::awaitable<void>>) {
+
+    // Special case for entt::entity type - it's not a component, so handlers take only 2 params
+    if constexpr (std::is_same_v<Type, entt::entity>) {
+      if constexpr (std::is_same_v<std::invoke_result_t<FuncT, EcsT&, entt_ext::entity>, asio::awaitable<void>>) {
+        // Async handler for entity destruction
+        on_destroy_async_handlers.emplace(id, [func = std::forward<FuncT>(func)](EcsT& ecs, entt_ext::entity entt) -> asio::awaitable<void> {
+          co_await func(ecs, entt);
+        });
+      } else {
+        // Sync handler for entity destruction
+        on_destroy_handlers.emplace(id, [func = std::forward<FuncT>(func)](EcsT& ecs, entt_ext::entity entt) {
+          func(ecs, entt);
+        });
+      }
+    } else if constexpr (std::is_same_v<std::invoke_result_t<FuncT, EcsT&, entt_ext::entity, Type&>, asio::awaitable<void>>) {
       // Async handler - wrap it to handle component retrieval at registration time
       on_destroy_async_handlers.emplace(id, [func = std::forward<FuncT>(func)](EcsT& ecs, entt_ext::entity entt) -> asio::awaitable<void> {
         if constexpr (entt::component_traits<Type>::page_size > 0u) {
-          co_await func(ecs, entt, ecs.template get<Type>(entt));
+          if (ecs.template all_of<Type>(entt)) {
+            co_await func(ecs, entt, ecs.template get<Type>(entt));
+          } else {
+            Type t;
+            co_await func(ecs, entt, t);
+          }
         } else {
           Type t;
           co_await func(ecs, entt, t);
@@ -69,7 +88,12 @@ public:
       // Sync handler - wrap it to handle component retrieval at registration time
       on_destroy_handlers.emplace(id, [func = std::forward<FuncT>(func)](EcsT& ecs, entt_ext::entity entt) {
         if constexpr (entt::component_traits<Type>::page_size > 0u) {
-          func(ecs, entt, ecs.template get<Type>(entt));
+          if (ecs.template all_of<Type>(entt)) {
+            func(ecs, entt, ecs.template get<Type>(entt));
+          } else {
+            Type t;
+            func(ecs, entt, t);
+          }
         } else {
           Type t;
           func(ecs, entt, t);

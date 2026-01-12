@@ -251,6 +251,15 @@ public:
   }
 
   /**
+   * @brief Tests if a loader knows about a given local entity.
+   * @param entt A valid local identifier.
+   * @return True if the local entity is managed by the loader, false otherwise.
+   */
+  [[nodiscard]] bool contains_local(entity_type entt) const noexcept {
+    return locrem_.find(entt) != locrem_.cend();
+  }
+
+  /**
    * @brief Returns the remote identifier to which a local entity refers.
    * @param entt A valid local identifier.
    * @return The remote identifier if any, the null entity otherwise.
@@ -277,6 +286,38 @@ public:
     const auto entity = to_entity(remote);
     remloc_.insert_or_assign(entity, std::make_pair(remote, local));
     locrem_.insert_or_assign(local, remote);
+  }
+
+  /**
+   * @brief Manually remove a remote-to-local entity mapping.
+   *
+   * This allows external code to remove entity mappings without going
+   * through the deserialization process. The remote entity is provided from
+   * outside the loader.
+   *
+   * @param remote The remote (server) entity identifier.
+   */
+  void remove_mapping_by_remote(entity_type remote) {
+    const auto entity = to_entity(remote);
+    if (const auto it = remloc_.find(entity); it != remloc_.cend() && it->second.first == remote) {
+      locrem_.erase(it->second.second);
+      remloc_.erase(it);
+    }
+  }
+  /**
+   * @brief Manually remove a remote-to-local entity mapping.
+   *
+   * This allows external code to remove entity mappings without going
+   * through the deserialization process. The local entity is provided from
+   * outside the loader.
+   *
+   * @param local The local (client) entity identifier.
+   */
+  void remove_mapping_by_local(entity_type local) {
+    if (const auto it = locrem_.find(local); it != locrem_.cend()) {
+      remloc_.erase(to_entity(it->second));
+      locrem_.erase(it);
+    }
   }
 
 private:

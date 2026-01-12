@@ -6,8 +6,9 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
+#else
+#include <spdlog/spdlog.h>
 #endif
-
 namespace entt_ext {
 
 #ifdef __EMSCRIPTEN__
@@ -243,7 +244,7 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
     auto [ec] = co_await timer.async_wait(use_nothrow_awaitable);
 
     if (ec) {
-      // spdlog::warn("run_update_loop: {}", ec.message());
+      spdlog::warn("run_update_loop: {}", ec.message());
       co_return;
     }
   }
