@@ -28,7 +28,7 @@ struct deferred_command {
     custom
   };
 
-  op_type                                              operation;
+  op_type                                              operation      = op_type::custom; // Default value for safety
   entt_ext::entity                                     entity         = entt_ext::null;
   entt::id_type                                        component_type = 0;
   std::move_only_function<asio::awaitable<void>(ecs&)> executor;

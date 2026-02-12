@@ -2,6 +2,7 @@
 
 #include "core.hpp"
 #include "ecs_fwd.hpp"
+#include "hierarchy_wrapper.hpp"
 
 #include "component_observer.hpp"
 #include "continuous_loader_with_mapping.hpp"
@@ -29,6 +30,7 @@
 #include <thread>
 #include <tuple>
 #include <type_traits>
+#include <unordered_set>
 
 // #include <spdlog/spdlog.h>
 
@@ -157,11 +159,11 @@ public:
 
     void skip_invalid() {
       if constexpr (entt::component_traits<Type>::page_size > 0u) {
-        while (it != end && !ecs.template all_of<Type, Types...>(*it)) {
+        while (it != end && (!ecs.valid(*it) || !ecs.template all_of<Type, Types...>(*it))) {
           ++it;
         }
       } else {
-        while (it != end && !ecs.template all_of<Types...>(*it)) {
+        while (it != end && (!ecs.valid(*it) || !ecs.template all_of<Types...>(*it))) {
           ++it;
         }
       }
@@ -281,8 +283,13 @@ public:
   using alloc_traits          = std::allocator_traits<std::allocator<entt_ext::entity>>;
   using adjacency_matrix_type = entt::adjacency_matrix<entt::directed_tag>;
 
-  ecs(std::string const& persistance_filename = "");
-  explicit ecs(const allocator_type& allocator, std::string const& persistance_filename = "");
+  /// Default command channel buffer size
+  static constexpr std::size_t default_command_channel_size = 1000;
+
+  ecs(std::string const& persistance_filename = "", std::size_t command_channel_size = default_command_channel_size);
+  explicit ecs(const allocator_type& allocator,
+               std::string const&    persistance_filename = "",
+               std::size_t           command_channel_size = default_command_channel_size);
   ecs(ecs&& other) noexcept;
   ecs& operator=(ecs&& other) noexcept;
 
@@ -602,15 +609,18 @@ public:
 
   template <typename FuncT>
   auto post_and_await(FuncT&& func) -> asio::awaitable<void> {
-    co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-        [this, func = std::move(func)](auto&& self) {
-          asio::defer(main_io_context(), [self = std::move(self), this, func = std::move(func)]() mutable {
-            func(*this);
-            self.complete();
+    // Wrap function in shared_ptr to survive any copies during async operations
+    auto func_ptr = std::make_shared<std::decay_t<FuncT>>(std::forward<FuncT>(func));
+
+    co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
+        [this, func_ptr](auto handler) mutable {
+          asio::post(main_io_context(), [this, func_ptr, handler = std::move(handler)]() mutable {
+            (*func_ptr)(*this);
+            std::move(handler)();
           });
         },
         asio::use_awaitable);
-    ;
+    co_return;
   }
 
   // Defers a synchronous function to be executed on the ECS command queue
@@ -657,8 +667,8 @@ public:
   // ============= Deferred Operations API ============
 
   // Deferred structural operations
-  entity_type create_deferred();
-  auto        destroy_deferred(const entity_type entt) -> asio::awaitable<void>;
+  [[nodiscard]] entity_type create_deferred();
+  auto                      destroy_deferred(const entity_type entt) -> asio::awaitable<void>;
 
   template <typename Type, typename... Args>
   auto emplace_deferred(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
@@ -701,20 +711,10 @@ private:
   // Helper to register cleanup and add child to parent's children set
   template <typename ParentType, typename ChildType>
   void register_child_relationship(entt_ext::entity prnt, entt_ext::entity chld) {
-    // Register automatic cleanup when parent is destroyed
-    if (!any_of<children<ChildType>>(prnt)) {
-      static bool cleanup_registered = [this]() {
-        component_observer<children<ChildType>>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, children<ChildType>& children_set) {
-          for (auto child_entity : children_set) {
-            if (ecs_ref.valid(child_entity)) {
-              ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
-            }
-          }
-        });
-        return true;
-      }();
-      (void)cleanup_registered;
+    // Register automatic cleanup when parent is destroyed (marks children for deletion)
+    register_children_cleanup_handler<children<ChildType>>();
 
+    if (!any_of<children<ChildType>>(prnt)) {
       emplace<children<ChildType>>(prnt, children<ChildType>{chld});
     } else {
       patch<children<ChildType>>(prnt, [chld](auto& children_set) {
@@ -723,7 +723,11 @@ private:
     }
 
     // Register automatic removal from parent's children set when child is destroyed
-    static bool child_cleanup_registered = [this]() {
+    // Use a combined type hash for parent<ParentType> + children<ChildType> relationship
+    auto parent_cleanup_hash = entt::type_hash<parent<ParentType>>::value() ^ entt::type_hash<children<ChildType>>::value();
+    if (!is_cleanup_registered(parent_cleanup_hash)) {
+      mark_cleanup_registered(parent_cleanup_hash);
+
       component_observer<parent<ParentType>>().on_destroy([](ecs& ecs_ref, entity_type child_entity, parent<ParentType>& parent_comp) {
         // Remove child from parent's children set when child is destroyed
         if (ecs_ref.valid(parent_comp.entity)) {
@@ -733,9 +737,7 @@ private:
           }
         }
       });
-      return true;
-    }();
-    (void)child_cleanup_registered;
+    }
   }
 
   // Helper to remap entity references in components after loading from snapshot
@@ -770,6 +772,20 @@ private:
 
   auto run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable<void>;
 
+  // Helper to check if cleanup handler is already registered for a component type
+  bool is_cleanup_registered(entt::id_type type_hash) const {
+    return registered_cleanup_handlers_.contains(type_hash);
+  }
+
+  // Helper to mark a cleanup handler as registered for a component type
+  void mark_cleanup_registered(entt::id_type type_hash) {
+    registered_cleanup_handlers_.insert(type_hash);
+  }
+
+  // Helper to register children cleanup handler (extracted from duplicated code)
+  template <typename ChildrenType>
+  void register_children_cleanup_handler();
+
 private:
   registry_type                                                     registry_;
   entt_ext::entity                                                  global_entity_ = entt_ext::null;
@@ -777,9 +793,10 @@ private:
   asio::io_context                                                  main_io_context_       = asio::io_context{};
   asio::io_context                                                  concurrent_io_context_ = asio::io_context{};
   std::vector<std::function<asio::awaitable<void>(entt_ext::ecs&)>> defered_tasks_;
-  bool                                                              running_         = true;
-  bool                                                              is_loading_      = false;
-  command_channel                                                   command_channel_ = command_channel{main_io_context(), 1000};
+  bool                                                              running_ = true;
+  std::size_t                                                       command_channel_size_;
+  command_channel                                                   command_channel_;
+  std::unordered_set<entt::id_type>                                 registered_cleanup_handlers_;
 };
 
 template <typename T, typename... ArgsT>
@@ -816,6 +833,26 @@ inline auto ecs::system() -> system_builder<entt::get_t<ComponentsT...>, entt::e
   return system<ComponentsT...>(entt::exclude_t<>{});
 }
 
+// Helper to register children cleanup handler - extracted from duplicated code
+// This registers a destroy handler that marks all children for deletion when the parent is destroyed
+template <typename ChildrenType>
+inline void ecs::register_children_cleanup_handler() {
+  auto type_hash = entt::type_hash<ChildrenType>::value();
+  if (is_cleanup_registered(type_hash)) {
+    return; // Already registered for this instance
+  }
+  mark_cleanup_registered(type_hash);
+
+  component_observer<ChildrenType>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, ChildrenType& children_set) {
+    // Mark all children for deletion when parent is destroyed
+    for (auto child_entity : children_set) {
+      if (ecs_ref.valid(child_entity)) {
+        ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
+      }
+    }
+  });
+}
+
 // Now implement the ecs::component method after the class definition
 template <typename Type>
 inline decltype(auto) ecs::component_observer() {
@@ -850,23 +887,11 @@ inline decltype(auto) ecs::component_observer() {
 
 template <typename Type, typename... Args>
 inline decltype(auto) ecs::emplace(const entity_type entt, Args&&... args) {
-  auto& observer = component_observer<Type>();
+  component_observer<Type>();
 
   // If this is a children<> component, register automatic cleanup on destroy
   if constexpr (is_children_v<Type>) {
-    // Check if we already have a destroy handler registered for this component type
-    static bool cleanup_registered = [&observer]() {
-      observer.on_destroy([](ecs& ecs_ref, entity_type parent_entity, Type& children_set) {
-        // Mark all children for deletion when parent is destroyed
-        for (auto child_entity : children_set) {
-          if (ecs_ref.valid(child_entity)) {
-            ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
-          }
-        }
-      });
-      return true;
-    }();
-    (void)cleanup_registered; // Suppress unused variable warning
+    register_children_cleanup_handler<Type>();
   }
 
   return registry_.template emplace<Type>(entt, std::forward<Args>(args)...);
@@ -878,17 +903,7 @@ inline void ecs::insert(It first, It last, const Type& value) {
 
   // If this is a children<> component, register automatic cleanup on destroy
   if constexpr (is_children_v<Type>) {
-    static bool cleanup_registered = [this]() {
-      component_observer<Type>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, Type& children_set) {
-        for (auto child_entity : children_set) {
-          if (ecs_ref.valid(child_entity)) {
-            ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
-          }
-        }
-      });
-      return true;
-    }();
-    (void)cleanup_registered;
+    register_children_cleanup_handler<Type>();
   }
 
   return registry_.template insert<Type>(std::move(first), std::move(last), value);
@@ -900,17 +915,7 @@ inline void ecs::insert(EIt first, EIt last, CIt from) {
 
   // If this is a children<> component, register automatic cleanup on destroy
   if constexpr (is_children_v<Type>) {
-    static bool cleanup_registered = [this]() {
-      component_observer<Type>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, Type& children_set) {
-        for (auto child_entity : children_set) {
-          if (ecs_ref.valid(child_entity)) {
-            ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
-          }
-        }
-      });
-      return true;
-    }();
-    (void)cleanup_registered;
+    register_children_cleanup_handler<Type>();
   }
 
   registry_.template insert<Type>(first, last, from);
@@ -922,17 +927,7 @@ inline decltype(auto) ecs::emplace_or_replace(const entity_type entt, Args&&... 
 
   // If this is a children<> component, register automatic cleanup on destroy
   if constexpr (is_children_v<Type>) {
-    static bool cleanup_registered = [this]() {
-      component_observer<Type>().on_destroy([](ecs& ecs_ref, entity_type parent_entity, Type& children_set) {
-        for (auto child_entity : children_set) {
-          if (ecs_ref.valid(child_entity)) {
-            ecs_ref.emplace_if_not_exists<entt_ext::delete_later>(child_entity);
-          }
-        }
-      });
-      return true;
-    }();
-    (void)cleanup_registered;
+    register_children_cleanup_handler<Type>();
   }
 
   return registry_.template emplace_or_replace<Type>(entt, std::forward<Args>(args)...);
@@ -1090,9 +1085,19 @@ asio::awaitable<void> ecs::load_snapshot(ArchiveT& ar) {
           {
             emplace<loading_tag>(global_entity_);
             entt::snapshot_loader{registry_}.get<entt_ext::entity>(ar);
-            (entt::snapshot_loader{registry_}.template get<ComponentsT>(ar), ...);
-            // (entt::snapshot{registry_}.template get<entt_ext::parent<ComponentsT>>(ar), ...);
-            // (entt::snapshot{registry_}.template get<entt_ext::children<ComponentsT>>(ar), ...);
+
+            // Load components - unwrap with_hierarchy<T> to get actual type T,
+            // and also load parent<T>/children<T> if wrapped
+            auto load_component = [&]<typename T>() {
+              using ActualT = sync::unwrap_hierarchy_t<T>;
+              entt::snapshot_loader{registry_}.template get<ActualT>(ar);
+              if constexpr (sync::is_with_hierarchy_v<T>) {
+                entt::snapshot_loader{registry_}.template get<entt_ext::parent<ActualT>>(ar);
+                entt::snapshot_loader{registry_}.template get<entt_ext::children<ActualT>>(ar);
+              }
+            };
+            (load_component.template operator()<ComponentsT>(), ...);
+
             remove<loading_tag>(global_entity_);
           }
           self.complete();
@@ -1109,11 +1114,19 @@ asio::awaitable<void> ecs::save_snapshot(ArchiveT& ar) const {
       [&ar, this](auto&& self) {
         asio::post(const_cast<asio::io_context&>(main_io_context()), [self = std::move(self), &ar, this]() mutable {
           {
-
             entt::snapshot{registry_}.get<entt_ext::entity>(ar);
-            (entt::snapshot{registry_}.template get<ComponentsT>(ar), ...);
-            // (entt::snapshot{registry_}.template get<entt_ext::parent<ComponentsT>>(ar), ...);
-            // (entt::snapshot{registry_}.template get<entt_ext::children<ComponentsT>>(ar), ...);
+
+            // Save components - unwrap with_hierarchy<T> to get actual type T,
+            // and also save parent<T>/children<T> if wrapped
+            auto save_component = [&]<typename T>() {
+              using ActualT = sync::unwrap_hierarchy_t<T>;
+              entt::snapshot{registry_}.template get<ActualT>(ar);
+              if constexpr (sync::is_with_hierarchy_v<T>) {
+                entt::snapshot{registry_}.template get<entt_ext::parent<ActualT>>(ar);
+                entt::snapshot{registry_}.template get<entt_ext::children<ActualT>>(ar);
+              }
+            };
+            (save_component.template operator()<ComponentsT>(), ...);
           }
           self.complete();
         });
@@ -1132,17 +1145,30 @@ asio::awaitable<bool> ecs::merge_snapshot(ArchiveT& ar) {
             // Load entities
             continuous_loader_.get<entt_ext::entity>(ar);
 
-            // Load components
-            (continuous_loader_.template get<ComponentsT>(ar), ...);
-            // (continuous_loader_.template get<entt_ext::parent<ComponentsT>>(ar), ...);
-            // (continuous_loader_.template get<entt_ext::children<ComponentsT>>(ar), ...);
+            // Load components - unwrap with_hierarchy<T> to get actual type T,
+            // and also load parent<T>/children<T> if wrapped
+            auto load_component = [&]<typename T>() {
+              using ActualT = sync::unwrap_hierarchy_t<T>;
+              continuous_loader_.template get<ActualT>(ar);
+              if constexpr (sync::is_with_hierarchy_v<T>) {
+                continuous_loader_.template get<entt_ext::parent<ActualT>>(ar);
+                continuous_loader_.template get<entt_ext::children<ActualT>>(ar);
+              }
+            };
+            (load_component.template operator()<ComponentsT>(), ...);
 
             continuous_loader_.orphans();
 
             // Remap entity references inside components after loading
-            (remap_component_entities<ComponentsT>(), ...);
-            // (remap_component_entities<entt_ext::parent<ComponentsT>>(), ...);
-            // (remap_component_entities<entt_ext::children<ComponentsT>>(), ...);
+            auto remap_component = [this]<typename T>() {
+              using ActualT = sync::unwrap_hierarchy_t<T>;
+              remap_component_entities<ActualT>();
+              if constexpr (sync::is_with_hierarchy_v<T>) {
+                remap_component_entities<entt_ext::parent<ActualT>>();
+                remap_component_entities<entt_ext::children<ActualT>>();
+              }
+            };
+            (remap_component.template operator()<ComponentsT>(), ...);
 
             remove<loading_tag>(global_entity_);
           }

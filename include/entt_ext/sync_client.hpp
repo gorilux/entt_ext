@@ -229,14 +229,16 @@ private:
   // Set up notification handlers for a specific component type
   template <typename ComponentT>
   void setup_component_notification_handlers() {
-    // Set up for the component itself
-    setup_component_notification_handlers_impl<ComponentT>();
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
 
-    // // Also set up for hierarchy components if not already a hierarchy component
-    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
-    //   setup_component_notification_handlers_impl<entt_ext::parent<ComponentT>>();
-    //   setup_component_notification_handlers_impl<entt_ext::children<ComponentT>>();
-    // }
+    // Set up for the component itself
+    setup_component_notification_handlers_impl<ActualT>();
+
+    // Also set up for hierarchy components if wrapped with with_hierarchy<T>
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      setup_component_notification_handlers_impl<entt_ext::parent<ActualT>>();
+      setup_component_notification_handlers_impl<entt_ext::children<ActualT>>();
+    }
   }
 
   // Implementation of notification handler setup for a single component
@@ -266,10 +268,10 @@ private:
 
       // Apply component update directly WITHOUT triggering observers (prevent loops)
       if (ecs_.valid(client_entity)) {
-        spdlog::debug("received_component_update: {} server={} client={}",
-                      type_name<ComponentT>(),
-                      static_cast<int>(server_entity),
-                      static_cast<int>(client_entity));
+        // spdlog::debug("received_component_update: {} server={} client={}",
+        //               type_name<ComponentT>(),
+        //               static_cast<int>(server_entity),
+        //               static_cast<int>(client_entity));
         ecs_.template emplace_or_replace<component_update_request<ComponentT>>(client_entity, request);
       }
     });
@@ -305,14 +307,16 @@ private:
   // Set up automatic sync for a specific component type
   template <typename ComponentT>
   void setup_automatic_sync() {
-    // Set up for the component itself
-    setup_automatic_sync_impl<ComponentT>();
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
 
-    // // Also set up for hierarchy components if not already a hierarchy component
-    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
-    //   setup_automatic_sync_impl<entt_ext::parent<ComponentT>>();
-    //   setup_automatic_sync_impl<entt_ext::children<ComponentT>>();
-    // }
+    // Set up for the component itself
+    setup_automatic_sync_impl<ActualT>();
+
+    // Also set up for hierarchy components if wrapped with with_hierarchy<T>
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      setup_automatic_sync_impl<entt_ext::parent<ActualT>>();
+      setup_automatic_sync_impl<entt_ext::children<ActualT>>();
+    }
   }
 
   // Implementation of automatic sync setup for a single component
@@ -347,7 +351,7 @@ private:
 
     // When a sync component is updated, send it to server immediately
     observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
-      spdlog::debug("Client-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
+      // spdlog::debug("Client-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
 
       if (loading_snapshot_) {
         co_return;
@@ -405,12 +409,20 @@ private:
             }
 
             // Apply the component update
+            // Note: emplace_or_replace triggers on_update which queues an async handler.
+            // We must NOT remove the request marker until after that async handler has
+            // had a chance to check it. Since both handlers go through the same command
+            // channel, we use defer_async with a double-defer pattern to ensure the
+            // removal happens after the on_update handler completes.
             ecs.template emplace_or_replace<ComponentT>(e, component_data);
-            // Note: Do NOT remove the request marker here - we need it to persist
-            // until after all async on_update handlers have had a chance to check it.
-            // Use a separate deferred removal that runs after all current handlers complete.
-            ecs.defer([e](entt_ext::ecs& ecs_ref) {
-              ecs_ref.template remove<component_update_request<ComponentT>>(e);
+
+            // First defer: This gets queued after the on_update async handler
+            // Second defer inside: This ensures removal happens after on_update executes
+            ecs.defer_async([e](entt_ext::ecs& ecs_ref) -> asio::awaitable<void> {
+              ecs_ref.defer([e](entt_ext::ecs& ecs_inner) {
+                ecs_inner.template remove<component_update_request<ComponentT>>(e);
+              });
+              co_return;
             });
           } catch (std::exception const& ex) {
             spdlog::error("Error applying component update request: {}", ex.what());
@@ -583,26 +595,28 @@ private:
   // Helper to load component and its hierarchy components from archive
   template <typename ComponentT>
   void load_component_and_hierarchy(cereal::PortableBinaryInputArchive& archive) {
-    // Load the component itself
-    continuous_loader_.template get<ComponentT>(archive);
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
 
-    // Also load hierarchy components if not already a hierarchy component
-    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
-    //   continuous_loader_.template get<entt_ext::parent<ComponentT>>(archive);
-    //   continuous_loader_.template get<entt_ext::children<ComponentT>>(archive);
-    // }
+    // Load the component itself
+    continuous_loader_.template get<ActualT>(archive);
+
+    // Also load hierarchy components if wrapped with with_hierarchy<T>
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      continuous_loader_.template get<entt_ext::parent<ActualT>>(archive);
+      continuous_loader_.template get<entt_ext::children<ActualT>>(archive);
+    }
   }
 
   // Helper to remap component and its hierarchy components
   template <typename ComponentT>
   auto remap_component_and_hierarchy() -> asio::awaitable<void> {
-    if constexpr (is_hierarchy_component<ComponentT>::value) {
-      co_await remap_component_entities<ComponentT>();
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
+
+    // Remap hierarchy components if wrapped with with_hierarchy<T>
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      co_await remap_component_entities<entt_ext::parent<ActualT>>();
+      co_await remap_component_entities<entt_ext::children<ActualT>>();
     }
-    // else {
-    //   co_await remap_component_entities<entt_ext::parent<ComponentT>>();
-    //   co_await remap_component_entities<entt_ext::children<ComponentT>>();
-    // }
     co_return;
   }
 

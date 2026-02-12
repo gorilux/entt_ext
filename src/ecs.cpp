@@ -19,27 +19,42 @@ auto invoke_main_loop_callback(void* callback) -> void {
 }
 #endif
 
-ecs::ecs(std::string const& persistance_filename)
-  : ecs{allocator_type{}, persistance_filename} {
+ecs::ecs(std::string const& persistance_filename, std::size_t command_channel_size)
+  : ecs{allocator_type{}, persistance_filename, command_channel_size} {
 }
 
-ecs::ecs(const allocator_type& allocator, std::string const& persistance_filename)
+ecs::ecs(const allocator_type& allocator, std::string const& persistance_filename, std::size_t command_channel_size)
   : registry_{allocator}
-  , continuous_loader_{registry_} {
+  , continuous_loader_{registry_}
+  , command_channel_size_{command_channel_size}
+  , command_channel_{main_io_context(), command_channel_size_} {
   load_state(persistance_filename);
 }
 
 ecs::ecs(ecs&& other) noexcept
   : registry_{std::move(other.registry_)}
   , global_entity_{std::move(other.global_entity_)}
-  , continuous_loader_{std::move(other.continuous_loader_)} {
+  , continuous_loader_{std::move(other.continuous_loader_)}
+  , defered_tasks_{std::move(other.defered_tasks_)}
+  , running_{other.running_}
+  , command_channel_size_{other.command_channel_size_}
+  , command_channel_{main_io_context(), other.command_channel_size_}
+  , registered_cleanup_handlers_{std::move(other.registered_cleanup_handlers_)} {
+  // Note: io_contexts cannot be moved, so they are default-constructed
+  // command_channel_ is created fresh with the new main_io_context
 }
 
 ecs& ecs::operator=(ecs&& other) noexcept {
   if (this != &other) {
-    registry_          = std::move(other.registry_);
-    global_entity_     = std::move(other.global_entity_);
-    continuous_loader_ = std::move(other.continuous_loader_);
+    registry_             = std::move(other.registry_);
+    global_entity_        = std::move(other.global_entity_);
+    continuous_loader_    = std::move(other.continuous_loader_);
+    defered_tasks_        = std::move(other.defered_tasks_);
+    running_              = other.running_;
+    command_channel_size_ = other.command_channel_size_;
+    // Note: io_contexts and command_channel cannot be moved/assigned
+    // The moved-to object keeps its own io_contexts and command_channel
+    registered_cleanup_handlers_ = std::move(other.registered_cleanup_handlers_);
   }
   return *this;
 }
@@ -234,6 +249,10 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
         concurrent_io_context().stop();
       });
       asio::post(main_io_context(), [this]() {
+        // Close the command channel to unblock process_command_channel() coroutine
+        command_channel_.close();
+      });
+      asio::post(main_io_context(), [this]() {
         // spdlog::info("Main io context stopped");
         main_io_context().stop();
       });
@@ -260,7 +279,19 @@ void ecs::stop() {
 // Channel processor coroutine - runs on main executor
 asio::awaitable<void> ecs::process_command_channel() {
   while (running_) {
-    auto [ec, cmd] = co_await command_channel_.async_receive(asio::as_tuple(asio::use_awaitable));
+    // Use a separate scope to control cmd lifetime
+    boost::system::error_code                            ec;
+    std::move_only_function<asio::awaitable<void>(ecs&)> executor;
+
+    {
+      deferred_command cmd;
+      std::tie(ec, cmd) = co_await command_channel_.async_receive(asio::as_tuple(asio::use_awaitable));
+
+      if (!ec && cmd.executor) {
+        // Move executor out before cmd goes out of scope
+        executor = std::move(cmd.executor);
+      }
+    } // cmd is destroyed here with empty executor
 
     if (ec) {
       if (ec == asio::error::operation_aborted || ec == asio::experimental::error::channel_closed) {
@@ -270,12 +301,14 @@ asio::awaitable<void> ecs::process_command_channel() {
       continue;
     }
 
-    // Execute command on main executor
-    try {
-      co_await cmd.executor(*this);
-    } catch (std::exception const& e) {
-      // Log error if needed, but continue processing
-      // spdlog::error("Error executing deferred command: {}", e.what());
+    // Execute command on main executor (cmd is already destroyed)
+    if (executor) {
+      try {
+        co_await executor(*this);
+      } catch (std::exception const& e) {
+        // Log error if needed, but continue processing
+        // spdlog::error("Error executing deferred command: {}", e.what());
+      }
     }
   }
 }
@@ -298,17 +331,10 @@ void ecs::load_state(std::string const& filename) {
   using InputArchiveType = cereal::PortableBinaryInputArchive;
 
   if (!filename.empty()) {
-    try {
-      is_loading_ = true;
-      std::ifstream    ifs(filename, std::ios::binary);
-      InputArchiveType ar(ifs);
-      // entt::snapshot_loader{registry_}
-      continuous_loader_.get<entt_ext::entity>(ar).template get<state_persistance_header>(ar).template get<main_context_tag>(ar);
-      is_loading_ = false;
-    } catch (std::exception const& ex) {
-      is_loading_ = false;
-      throw;
-    }
+    std::ifstream    ifs(filename, std::ios::binary);
+    InputArchiveType ar(ifs);
+    // entt::snapshot_loader{registry_}
+    continuous_loader_.get<entt_ext::entity>(ar).template get<state_persistance_header>(ar).template get<main_context_tag>(ar);
 
     for (auto [entt] : view<main_context_tag>().each()) {
       global_entity_ = entt;

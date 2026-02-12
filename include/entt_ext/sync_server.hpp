@@ -339,14 +339,16 @@ private:
   // Set up automatic sync for a specific component type (server-side changes)
   template <typename ComponentT>
   void setup_automatic_sync(entt_ext::ecs& ecs) {
-    // Set up for the component itself
-    setup_automatic_sync_impl<ComponentT>(ecs);
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
 
-    // // Also set up for hierarchy components if not already a hierarchy component
-    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
-    //   setup_automatic_sync_impl<entt_ext::parent<ComponentT>>(ecs);
-    //   setup_automatic_sync_impl<entt_ext::children<ComponentT>>(ecs);
-    // }
+    // Set up for the component itself
+    setup_automatic_sync_impl<ActualT>(ecs);
+
+    // Also set up for hierarchy components if wrapped with with_hierarchy<T>
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      setup_automatic_sync_impl<entt_ext::parent<ActualT>>(ecs);
+      setup_automatic_sync_impl<entt_ext::children<ActualT>>(ecs);
+    }
   }
 
   // Implementation of automatic sync setup for a single component
@@ -377,7 +379,7 @@ private:
 
     // When a sync component is updated by the server, notify all clients immediately
     observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
-      spdlog::debug("Server-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
+      // spdlog::debug("Server-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
       if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
         co_return;
       }
@@ -486,11 +488,11 @@ private:
   template <typename ComponentT>
   asio::awaitable<void>
   notify_component_update_to_client(entity server_entity, version_type sync_version, ComponentT const& component, std::string const& client_id) {
-    spdlog::debug("Notifying component update to client: {} server_entity={} client={} {}",
-                  type_name<ComponentT>(),
-                  static_cast<int>(server_entity),
-                  client_id,
-                  std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
+    // spdlog::debug("Notifying component update to client: {} server_entity={} client={} {}",
+    //               type_name<ComponentT>(),
+    //               static_cast<int>(server_entity),
+    //               client_id,
+    //               std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
     std::string endpoint_name = "component_updated_" + std::string(type_name<ComponentT>());
 
     // Send server entity in target_entity field
@@ -743,26 +745,30 @@ private:
   // Helper to save component and its hierarchy components to archive
   template <typename ComponentT>
   void save_component_and_hierarchy(cereal::PortableBinaryOutputArchive& archive) {
-    // Save the component itself
-    entt::snapshot{ecs_.registry()}.template get<ComponentT>(archive);
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
 
-    // // Also save hierarchy components if not already a hierarchy component
-    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
-    //   entt::snapshot{ecs_.registry()}.template get<entt_ext::parent<ComponentT>>(archive);
-    //   entt::snapshot{ecs_.registry()}.template get<entt_ext::children<ComponentT>>(archive);
-    // }
+    // Save the component itself
+    entt::snapshot{ecs_.registry()}.template get<ActualT>(archive);
+
+    // Also save hierarchy components if wrapped with with_hierarchy<T>
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      entt::snapshot{ecs_.registry()}.template get<entt_ext::parent<ActualT>>(archive);
+      entt::snapshot{ecs_.registry()}.template get<entt_ext::children<ActualT>>(archive);
+    }
   }
 
   template <typename ComponentT>
   void collect_component_and_hierarchy_entities(std::vector<entity>& entities) {
-    // Collect entities with the component itself
-    collect_entities_with_component<ComponentT>(entities);
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
 
-    // Also collect entities with hierarchy components if not already a hierarchy component
-    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
-    //   collect_entities_with_component<entt_ext::parent<ComponentT>>(entities);
-    //   collect_entities_with_component<entt_ext::children<ComponentT>>(entities);
-    // }
+    // Collect entities with the component itself
+    collect_entities_with_component<ActualT>(entities);
+
+    // Also collect entities with hierarchy components if wrapped with with_hierarchy<T>
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      collect_entities_with_component<entt_ext::parent<ActualT>>(entities);
+      collect_entities_with_component<entt_ext::children<ActualT>>(entities);
+    }
   }
 
   template <typename ComponentT>
@@ -780,12 +786,14 @@ private:
   // Check if entity has a specific component or its hierarchy components
   template <typename ComponentT>
   bool has_component_or_hierarchy(entity entt) const {
-    // Check the component itself
-    bool has_comp = ecs_.template any_of<ComponentT>(entt);
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
 
-    // Also check hierarchy components if not already a hierarchy component
-    if constexpr (!is_hierarchy_component<ComponentT>::value) {
-      has_comp = has_comp || ecs_.template any_of<entt_ext::parent<ComponentT>>(entt) || ecs_.template any_of<entt_ext::children<ComponentT>>(entt);
+    // Check the component itself
+    bool has_comp = ecs_.template any_of<ActualT>(entt);
+
+    // Also check hierarchy components if wrapped with with_hierarchy<T>
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      has_comp = has_comp || ecs_.template any_of<entt_ext::parent<ActualT>>(entt) || ecs_.template any_of<entt_ext::children<ActualT>>(entt);
     }
 
     return has_comp;
@@ -820,14 +828,16 @@ private:
 
   template <typename ComponentT>
   void register_component_endpoints(entt_ext::ecs& ecs) {
-    // Register for the component itself
-    register_component_endpoints_impl<ComponentT>(ecs);
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
 
-    // // Also register for hierarchy components if not already a hierarchy component
-    // if constexpr (!is_hierarchy_component<ComponentT>::value) {
-    //   register_component_endpoints_impl<entt_ext::parent<ComponentT>>(ecs);
-    //   register_component_endpoints_impl<entt_ext::children<ComponentT>>(ecs);
-    // }
+    // Register for the component itself
+    register_component_endpoints_impl<ActualT>(ecs);
+
+    // Also register for hierarchy components if wrapped with with_hierarchy<T>
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      register_component_endpoints_impl<entt_ext::parent<ActualT>>(ecs);
+      register_component_endpoints_impl<entt_ext::children<ActualT>>(ecs);
+    }
   }
 
   template <typename ComponentT>

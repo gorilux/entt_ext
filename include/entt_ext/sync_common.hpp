@@ -43,17 +43,29 @@ struct sync_component_list {
     return sizeof...(Components);
   }
 
+private:
+  // Helper to add component name to hash and output stream
+  template <typename T>
+  static void add_component_to_protocol(std::ostringstream& oss, size_t& hash) {
+    // Use the full type name (including with_hierarchy wrapper if present)
+    // This ensures client/server with different hierarchy configs don't match
+    auto name = type_name<T>();
+    hash ^= std::hash<std::string_view>{}(name) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    oss << name << "_";
+  }
+
+public:
   // Generate a protocol version string based on component types and their order
   static std::string generate_protocol_version() {
     std::ostringstream oss;
     size_t             hash = size();
 
-    // Combine type names in order to create a version identifier
-    ((hash ^= std::hash<std::string_view>{}(type_name<Components>()) + 0x9e3779b9 + (hash << 6) + (hash >> 2)), ...);
-
     // Include component names for debugging
     oss << "sync_v1_";
-    ((oss << type_name<Components>() << "_"), ...);
+
+    // Combine type names in order to create a version identifier
+    (add_component_to_protocol<Components>(oss, hash), ...);
+
     oss << "hash_" << std::hex << hash;
 
     return oss.str();
@@ -81,26 +93,10 @@ struct sync_list_traits<sync_component_list<Components...>> {
   using apply = Template<Components...>;
 };
 
-// ============================================================================
-// Hierarchy Component Expansion - Automatically include parent/children
-// ============================================================================
-//
-// Usage:
-//   Instead of manually specifying:
-//     sync_component_list<ComponentA, parent<ComponentA>, children<ComponentA>,
-//                         ComponentB, parent<ComponentB>, children<ComponentB>>
-//
-//   You can use the macro:
-//     ENTT_EXT_SYNC_COMPONENTS_WITH_HIERARCHY(ComponentA, ComponentB)
-//
-//   This automatically expands to include parent<T> and children<T> for each
-//   component T in the list. Existing parent<> or children<> types are not
-//   expanded further to avoid duplication.
-//
-// ============================================================================
+// Note: with_hierarchy<T>, is_with_hierarchy_v<T>, and unwrap_hierarchy_t<T>
+// are defined in hierarchy_wrapper.hpp (included via ecs.hpp)
 
-// Helper to check if a type is already parent<> or children<>
-// Type trait to detect hierarchy components
+// Type trait to detect hierarchy components (parent<T> or children<T>)
 template <typename T>
 struct is_hierarchy_component : std::false_type {};
 
@@ -110,8 +106,10 @@ struct is_hierarchy_component<entt_ext::parent<T>> : std::true_type {};
 template <typename T>
 struct is_hierarchy_component<entt_ext::children<T>> : std::true_type {};
 
-// Simplified macro - hierarchy components are now handled automatically at runtime
-// This macro is now just an alias for sync_component_list for backward compatibility
+template <typename T>
+inline constexpr bool is_hierarchy_component_v = is_hierarchy_component<T>::value;
+
+// Backward compatibility macro
 #define ENTT_EXT_SYNC_COMPONENTS_WITH_HIERARCHY(...) entt_ext::sync::sync_component_list<__VA_ARGS__>
 
 // ============================================================================
