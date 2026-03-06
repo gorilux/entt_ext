@@ -1,9 +1,26 @@
 project('entt_ext', 'cpp', version : '0.0.1', license: 'MIT', default_options : ['cpp_std=c++23'])
 
-# Add Boost dependency
-boost_dep = dependency('boost')
+cpp = meson.get_compiler('cpp')
+compiler_args = ['-DENTT_USE_ATOMIC=1', '-DENTT_ID_TYPE=std::uint64_t']
+linker_args = []
+system = host_machine.system()
 
-entt_ext_sources = [  
+# Add Boost dependency
+if system == 'android'
+  # Boost has no .pc file; point to the Android libs include directory
+  # spdlog shim provides a lightweight Android-native logging replacement
+  spdlog_shim_dir = meson.global_source_root() / 'cross' / 'android-spdlog-shim'
+  boost_dep = declare_dependency(
+    compile_args: [
+      '-isystem', '/opt/android-libs/aarch64/include',
+      '-isystem', spdlog_shim_dir,
+    ]
+  )
+else
+  boost_dep = dependency('boost')
+endif
+
+entt_ext_sources = [
   'include/entt_ext/ecs.hpp',
   'include/entt_ext/core.hpp',
   'include/entt_ext/settings.hpp',
@@ -11,11 +28,6 @@ entt_ext_sources = [
   'src/ecs.cpp',
   'src/deferred_operations.cpp'
 ]
-
-cpp = meson.get_compiler('cpp')
-compiler_args = ['-DENTT_USE_ATOMIC=1', '-DENTT_ID_TYPE=std::uint64_t']
-linker_args = []
-system = host_machine.system()
 
 cereal_project = subproject('cereal')
 cereal_dep = cereal_project.get_variable('cereal_dep')

@@ -203,17 +203,26 @@ public:
   }
 
   /**
-   * @brief Destroys those entities that have no elements.
+   * @brief Destroys loader-managed entities that have no elements.
    *
    * In case all the entities were serialized but only part of the elements
    * was saved, it could happen that some of the entities have no elements
    * once restored.<br/>
    * This function helps to identify and destroy those entities.
    *
+   * Only entities known to this loader (i.e. created via restore()) are
+   * considered, so pre-existing application entities with no components are
+   * left untouched.
+   *
    * @return A non-const reference to this loader.
    */
   continuous_loader_with_mapping& orphans() {
-    internal::orphans(*reg);
+    for (auto [entity_base, pair] : remloc_) {
+      auto local = pair.second;
+      if (reg->valid(local) && reg->orphan(local)) {
+        reg->destroy(local);
+      }
+    }
     return *this;
   }
 

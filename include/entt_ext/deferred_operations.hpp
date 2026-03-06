@@ -5,6 +5,8 @@
 #include <functional>
 #include <memory>
 
+#include "move_only_function.hpp"
+
 namespace entt_ext {
 
 // Forward declare command_channel type (will be defined in ecs.hpp)

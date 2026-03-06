@@ -4,6 +4,10 @@
 
 #include <functional>
 
+#ifndef __EMSCRIPTEN__
+#include <csignal>
+#endif
+
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #else
@@ -93,6 +97,11 @@ void ecs::run(int timeout_ms, size_t concurrency) {
 #ifndef __EMSCRIPTEN__
   auto& concurrent_io_ctx = concurrent_io_context();
   auto  dummy_timer       = boost::asio::deadline_timer{concurrent_io_ctx};
+
+  // Ignore SIGPIPE to prevent socket write operations from terminating the process.
+  // This is essential for network applications — writing to a closed socket generates
+  // SIGPIPE whose default action is process termination.
+  std::signal(SIGPIPE, SIG_IGN);
 
   asio::signal_set signals(main_io_ctx, SIGINT, SIGTERM);
   signals.async_wait([this](auto error_code, auto) {

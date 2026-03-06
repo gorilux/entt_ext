@@ -80,6 +80,18 @@ struct is_children<index_set<entt_ext::entity, Type>> : std::true_type {
 template <typename T>
 inline constexpr bool is_children_v = is_children<T>::value;
 
+// Type trait to control cascade deletion behavior for hierarchy types.
+// By default, destroying a parent entity cascades to its children.
+// Hierarchy types can opt out by defining: static constexpr bool cascade_delete = false;
+template <typename T, typename = void>
+struct cascade_delete_trait : std::true_type {};
+
+template <typename T>
+struct cascade_delete_trait<T, std::void_t<decltype(T::cascade_delete)>> : std::bool_constant<T::cascade_delete> {};
+
+template <typename T>
+inline constexpr bool cascade_delete_v = cascade_delete_trait<T>::value;
+
 // Marker type for system component declarations to inject children views
 template <typename Type, typename... Others>
 struct children_view {};
@@ -834,9 +846,18 @@ inline auto ecs::system() -> system_builder<entt::get_t<ComponentsT...>, entt::e
 }
 
 // Helper to register children cleanup handler - extracted from duplicated code
-// This registers a destroy handler that marks all children for deletion when the parent is destroyed
+// This registers a destroy handler that marks all children for deletion when the parent is destroyed.
+// Hierarchy types can opt out of cascade deletion by defining: static constexpr bool cascade_delete = false;
 template <typename ChildrenType>
 inline void ecs::register_children_cleanup_handler() {
+  // Skip cascade delete registration if the hierarchy type opts out
+  if constexpr (is_children_v<ChildrenType>) {
+    using hierarchy_type = typename is_children<ChildrenType>::child_type;
+    if constexpr (!cascade_delete_v<hierarchy_type>) {
+      return;
+    }
+  }
+
   auto type_hash = entt::type_hash<ChildrenType>::value();
   if (is_cleanup_registered(type_hash)) {
     return; // Already registered for this instance

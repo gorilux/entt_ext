@@ -29,6 +29,15 @@ constexpr auto type_name() {
     name.remove_prefix(const_prefix.size());
   }
 
+  // Normalize cross-compiler differences: GCC abbreviates type names relative
+  // to the enclosing namespace (since type_name() lives in entt_ext::, it drops
+  // the entt_ext:: prefix), while Clang always uses fully qualified names.
+  // Strip the leading "entt_ext::" so both compilers produce the same output.
+  constexpr std::string_view ns_prefix = "entt_ext::";
+  if (name.starts_with(ns_prefix)) {
+    name.remove_prefix(ns_prefix.size());
+  }
+
   return name;
 }
 } // namespace entt_ext

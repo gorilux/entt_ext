@@ -15,6 +15,7 @@
 #include <boost/asio/awaitable.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <sstream>
 #include <string_view>
@@ -44,13 +45,25 @@ struct sync_component_list {
   }
 
 private:
+  // Deterministic hash for cross-platform consistency.
+  // std::hash is implementation-defined and differs between libstdc++ and libc++,
+  // so we use FNV-1a which produces identical results on all platforms.
+  static constexpr uint64_t fnv1a(std::string_view sv) {
+    uint64_t hash = 14695981039346656037ULL; // FNV offset basis
+    for (char c : sv) {
+      hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
+      hash *= 1099511628211ULL; // FNV prime
+    }
+    return hash;
+  }
+
   // Helper to add component name to hash and output stream
   template <typename T>
   static void add_component_to_protocol(std::ostringstream& oss, size_t& hash) {
     // Use the full type name (including with_hierarchy wrapper if present)
     // This ensures client/server with different hierarchy configs don't match
     auto name = type_name<T>();
-    hash ^= std::hash<std::string_view>{}(name) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= fnv1a(name) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     oss << name << "_";
   }
 

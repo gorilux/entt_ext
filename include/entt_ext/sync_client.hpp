@@ -81,8 +81,8 @@ public:
 
       co_return true;
     } catch (...) {
-      session_id_.clear(); // Clear session on connection failure
-      co_return false;
+      session_id_.clear();
+      throw; // Let the caller see the actual error
     }
   }
 
