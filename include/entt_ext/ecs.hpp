@@ -32,7 +32,7 @@
 #include <type_traits>
 #include <unordered_set>
 
-// #include <spdlog/spdlog.h>
+#include <spdlog/spdlog.h>
 
 namespace entt_ext {
 
@@ -109,7 +109,13 @@ void map_entities(children<Type>& child_set, LoaderT const& loader) {
     auto mapped = loader.map(element);
     if (mapped != entt_ext::null) {
       mapped_set.insert(mapped);
+    } else {
+      spdlog::warn("[remap] children<{}> failed to map entity {} (returned null)", entt::type_id<Type>().name(), static_cast<int>(element));
     }
+  }
+
+  if (child_set.size() != mapped_set.size()) {
+    spdlog::warn("[remap] children<{}> size changed: {} -> {} (some children lost)", entt::type_id<Type>().name(), child_set.size(), mapped_set.size());
   }
 
   // Swap with the original
@@ -136,7 +142,11 @@ void map_entities_to_remote(children<Type>& child_set, LoaderT const& loader) {
 // Map entity references from remote to local IDs
 template <typename Type, typename LoaderT>
 void map_entities(parent<Type>& parent, LoaderT const& loader) {
+  auto original = parent.entity;
   parent.entity = loader.map(parent.entity);
+  if (parent.entity == entt_ext::null) {
+    spdlog::warn("[remap] parent<{}> failed to map entity {} (returned null)", entt::type_id<Type>().name(), static_cast<int>(original));
+  }
 }
 
 // Map entity references from local to remote IDs (for sending to server)
@@ -973,11 +983,13 @@ inline auto ecs::emplace_deferred(const entity_type entt, Args&&... args) -> asi
                        .entity         = entt,
                        .component_type = entt::type_hash<Type>::value(),
                        .executor       = [entt, args_tuple = std::move(args_tuple)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
-                         std::apply(
-                             [&](auto&&... args) {
-                               ecs_ref.template emplace<Type>(entt, std::forward<decltype(args)>(args)...);
-                             },
-                             std::move(args_tuple));
+                         if (ecs_ref.valid(entt)) {
+                           std::apply(
+                               [&](auto&&... args) {
+                                 ecs_ref.template emplace<Type>(entt, std::forward<decltype(args)>(args)...);
+                               },
+                               std::move(args_tuple));
+                         }
                          co_return;
                        }};
 
@@ -995,11 +1007,13 @@ inline auto ecs::emplace_or_replace_deferred(const entity_type entt, Args&&... a
                        .entity         = entt,
                        .component_type = entt::type_hash<Type>::value(),
                        .executor       = [entt, args_tuple = std::move(args_tuple)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
-                         std::apply(
-                             [&](auto&&... args) {
-                               ecs_ref.template emplace_or_replace<Type>(entt, std::forward<decltype(args)>(args)...);
-                             },
-                             std::move(args_tuple));
+                         if (ecs_ref.valid(entt)) {
+                           std::apply(
+                               [&](auto&&... args) {
+                                 ecs_ref.template emplace_or_replace<Type>(entt, std::forward<decltype(args)>(args)...);
+                               },
+                               std::move(args_tuple));
+                         }
                          co_return;
                        }};
 
@@ -1015,11 +1029,13 @@ inline auto ecs::emplace_if_not_exists_deferred(const entity_type entt, Args&&..
                        .entity         = entt,
                        .component_type = entt::type_hash<Type>::value(),
                        .executor       = [entt, args_tuple = std::move(args_tuple)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
-                         std::apply(
-                             [&](auto&&... args) {
-                               ecs_ref.template emplace_if_not_exists<Type>(entt, std::forward<decltype(args)>(args)...);
-                             },
-                             std::move(args_tuple));
+                         if (ecs_ref.valid(entt)) {
+                           std::apply(
+                               [&](auto&&... args) {
+                                 ecs_ref.template emplace_if_not_exists<Type>(entt, std::forward<decltype(args)>(args)...);
+                               },
+                               std::move(args_tuple));
+                         }
                          co_return;
                        }};
 
@@ -1036,11 +1052,13 @@ inline auto ecs::replace_deferred(const entity_type entt, Args&&... args) -> asi
                        .entity         = entt,
                        .component_type = entt::type_hash<Type>::value(),
                        .executor       = [entt, args_tuple = std::move(args_tuple)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
-                         std::apply(
-                             [&](auto&&... args) {
-                               ecs_ref.template replace<Type>(entt, std::forward<decltype(args)>(args)...);
-                             },
-                             std::move(args_tuple));
+                         if (ecs_ref.valid(entt) && ecs_ref.template all_of<Type>(entt)) {
+                           std::apply(
+                               [&](auto&&... args) {
+                                 ecs_ref.template replace<Type>(entt, std::forward<decltype(args)>(args)...);
+                               },
+                               std::move(args_tuple));
+                         }
                          co_return;
                        }};
 
@@ -1055,7 +1073,8 @@ inline auto ecs::remove_deferred(const entity_type entt) -> asio::awaitable<void
                        .entity         = entt,
                        .component_type = entt::type_hash<Type>::value(),
                        .executor       = [entt](ecs& ecs_ref) -> asio::awaitable<void> {
-                         ecs_ref.template remove<Type, Other...>(entt);
+                         if (ecs_ref.valid(entt) && ecs_ref.template all_of<Type>(entt))
+                           ecs_ref.template remove<Type, Other...>(entt);
                          co_return;
                        }};
 
@@ -1073,11 +1092,13 @@ inline auto ecs::patch_deferred(const entity_type entt, Func&&... func) -> asio:
                        .entity         = entt,
                        .component_type = entt::type_hash<Type>::value(),
                        .executor       = [entt, funcs_tuple = std::move(funcs_tuple)](ecs& ecs_ref) -> asio::awaitable<void> {
-                         std::apply(
-                             [&](auto&&... funcs) {
-                               ecs_ref.template patch<Type>(entt, std::forward<decltype(funcs)>(funcs)...);
-                             },
-                             std::move(funcs_tuple));
+                         if (ecs_ref.valid(entt) && ecs_ref.template all_of<Type>(entt)) {
+                           std::apply(
+                               [&](auto&&... funcs) {
+                                 ecs_ref.template patch<Type>(entt, std::forward<decltype(funcs)>(funcs)...);
+                               },
+                               std::move(funcs_tuple));
+                         }
                          co_return;
                        }};
 
@@ -1088,7 +1109,8 @@ inline auto ecs::patch_deferred(const entity_type entt, Func&&... func) -> asio:
 
 inline auto ecs::destroy_deferred(const entity_type entt) -> asio::awaitable<void> {
   deferred_command cmd{.operation = deferred_command::op_type::destroy, .entity = entt, .executor = [entt](ecs& ecs_ref) -> asio::awaitable<void> {
-                         ecs_ref.destroy(entt);
+                         if (ecs_ref.valid(entt))
+                           ecs_ref.destroy(entt);
                          co_return;
                        }};
   co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
@@ -1190,6 +1212,23 @@ asio::awaitable<bool> ecs::merge_snapshot(ArchiveT& ar) {
               }
             };
             (remap_component.template operator()<ComponentsT>(), ...);
+
+            // Diagnostic: log entity counts for each component type after merge
+            auto log_component = [this]<typename T>() {
+              using ActualT = sync::unwrap_hierarchy_t<T>;
+              auto count = registry_.template view<ActualT>().size();
+              if (count > 0) {
+                spdlog::info("[merge] {} entities with {}", count, entt::type_id<ActualT>().name());
+              }
+              if constexpr (sync::is_with_hierarchy_v<T>) {
+                auto parent_count = registry_.template view<entt_ext::parent<ActualT>>().size();
+                auto children_count = registry_.template view<entt_ext::children<ActualT>>().size();
+                if (parent_count > 0 || children_count > 0) {
+                  spdlog::info("[merge]   parent<{}>: {}, children<{}>: {}", entt::type_id<ActualT>().name(), parent_count, entt::type_id<ActualT>().name(), children_count);
+                }
+              }
+            };
+            (log_component.template operator()<ComponentsT>(), ...);
 
             remove<loading_tag>(global_entity_);
           }

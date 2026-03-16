@@ -404,7 +404,8 @@ private:
           try {
             // Map entity references from remote to local IDs
             auto component_data = request.component_data;
-            if constexpr (is_hierarchy_component<ComponentT>::value) {
+            if constexpr (is_hierarchy_component<ComponentT>::value ||
+                         requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); }) {
               co_await map_entities_async(component_data);
             }
 
@@ -503,7 +504,8 @@ private:
     // Create a copy of the component for mapping
     ComponentT component_to_send = component;
 
-    if constexpr (is_hierarchy_component<ComponentT>::value) {
+    if constexpr (is_hierarchy_component<ComponentT>::value ||
+                   requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities_to_remote(l); }) {
       co_await map_component_entities_to_remote_async(component_to_send);
     }
 
@@ -617,6 +619,10 @@ private:
       co_await remap_component_entities<entt_ext::parent<ActualT>>();
       co_await remap_component_entities<entt_ext::children<ActualT>>();
     }
+    // Remap entity references inside components marked with with_entity_refs
+    if constexpr (is_with_entity_refs_v<ComponentT>) {
+      co_await remap_component_entities<ActualT>();
+    }
     co_return;
   }
 
@@ -657,6 +663,15 @@ private:
     co_return;
   }
 
+  // Generic map_entities_async for components with a map_entities member (e.g. automation::targets)
+  template <typename ComponentT>
+    requires requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); }
+             && (!sync::is_hierarchy_component_v<ComponentT>)
+  auto map_entities_async(ComponentT& component) -> asio::awaitable<void> {
+    component.map_entities(continuous_loader_);
+    co_return;
+  }
+
   // Helper to map entity references to remote (server) IDs before sending
   // If any referenced entities don't have server mappings, request them first
   template <typename ComponentT>
@@ -683,6 +698,15 @@ private:
       mapped_set.insert(server_entity);
     }
     component.swap(mapped_set);
+    co_return;
+  }
+
+  // Generic remote mapping for components with map_entities_to_remote member (e.g. automation::targets)
+  template <typename ComponentT>
+    requires requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities_to_remote(l); }
+             && (!sync::is_hierarchy_component_v<ComponentT>)
+  auto map_component_entities_to_remote_async(ComponentT& component) -> asio::awaitable<void> {
+    component.map_entities_to_remote(continuous_loader_);
     co_return;
   }
 
@@ -743,6 +767,10 @@ private:
       co_return;
     });
   }
+
+public:
+  // Access the underlying RPC client (e.g. to register custom notification handlers)
+  rpc_client& get_rpc_client() { return rpc_client_; }
 
 private:
   ecs&                                           ecs_;

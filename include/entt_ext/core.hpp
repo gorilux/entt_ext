@@ -30,41 +30,30 @@ struct delete_later {
 template <typename T>
 class double_buffer {
   std::array<T, 2>    m_buffer{};
-  std::atomic<size_t> m_read_index{0};
-  std::atomic<size_t> m_write_index{1};
+  std::atomic<size_t> m_index{0}; // index of the READ buffer
 
 public:
   double_buffer() = default;
-  double_buffer(const double_buffer& other) {
-    if (this != &other) {
-      m_buffer      = other.m_buffer;
-      m_read_index  = other.m_read_index.load();
-      m_write_index = other.m_write_index.load();
-    }
-  }
+  double_buffer(const double_buffer& other)
+    : m_buffer(other.m_buffer)
+    , m_index(other.m_index.load(std::memory_order_relaxed)) {}
 
-  double_buffer(double_buffer&& other) {
-    if (this != &other) {
-      m_buffer      = std::move(other.m_buffer);
-      m_read_index  = other.m_read_index.load();
-      m_write_index = other.m_write_index.load();
-    }
-  }
+  double_buffer(double_buffer&& other)
+    : m_buffer(std::move(other.m_buffer))
+    , m_index(other.m_index.load(std::memory_order_relaxed)) {}
 
   double_buffer& operator=(const double_buffer& other) {
     if (this != &other) {
-      m_buffer      = other.m_buffer;
-      m_read_index  = other.m_read_index.load();
-      m_write_index = other.m_write_index.load();
+      m_buffer = other.m_buffer;
+      m_index.store(other.m_index.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
     return *this;
   }
 
   double_buffer& operator=(double_buffer&& other) {
     if (this != &other) {
-      m_buffer      = std::move(other.m_buffer);
-      m_read_index  = other.m_read_index.load();
-      m_write_index = other.m_write_index.load();
+      m_buffer = std::move(other.m_buffer);
+      m_index.store(other.m_index.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
     return *this;
   }
@@ -81,59 +70,17 @@ public:
     return *this;
   }
 
-  operator T&() {
-    return write();
-  }
+  operator T&() { return write(); }
+  operator const T&() const { return read(); }
 
-  operator const T&() const {
-    return read();
-  }
+  const T& read() const { return m_buffer[m_index.load(std::memory_order_acquire)]; }
+  T&       write()       { return m_buffer[1 - m_index.load(std::memory_order_relaxed)]; }
 
-  const T& read() const {
-    // if constexpr (std::is_same_v<T, bool>) {
-    //   spdlog::debug("[read] read index {} {} read_value {} write_value {} ",
-    //                 m_read_index.load(),
-    //                 m_write_index.load(),
-    //                 m_buffer[m_read_index],
-    //                 m_buffer[m_write_index]);
-    // }
-    return m_buffer[m_read_index];
-  }
+  void swap() { m_index.store(1 - m_index.load(std::memory_order_relaxed), std::memory_order_release); }
 
-  T& write() {
-    // if constexpr (std::is_same_v<T, bool>) {
-    //   spdlog::debug("[write] read index {} {} read_value {} write_value {} ",
-    //                 m_read_index.load(),
-    //                 m_write_index.load(),
-    //                 m_buffer[m_read_index],
-    //                 m_buffer[m_write_index]);
-    // }
-    return m_buffer[m_write_index];
-  }
-
-  void swap() {
-    // if constexpr (std::is_same_v<T, bool>) {
-    //   spdlog::debug("[swap] read index {} {} read_value {} write_value {} ",
-    //                 m_read_index.load(),
-    //                 m_write_index.load(),
-    //                 m_buffer[m_read_index],
-    //                 m_buffer[m_write_index]);
-    // }
-    m_read_index.store(m_write_index.load());
-    m_write_index.store((m_read_index.load() + 1) % 2);
-  }
-
-  T* operator->() {
-    return &write();
-  }
-
-  const T* operator->() const {
-    return &read();
-  }
-
-  const T& operator*() const {
-    return read();
-  }
+  T*       operator->()       { return &write(); }
+  const T* operator->() const { return &read(); }
+  const T& operator*()  const { return read(); }
 };
 
 } // namespace entt_ext

@@ -48,5 +48,43 @@ struct unwrap_hierarchy<with_hierarchy<T>> {
 template <typename T>
 using unwrap_hierarchy_t = typename unwrap_hierarchy<T>::type;
 
+// ============================================================================
+// Entity Reference Wrapper - Opt-in entity reference remapping for components
+// ============================================================================
+//
+// Usage:
+//   sync_client<
+//       with_entity_refs<automation::targets>,  // Contains entity references that need remapping
+//       Health,                                  // No entity references
+//   > client(ecs);
+//
+// Components wrapped with with_entity_refs must provide:
+//   template <typename LoaderT>
+//   void map_entities(LoaderT const& loader);           // remote-to-local remapping
+//
+//   template <typename LoaderT>
+//   void map_entities_to_remote(LoaderT const& loader); // local-to-remote remapping
+// ============================================================================
+
+template <typename T>
+struct with_entity_refs {
+  using type = T;
+};
+
+template <typename T>
+struct is_with_entity_refs : std::false_type {};
+
+template <typename T>
+struct is_with_entity_refs<with_entity_refs<T>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_with_entity_refs_v = is_with_entity_refs<T>::value;
+
+// Extend unwrap_hierarchy to also handle with_entity_refs
+template <typename T>
+struct unwrap_hierarchy<with_entity_refs<T>> {
+  using type = T;
+};
+
 } // namespace entt_ext::sync
 

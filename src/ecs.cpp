@@ -105,9 +105,9 @@ void ecs::run(int timeout_ms, size_t concurrency) {
 
   asio::signal_set signals(main_io_ctx, SIGINT, SIGTERM);
   signals.async_wait([this](auto error_code, auto) {
-    asio::post(main_io_context(), [this]() {
-      stop();
-    });
+    stop();
+    concurrent_io_context().stop();
+    main_io_context().stop();
   });
 
   dummy_timer.async_wait([](auto) {});

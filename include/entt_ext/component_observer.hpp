@@ -30,12 +30,17 @@ public:
     auto id = next_handler_id++;
     if constexpr (std::is_same_v<std::invoke_result_t<FuncT, EcsT&, entt_ext::entity, Type&>, asio::awaitable<void>>) {
       // Async handler - wrap it to handle component retrieval at registration time
+      // Note: deferred async handlers may run after the entity/component is destroyed
       on_construct_async_handlers.emplace(id, [func = std::forward<FuncT>(func)](EcsT& ecs, entt_ext::entity entt) -> asio::awaitable<void> {
         if constexpr (entt::component_traits<Type>::page_size > 0u) {
-          co_await func(ecs, entt, ecs.template get<Type>(entt));
+          if (ecs.valid(entt) && ecs.template all_of<Type>(entt)) {
+            co_await func(ecs, entt, ecs.template get<Type>(entt));
+          }
         } else {
-          Type t;
-          co_await func(ecs, entt, t);
+          if (ecs.valid(entt)) {
+            Type t;
+            co_await func(ecs, entt, t);
+          }
         }
       });
     } else {
@@ -71,9 +76,10 @@ public:
       }
     } else if constexpr (std::is_same_v<std::invoke_result_t<FuncT, EcsT&, entt_ext::entity, Type&>, asio::awaitable<void>>) {
       // Async handler - wrap it to handle component retrieval at registration time
+      // Note: deferred async handlers may run after the entity is destroyed/recycled
       on_destroy_async_handlers.emplace(id, [func = std::forward<FuncT>(func)](EcsT& ecs, entt_ext::entity entt) -> asio::awaitable<void> {
         if constexpr (entt::component_traits<Type>::page_size > 0u) {
-          if (ecs.template all_of<Type>(entt)) {
+          if (ecs.valid(entt) && ecs.template all_of<Type>(entt)) {
             co_await func(ecs, entt, ecs.template get<Type>(entt));
           } else {
             Type t;
@@ -91,11 +97,11 @@ public:
           if (ecs.template all_of<Type>(entt)) {
             func(ecs, entt, ecs.template get<Type>(entt));
           } else {
-            Type t;
+            Type t{};
             func(ecs, entt, t);
           }
         } else {
-          Type t;
+          Type t{};
           func(ecs, entt, t);
         }
       });
@@ -108,12 +114,17 @@ public:
     auto id = next_handler_id++;
     if constexpr (std::is_same_v<std::invoke_result_t<FuncT, EcsT&, entt_ext::entity, Type&>, asio::awaitable<void>>) {
       // Async handler - wrap it to handle component retrieval at registration time
+      // Note: deferred async handlers may run after the entity/component is destroyed
       on_update_async_handlers.emplace(id, [func = std::forward<FuncT>(func)](EcsT& ecs, entt_ext::entity entt) -> asio::awaitable<void> {
         if constexpr (entt::component_traits<Type>::page_size > 0u) {
-          co_await func(ecs, entt, ecs.template get<Type>(entt));
+          if (ecs.valid(entt) && ecs.template all_of<Type>(entt)) {
+            co_await func(ecs, entt, ecs.template get<Type>(entt));
+          }
         } else {
-          Type t;
-          co_await func(ecs, entt, t);
+          if (ecs.valid(entt)) {
+            Type t;
+            co_await func(ecs, entt, t);
+          }
         }
       });
     } else {

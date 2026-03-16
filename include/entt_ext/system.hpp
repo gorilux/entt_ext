@@ -227,7 +227,11 @@ private:
       asio::co_spawn(
           cfg.concurrent_io_ctx,
           [entity = cfg.entity, &ecs, &self, dt, handler = cfg.handler, view]() mutable -> asio::awaitable<void> {
-            co_await handler(ecs, self, dt, view);
+            try {
+              co_await handler(ecs, self, dt, view);
+            } catch (...) {
+              // Ensure running tag is always removed even if handler throws
+            }
             co_await ecs.remove_deferred<running<system_tag>>(entity);
           },
           asio::detached);
@@ -381,7 +385,7 @@ private:
       for (auto entry : view.each()) {
         auto entity = std::get<0>(entry);
 
-        if (!ecs.valid(entity) || ecs.template any_of<running<FuncT, each_tag>, running<each_tag>>(entity)) {
+        if (!ecs.valid(entity) || ecs.template any_of<running<FuncT, each_tag>>(entity)) {
           continue;
         }
 
@@ -398,7 +402,6 @@ private:
           continue;
         }
 
-        ecs.template emplace<running<each_tag>>(entity);
         ecs.template emplace<running<FuncT, each_tag>>(entity);
         if constexpr (IsOnce) {
           ecs.template emplace<running<FuncT, run_once_tag>>(entity);
@@ -409,15 +412,18 @@ private:
             [&ecs, entity, &self, dt, handler = cfg.handler, entry, children_ranges = std::move(children_ranges)]() mutable -> asio::awaitable<void> {
               co_await asio::this_coro::executor;
 
-              // Combine entry tuple with children_ranges tuple and call handler
-              // We need to unpack children_ranges into references
-              auto invoke_with_children = [&](auto&... child_ranges) -> asio::awaitable<void> {
-                auto full_args = std::tuple_cat(std::tie(ecs, self, dt), entry, std::tie(child_ranges...));
-                co_return co_await std::apply(handler, std::move(full_args));
-              };
-              co_await std::apply(invoke_with_children, children_ranges);
+              try {
+                // Combine entry tuple with children_ranges tuple and call handler
+                // We need to unpack children_ranges into references
+                auto invoke_with_children = [&](auto&... child_ranges) -> asio::awaitable<void> {
+                  auto full_args = std::tuple_cat(std::tie(ecs, self, dt), entry, std::tie(child_ranges...));
+                  co_return co_await std::apply(handler, std::move(full_args));
+                };
+                co_await std::apply(invoke_with_children, children_ranges);
+              } catch (...) {
+                // Ensure running tag is always removed even if handler throws
+              }
 
-              co_await ecs.remove_deferred<running<each_tag>>(entity);
               co_await ecs.remove_deferred<running<FuncT, each_tag>>(entity);
               co_return;
             },
@@ -644,11 +650,10 @@ public:
     for (auto entry : view.each()) {
       auto entity = std::get<0>(entry);
 
-      if (!ecs.valid(entity) || ecs.template any_of<running<FuncT, each_tag>, running<each_tag>>(entity)) {
+      if (!ecs.valid(entity) || ecs.template any_of<running<FuncT, each_tag>>(entity)) {
         continue;
       }
 
-      ecs.template emplace<running<each_tag>>(entity);
       ecs.template emplace<running<FuncT, each_tag>>(entity);
       if constexpr (Policy == run_policy::once) {
         ecs.template emplace<running<FuncT, run_once_tag>>(entity);
@@ -657,9 +662,12 @@ public:
           concurrent_executor,
           [&main_executor, entity, &ecs, &self, dt, handler, entry]() -> asio::awaitable<void> {
             co_await asio::this_coro::executor;
-            co_await std::apply(handler, std::tuple_cat(std::tie(ecs, self, dt), entry));
+            try {
+              co_await std::apply(handler, std::tuple_cat(std::tie(ecs, self, dt), entry));
+            } catch (...) {
+              // Ensure running tag is always removed even if handler throws
+            }
 
-            co_await ecs.remove_deferred<running<each_tag>>(entity);
             co_await ecs.remove_deferred<running<FuncT, each_tag>>(entity);
             co_return;
           },

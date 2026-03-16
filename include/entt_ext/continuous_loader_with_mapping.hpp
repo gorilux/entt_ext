@@ -26,12 +26,12 @@ void orphans(Registry& registry) {
 /**
  * @brief Enhanced continuous loader that exposes entity mappings
  *
- * This class inherits from entt::basic_continuous_loader and provides direct
- * access to the internal entity mapping table, allowing efficient extraction
- * of all server->client entity ID mappings without iteration.
+ * Uses the full entity identifier (ID + version) as the mapping key,
+ * so recycled entity IDs with different versions get separate live entities
+ * instead of colliding.
  *
- * The internal `remloc` map stores: base_entity_id -> pair(server_entity, client_entity)
- * We expose this through an accessor method to avoid modifying entt's source.
+ * The internal `remloc` map stores: remote_entity -> local_entity
+ * We expose this through accessor methods.
  */
 template <typename Registry>
 class continuous_loader_with_mapping {
@@ -39,15 +39,18 @@ class continuous_loader_with_mapping {
   using traits_type = entt::entt_traits<typename Registry::entity_type>;
 
   void restore(typename Registry::entity_type entt) {
-    if (const auto entity = to_entity(entt); remloc_.contains(entity) && remloc_[entity].first == entt) {
-      if (!reg->valid(remloc_[entity].second)) {
-        const auto local       = reg->create();
-        remloc_[entity].second = local;
+    if (auto it = remloc_.find(entt); it != remloc_.end()) {
+      // Exact match (same ID + version) — reuse if live entity is still valid
+      if (!reg->valid(it->second)) {
+        locrem_.erase(it->second);
+        const auto local = reg->create();
+        it->second       = local;
         locrem_.insert_or_assign(local, entt);
       }
     } else {
+      // New entity (or recycled ID with different version) — create a new live entity
       const auto local = reg->create();
-      remloc_.insert_or_assign(entity, std::make_pair(entt, local));
+      remloc_.insert_or_assign(entt, local);
       locrem_.insert_or_assign(local, entt);
     }
   }
@@ -170,18 +173,24 @@ public:
       for (std::size_t pos = in_use; pos < length; ++pos) {
         archive(entt);
 
-        if (const auto entity = to_entity(entt); remloc_.contains(entity)) {
-          const auto local = remloc_[entity].second;
-          if (reg->valid(local)) {
-            reg->destroy(local);
+        // Dead entity — clean up any mapping with the same base ID (any version)
+        const auto base = to_entity(entt);
+        for (auto it = remloc_.begin(); it != remloc_.end();) {
+          if (to_entity(it->first) == base) {
+            auto local = it->second;
+            if (reg->valid(local)) {
+              reg->destroy(local);
+            }
+            locrem_.erase(local);
+            it = remloc_.erase(it);
+          } else {
+            ++it;
           }
-          locrem_.erase(local);
-          remloc_.erase(entity);
         }
       }
     } else {
-      for (auto&& ref : remloc_) {
-        storage.remove(ref.second.second);
+      for (auto&& [remote, local] : remloc_) {
+        storage.remove(local);
       }
 
       while (length--) {
@@ -217,10 +226,14 @@ public:
    * @return A non-const reference to this loader.
    */
   continuous_loader_with_mapping& orphans() {
-    for (auto [entity_base, pair] : remloc_) {
-      auto local = pair.second;
+    for (auto it = remloc_.begin(); it != remloc_.end();) {
+      auto local = it->second;
       if (reg->valid(local) && reg->orphan(local)) {
         reg->destroy(local);
+        locrem_.erase(local);
+        it = remloc_.erase(it);
+      } else {
+        ++it;
       }
     }
     return *this;
@@ -232,8 +245,7 @@ public:
    * @return True if `entity` is managed by the loader, false otherwise.
    */
   [[nodiscard]] bool contains(entity_type entt) const noexcept {
-    const auto it = remloc_.find(to_entity(entt));
-    return it != remloc_.cend() && it->second.first == entt;
+    return remloc_.contains(entt);
   }
 
   /**
@@ -242,8 +254,8 @@ public:
    * @return The local identifier if any, the null entity otherwise.
    */
   [[nodiscard]] entity_type to_local(entity_type entt) const noexcept {
-    if (const auto it = remloc_.find(to_entity(entt)); it != remloc_.cend() && it->second.first == entt) {
-      return it->second.second;
+    if (const auto it = remloc_.find(entt); it != remloc_.cend()) {
+      return it->second;
     }
 
     return null;
@@ -292,8 +304,7 @@ public:
    * @param local The local (client) entity identifier.
    */
   void insert_mapping(entity_type remote, entity_type local) {
-    const auto entity = to_entity(remote);
-    remloc_.insert_or_assign(entity, std::make_pair(remote, local));
+    remloc_.insert_or_assign(remote, local);
     locrem_.insert_or_assign(local, remote);
   }
 
@@ -307,9 +318,8 @@ public:
    * @param remote The remote (server) entity identifier.
    */
   void remove_mapping_by_remote(entity_type remote) {
-    const auto entity = to_entity(remote);
-    if (const auto it = remloc_.find(entity); it != remloc_.cend() && it->second.first == remote) {
-      locrem_.erase(it->second.second);
+    if (const auto it = remloc_.find(remote); it != remloc_.cend()) {
+      locrem_.erase(it->second);
       remloc_.erase(it);
     }
   }
@@ -324,15 +334,15 @@ public:
    */
   void remove_mapping_by_local(entity_type local) {
     if (const auto it = locrem_.find(local); it != locrem_.cend()) {
-      remloc_.erase(to_entity(it->second));
+      remloc_.erase(it->second);
       locrem_.erase(it);
     }
   }
 
 private:
-  entt::dense_map<typename traits_type::entity_type, std::pair<entity_type, entity_type>> remloc_;
-  entt::dense_map<entity_type, entity_type>                                               locrem_;
-  registry_type*                                                                          reg;
+  entt::dense_map<entity_type, entity_type> remloc_; // remote (archived) entity → local (live) entity
+  entt::dense_map<entity_type, entity_type> locrem_; // local (live) entity → remote (archived) entity
+  registry_type*                            reg;
 };
 
 } // namespace entt_ext

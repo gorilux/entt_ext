@@ -908,6 +908,10 @@ private:
     return ss.str();
   }
 
+public:
+  // Access the underlying RPC server (e.g. to send custom notifications)
+  rpc_server& get_rpc_server() { return rpc_server_; }
+
 private:
   ecs&                                               ecs_;
   rpc_server                                         rpc_server_;

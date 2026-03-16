@@ -4,8 +4,10 @@
 
 #include <spdlog/spdlog.h>
 
-#include <cereal/archives/json.hpp>
+// #include <cereal/archives/json.hpp>
+// #include <cereal/archives/msgpack.hpp>
 #include <cereal/archives/portable_binary.hpp>
+
 #include <cereal/cereal.hpp>
 #include <cereal/types/string.hpp>
 
@@ -93,9 +95,10 @@ struct settings_collection {
   }
 };
 
-// using InputArchiveType  = cereal::JSONInputArchive;
-// using OutputArchiveType = cereal::JSONOutputArchive;
-
+// using InputArchiveType  = cereal::MsgpackInputArchive;
+// using OutputArchiveType = cereal::MsgpackOutputArchive;
+// using InputArchiveType  = cereal::MsgpackInputArchive;
+// using OutputArchiveType = cereal::MsgpackOutputArchive;
 using InputArchiveType  = cereal::PortableBinaryInputArchive;
 using OutputArchiveType = cereal::PortableBinaryOutputArchive;
 
