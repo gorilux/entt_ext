@@ -131,10 +131,12 @@ struct handshake_request {
   std::string client_name;      // Optional client identifier
   std::string client_version;   // Optional client version info
   std::string protocol_version; // Protocol version based on component types and order
+  std::string username;         // Authentication username (empty = no auth)
+  std::string password;         // Authentication password (plaintext, validated server-side)
 
   template <typename Archive>
   void serialize(Archive& archive) {
-    archive(client_name, client_version, protocol_version);
+    archive(client_name, client_version, protocol_version, username, password);
   }
 };
 
@@ -144,10 +146,12 @@ struct handshake_response {
   std::string                           error_message;    // Error details if handshake failed
   std::string                           protocol_version; // Server's protocol version
   std::chrono::steady_clock::time_point server_timestamp;
+  int                                   role = 0;         // User role (0=user, 1=admin)
+  std::string                           auth_token;       // Session auth token for subsequent requests
 
   template <typename Archive>
   void serialize(Archive& archive) {
-    archive(success, session_id, error_message, protocol_version, server_timestamp);
+    archive(success, session_id, error_message, protocol_version, server_timestamp, role, auth_token);
   }
 };
 

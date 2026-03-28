@@ -155,14 +155,31 @@ public:
                                      .server_timestamp = std::chrono::steady_clock::now()};
       }
 
+      // Run authentication if handler is set
+      int         auth_role  = 0;
+      std::string auth_token;
+      if (auth_handler_) {
+        auto auth_result = auth_handler_(request);
+        if (!auth_result.success) {
+          spdlog::warn("Authentication failed for user '{}': {}",
+                       request.username, auth_result.error_message);
+          auth_result.protocol_version = protocol_version_;
+          auth_result.server_timestamp = std::chrono::steady_clock::now();
+          co_return auth_result;
+        }
+        auth_role  = auth_result.role;
+        auth_token = auth_result.auth_token;
+      }
+
       // Generate unique session ID
       std::string session_id = generate_session_id();
 
       // Create client state for this session
       get_or_create_client_state(session_id);
 
-      spdlog::info("Client connected - Name: {}, Version: {}, Session: {}",
+      spdlog::info("Client connected - Name: {}, User: {}, Version: {}, Session: {}",
                    request.client_name.empty() ? "unknown" : request.client_name,
+                   request.username.empty() ? "anonymous" : request.username,
                    request.client_version.empty() ? "unknown" : request.client_version,
                    session_id);
 
@@ -170,7 +187,9 @@ public:
                                    .session_id       = session_id,
                                    .error_message    = "",
                                    .protocol_version = protocol_version_,
-                                   .server_timestamp = std::chrono::steady_clock::now()};
+                                   .server_timestamp = std::chrono::steady_clock::now(),
+                                   .role             = auth_role,
+                                   .auth_token       = auth_token};
 
     } catch (std::exception const& ex) {
       co_return handshake_response{.success          = false,
@@ -912,6 +931,13 @@ public:
   // Access the underlying RPC server (e.g. to send custom notifications)
   rpc_server& get_rpc_server() { return rpc_server_; }
 
+  // Set an authentication handler called during handshake.
+  // The handler receives the request and returns a handshake_response.
+  // If the handler returns success=true, the server proceeds with session creation.
+  // If the handler returns success=false, the handshake is rejected.
+  using auth_handler_type = std::function<handshake_response(handshake_request const&)>;
+  void set_auth_handler(auth_handler_type handler) { auth_handler_ = std::move(handler); }
+
 private:
   ecs&                                               ecs_;
   rpc_server                                         rpc_server_;
@@ -919,6 +945,7 @@ private:
   bool                                               notifications_enabled_   = true;  // Enable real-time notifications by default
   bool                                               applying_client_changes_ = false; // Flag to prevent sync loops
   std::string                                        protocol_version_;                // Protocol version based on component types
+  auth_handler_type                                  auth_handler_;                    // Optional authentication handler
 };
 
 } // namespace entt_ext::sync

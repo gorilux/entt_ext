@@ -58,7 +58,12 @@ public:
 
   // Connect to the sync server and perform handshake
   asio::awaitable<bool>
-  connect(std::string const& host, std::uint16_t port, std::string const& client_name = "", std::string const& client_version = "") {
+  connect(std::string const& host,
+          std::uint16_t      port,
+          std::string const& client_name    = "",
+          std::string const& client_version = "",
+          std::string const& username       = "",
+          std::string const& password       = "") {
     try {
       // First establish TCP connection
       auto          executor = co_await asio::this_coro::executor;
@@ -69,8 +74,8 @@ public:
       // Set up notification handlers for real-time sync
       setup_notification_handlers();
 
-      // Perform handshake to get session ID
-      bool handshake_success = co_await perform_handshake(client_name, client_version);
+      // Perform handshake to get session ID (includes authentication)
+      bool handshake_success = co_await perform_handshake(client_name, client_version, username, password);
       if (!handshake_success) {
         // Disconnect on handshake failure
         co_await disconnect();
@@ -85,6 +90,11 @@ public:
       throw; // Let the caller see the actual error
     }
   }
+
+  // Auth info from last successful handshake
+  int                auth_role() const { return auth_role_; }
+  std::string const& auth_token() const { return auth_token_; }
+  std::string const& handshake_error() const { return handshake_error_; }
 
   // Disconnect from the sync server
   asio::awaitable<void> disconnect(bool clear_mapping = false) {
@@ -253,27 +263,23 @@ private:
       if (request.session_id != session_id_)
         return;
 
-      // request.target_entity contains the server entity
-      entity server_entity = request.target_entity;
+      // Defer ECS modifications to avoid concurrent registry access
+      // (notification handlers run from the RPC receive path)
+      ecs_.defer([this, request](entt_ext::ecs& ecs) {
+        entity server_entity = request.target_entity;
+        auto   client_entity = continuous_loader_.to_local(server_entity);
 
-      // Map server entity to local client entity
-      auto client_entity = continuous_loader_.to_local(server_entity);
+        if (client_entity == entt_ext::null) {
+          spdlog::debug("Received component update for unmapped server entity {} ({})", static_cast<int>(server_entity), type_name<ComponentT>());
+          client_entity = ecs.create();
+          continuous_loader_.insert_mapping(server_entity, client_entity);
+          spdlog::debug("Created new client entity {} for server entity {}", static_cast<int>(client_entity), static_cast<int>(server_entity));
+        }
 
-      if (client_entity == entt_ext::null) {
-        spdlog::debug("Received component update for unmapped server entity {} ({})", static_cast<int>(server_entity), type_name<ComponentT>());
-        client_entity = ecs_.create();
-        continuous_loader_.insert_mapping(server_entity, client_entity);
-        spdlog::debug("Created new client entity {} for server entity {}", static_cast<int>(client_entity), static_cast<int>(server_entity));
-      }
-
-      // Apply component update directly WITHOUT triggering observers (prevent loops)
-      if (ecs_.valid(client_entity)) {
-        // spdlog::debug("received_component_update: {} server={} client={}",
-        //               type_name<ComponentT>(),
-        //               static_cast<int>(server_entity),
-        //               static_cast<int>(client_entity));
-        ecs_.template emplace_or_replace<component_update_request<ComponentT>>(client_entity, request);
-      }
+        if (ecs.valid(client_entity)) {
+          ecs.template emplace_or_replace<component_update_request<ComponentT>>(client_entity, request);
+        }
+      });
     });
 
     // Handle component removals
@@ -282,25 +288,24 @@ private:
       if (request.session_id != session_id_)
         return;
 
-      // request.target_entity contains the server entity
-      entity server_entity = request.target_entity;
+      // Defer ECS modifications to avoid concurrent registry access
+      ecs_.defer([this, request](entt_ext::ecs& ecs) {
+        entity server_entity = request.target_entity;
+        auto   client_entity = continuous_loader_.to_local(server_entity);
 
-      // Map server entity to local client entity
-      auto client_entity = continuous_loader_.to_local(server_entity);
+        if (client_entity == entt_ext::null) {
+          spdlog::debug("Received component removal for unmapped server entity {} ({})", static_cast<int>(server_entity), type_name<ComponentT>());
+          return;
+        }
 
-      if (client_entity == entt_ext::null) {
-        spdlog::debug("Received component removal for unmapped server entity {} ({})", static_cast<int>(server_entity), type_name<ComponentT>());
-        return; // Entity not mapped yet, ignore
-      }
-
-      // Remove component directly WITHOUT triggering observers (prevent loops)
-      if (ecs_.valid(client_entity)) {
-        spdlog::debug("received_component_removal: {} server={} client={}",
-                      type_name<ComponentT>(),
-                      static_cast<int>(server_entity),
-                      static_cast<int>(client_entity));
-        ecs_.template emplace_or_replace<component_remove_request<ComponentT>>(client_entity, request);
-      }
+        if (ecs.valid(client_entity)) {
+          spdlog::debug("received_component_removal: {} server={} client={}",
+                        type_name<ComponentT>(),
+                        static_cast<int>(server_entity),
+                        static_cast<int>(client_entity));
+          ecs.template emplace_or_replace<component_remove_request<ComponentT>>(client_entity, request);
+        }
+      });
     });
   }
 
@@ -710,10 +715,17 @@ private:
     co_return;
   }
 
-  // Perform handshake with server to get session ID
-  auto perform_handshake(std::string const& client_name, std::string const& client_version) -> asio::awaitable<bool> {
+  // Perform handshake with server to get session ID (includes authentication)
+  auto perform_handshake(std::string const& client_name,
+                         std::string const& client_version,
+                         std::string const& username = "",
+                         std::string const& password = "") -> asio::awaitable<bool> {
     try {
-      handshake_request request{.client_name = client_name, .client_version = client_version, .protocol_version = protocol_version_};
+      handshake_request request{.client_name      = client_name,
+                                .client_version   = client_version,
+                                .protocol_version = protocol_version_,
+                                .username         = username,
+                                .password         = password};
 
       auto response = co_await rpc_client_.template invoke<handshake_response>("handshake", std::move(request));
 
@@ -726,20 +738,25 @@ private:
         }
 
         session_id_ = response.session_id;
-        spdlog::info("Handshake successful - Session: {}, Protocol: {}", session_id_, protocol_version_);
+        auth_role_  = response.role;
+        auth_token_ = response.auth_token;
+        spdlog::info("Handshake successful - Session: {}, User: {}, Role: {}", session_id_, username, auth_role_);
         co_return true;
       } else {
         spdlog::error("Handshake failed: {}", response.error_message);
+        handshake_error_ = response.error_message;
         session_id_.clear();
         co_return false;
       }
 
     } catch (std::exception const& ex) {
       spdlog::error("Handshake exception: {}", ex.what());
+      handshake_error_ = ex.what();
       session_id_.clear();
       co_return false;
     } catch (...) {
       spdlog::error("Handshake unknown exception");
+      handshake_error_ = "Unknown handshake error";
       session_id_.clear();
       co_return false;
     }
@@ -775,8 +792,11 @@ public:
 private:
   ecs&                                           ecs_;
   rpc_client                                     rpc_client_;
-  std::string                                    session_id_;       // Session ID obtained from handshake
-  std::string                                    protocol_version_; // Protocol version based on component types
+  std::string                                    session_id_;        // Session ID obtained from handshake
+  std::string                                    protocol_version_;  // Protocol version based on component types
+  std::string                                    handshake_error_;   // Last handshake error message
+  int                                            auth_role_  = 0;   // Role from auth (0=user, 1=admin)
+  std::string                                    auth_token_;        // Auth token from handshake
   bool                                           loading_snapshot_ = false;
   continuous_loader_with_mapping<entt::registry> continuous_loader_;
 };
