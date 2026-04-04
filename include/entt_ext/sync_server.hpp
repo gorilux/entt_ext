@@ -359,19 +359,21 @@ private:
   template <typename ComponentT>
   void setup_automatic_sync(entt_ext::ecs& ecs) {
     using ActualT = unwrap_hierarchy_t<ComponentT>;
+    constexpr bool read_only = is_server_only_v<ComponentT>;
 
     // Set up for the component itself
-    setup_automatic_sync_impl<ActualT>(ecs);
+    setup_automatic_sync_impl<ActualT, read_only>(ecs);
 
     // Also set up for hierarchy components if wrapped with with_hierarchy<T>
     if constexpr (is_with_hierarchy_v<ComponentT>) {
-      setup_automatic_sync_impl<entt_ext::parent<ActualT>>(ecs);
-      setup_automatic_sync_impl<entt_ext::children<ActualT>>(ecs);
+      setup_automatic_sync_impl<entt_ext::parent<ActualT>, read_only>(ecs);
+      setup_automatic_sync_impl<entt_ext::children<ActualT>, read_only>(ecs);
     }
   }
 
-  // Implementation of automatic sync setup for a single component
-  template <typename ComponentT>
+  // Implementation of automatic sync setup for a single component.
+  // ReadOnly=true for server_only components: skip apply-from-client observers.
+  template <typename ComponentT, bool ReadOnly = false>
   void setup_automatic_sync_impl(entt_ext::ecs& ecs) {
     // Set up component observer to track server-side changes
     auto& observer = ecs.component_observer<ComponentT>();
@@ -436,51 +438,53 @@ private:
       co_return;
     });
 
-    // Set up observer for component_update_request to apply updates from clients
-    auto& update_request_observer = ecs.component_observer<component_update_request<ComponentT>>();
+    if constexpr (!ReadOnly) {
+      // Set up observer for component_update_request to apply updates from clients
+      auto& update_request_observer = ecs.component_observer<component_update_request<ComponentT>>();
 
-    update_request_observer.on_construct(
-        [this](entt_ext::ecs& ecs, entt_ext::entity e, component_update_request<ComponentT>& request) -> asio::awaitable<void> {
-          try {
-            // Apply the component update
-            spdlog::debug("Applying component update request: {} server={} client={} version={}",
-                          type_name<ComponentT>(),
-                          static_cast<int>(e),
-                          std::chrono::duration_cast<std::chrono::milliseconds>(request.sync_version.time_since_epoch()).count(),
-                          request.session_id);
-            ecs.template emplace_or_replace<ComponentT>(e, request.component_data);
+      update_request_observer.on_construct(
+          [this](entt_ext::ecs& ecs, entt_ext::entity e, component_update_request<ComponentT>& request) -> asio::awaitable<void> {
+            try {
+              // Apply the component update
+              spdlog::debug("Applying component update request: {} server={} client={} version={}",
+                            type_name<ComponentT>(),
+                            static_cast<int>(e),
+                            std::chrono::duration_cast<std::chrono::milliseconds>(request.sync_version.time_since_epoch()).count(),
+                            request.session_id);
+              ecs.template emplace_or_replace<ComponentT>(e, request.component_data);
 
-            // Notify all other clients about the component update
-            co_await notify_component_update_to_other_clients<ComponentT>(e, request.sync_version, request.component_data, request.session_id);
+              // Notify all other clients about the component update
+              co_await notify_component_update_to_other_clients<ComponentT>(e, request.sync_version, request.component_data, request.session_id);
 
-            // Remove the request marker
-            co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
-          } catch (std::exception const& ex) {
-            spdlog::error("Error applying component update request: {}", ex.what());
-          } catch (...) {
-            spdlog::error("Error applying component update request: unknown exception");
-          }
+              // Remove the request marker
+              co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
+            } catch (std::exception const& ex) {
+              spdlog::error("Error applying component update request: {}", ex.what());
+            } catch (...) {
+              spdlog::error("Error applying component update request: unknown exception");
+            }
 
-          co_return;
-        });
+            co_return;
+          });
 
-    // Set up observer for component_remove_request to apply removals from clients
-    auto& remove_request_observer = ecs.component_observer<component_remove_request<ComponentT>>();
+      // Set up observer for component_remove_request to apply removals from clients
+      auto& remove_request_observer = ecs.component_observer<component_remove_request<ComponentT>>();
 
-    remove_request_observer.on_construct(
-        [this](entt_ext::ecs& ecs, entt_ext::entity e, component_remove_request<ComponentT>& request) -> asio::awaitable<void> {
-          try {
-            ecs.template remove<ComponentT>(e);
-            co_await notify_component_removal_to_other_clients<ComponentT>(e, request.sync_version, request.session_id);
-            co_await ecs.template remove_deferred<component_remove_request<ComponentT>>(e);
-          } catch (std::exception const& ex) {
-            spdlog::error("Error applying component remove request: {}", ex.what());
-          } catch (...) {
-            spdlog::error("Error applying component remove request: unknown exception");
-          }
+      remove_request_observer.on_construct(
+          [this](entt_ext::ecs& ecs, entt_ext::entity e, component_remove_request<ComponentT>& request) -> asio::awaitable<void> {
+            try {
+              ecs.template remove<ComponentT>(e);
+              co_await notify_component_removal_to_other_clients<ComponentT>(e, request.sync_version, request.session_id);
+              co_await ecs.template remove_deferred<component_remove_request<ComponentT>>(e);
+            } catch (std::exception const& ex) {
+              spdlog::error("Error applying component remove request: {}", ex.what());
+            } catch (...) {
+              spdlog::error("Error applying component remove request: unknown exception");
+            }
 
-          co_return;
-        });
+            co_return;
+          });
+    } // !ReadOnly
   }
 
   // Send component update notification to all clients (server-initiated changes)
@@ -848,35 +852,56 @@ private:
   template <typename ComponentT>
   void register_component_endpoints(entt_ext::ecs& ecs) {
     using ActualT = unwrap_hierarchy_t<ComponentT>;
+    constexpr bool read_only = is_server_only_v<ComponentT>;
 
     // Register for the component itself
-    register_component_endpoints_impl<ActualT>(ecs);
+    register_component_endpoints_impl<ActualT, read_only>(ecs);
 
     // Also register for hierarchy components if wrapped with with_hierarchy<T>
     if constexpr (is_with_hierarchy_v<ComponentT>) {
-      register_component_endpoints_impl<entt_ext::parent<ActualT>>(ecs);
-      register_component_endpoints_impl<entt_ext::children<ActualT>>(ecs);
+      register_component_endpoints_impl<entt_ext::parent<ActualT>, read_only>(ecs);
+      register_component_endpoints_impl<entt_ext::children<ActualT>, read_only>(ecs);
     }
   }
 
-  template <typename ComponentT>
+  template <typename ComponentT, bool ReadOnly = false>
   void register_component_endpoints_impl(entt_ext::ecs& ecs) {
     std::string component_name = std::string(type_name<ComponentT>());
 
     // Register update endpoint: "update_component_Position", "update_component_Velocity", etc.
     // This handles both insert and update operations
     std::string update_endpoint = "component_updated_" + component_name;
-    rpc_server_.attach(update_endpoint,
-                       [this](component_update_request<ComponentT> const& request) -> asio::awaitable<component_update_response<ComponentT>> {
-                         co_return co_await handle_component_update<ComponentT>(request);
-                       });
+
+    if constexpr (ReadOnly) {
+      // server_only component — reject client updates
+      rpc_server_.attach(update_endpoint,
+                         [](component_update_request<ComponentT> const& request) -> asio::awaitable<component_update_response<ComponentT>> {
+                           spdlog::warn("Rejected client update for server_only component: {}", type_name<ComponentT>());
+                           co_return component_update_response<ComponentT>{.success = false, .error_message = "server_only component"};
+                         });
+    } else {
+      rpc_server_.attach(update_endpoint,
+                         [this](component_update_request<ComponentT> const& request) -> asio::awaitable<component_update_response<ComponentT>> {
+                           co_return co_await handle_component_update<ComponentT>(request);
+                         });
+    }
 
     // Register remove endpoint: "remove_component_Position", "remove_component_Velocity", etc.
     std::string remove_endpoint = "component_removed_" + component_name;
-    rpc_server_.attach(remove_endpoint,
-                       [this](component_remove_request<ComponentT> const& request) -> asio::awaitable<component_remove_response<ComponentT>> {
-                         co_return co_await handle_component_remove<ComponentT>(request);
-                       });
+
+    if constexpr (ReadOnly) {
+      // server_only component — reject client removals
+      rpc_server_.attach(remove_endpoint,
+                         [](component_remove_request<ComponentT> const& request) -> asio::awaitable<component_remove_response<ComponentT>> {
+                           spdlog::warn("Rejected client removal for server_only component: {}", type_name<ComponentT>());
+                           co_return component_remove_response<ComponentT>{.success = false, .error_message = "server_only component"};
+                         });
+    } else {
+      rpc_server_.attach(remove_endpoint,
+                         [this](component_remove_request<ComponentT> const& request) -> asio::awaitable<component_remove_response<ComponentT>> {
+                           co_return co_await handle_component_remove<ComponentT>(request);
+                         });
+    }
   }
 
 private:

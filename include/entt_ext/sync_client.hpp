@@ -313,93 +313,97 @@ private:
   template <typename ComponentT>
   void setup_automatic_sync() {
     using ActualT = unwrap_hierarchy_t<ComponentT>;
+    constexpr bool read_only = is_server_only_v<ComponentT>;
 
     // Set up for the component itself
-    setup_automatic_sync_impl<ActualT>();
+    setup_automatic_sync_impl<ActualT, read_only>();
 
     // Also set up for hierarchy components if wrapped with with_hierarchy<T>
     if constexpr (is_with_hierarchy_v<ComponentT>) {
-      setup_automatic_sync_impl<entt_ext::parent<ActualT>>();
-      setup_automatic_sync_impl<entt_ext::children<ActualT>>();
+      setup_automatic_sync_impl<entt_ext::parent<ActualT>, read_only>();
+      setup_automatic_sync_impl<entt_ext::children<ActualT>, read_only>();
     }
   }
 
-  // Implementation of automatic sync setup for a single component
-  template <typename ComponentT>
+  // Implementation of automatic sync setup for a single component.
+  // ReadOnly=true for server_only components: skip send-to-server observers.
+  template <typename ComponentT, bool ReadOnly = false>
   void setup_automatic_sync_impl() {
     // Set up component observer to track changes
     auto& observer = ecs_.component_observer<ComponentT>();
 
-    // When a sync component is added, send it to server immediately
-    observer.on_construct([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
-      spdlog::debug("Client-side component added: {} {}", type_name<ComponentT>(), static_cast<int>(e));
+    if constexpr (!ReadOnly) {
+      // When a sync component is added, send it to server immediately
+      observer.on_construct([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
+        spdlog::debug("Client-side component added: {} {}", type_name<ComponentT>(), static_cast<int>(e));
 
-      if (loading_snapshot_) {
+        if (loading_snapshot_) {
+          co_return;
+        }
+        if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
+          co_return;
+        }
+
+        auto sync_version = std::chrono::steady_clock::now();
+
+        try {
+          co_await send_component_to_server<ComponentT>(e, component, sync_version);
+        } catch (std::exception const& ex) {
+          spdlog::error("Error sending component to server: {}", ex.what());
+        } catch (...) {
+          spdlog::error("Error sending component to server: unknown exception");
+        }
+
         co_return;
-      }
-      if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
+      });
+
+      // When a sync component is updated, send it to server immediately
+      observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
+        // spdlog::debug("Client-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
+
+        if (loading_snapshot_) {
+          co_return;
+        }
+        if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
+          co_return;
+        }
+
+        auto sync_version = std::chrono::steady_clock::now();
+
+        try {
+          co_await send_component_to_server<ComponentT>(e, component, sync_version);
+        } catch (std::exception const& ex) {
+          spdlog::error("Error sending component to server: {}", ex.what());
+        } catch (...) {
+          spdlog::error("Error sending component to server: unknown exception");
+        }
+
         co_return;
-      }
+      });
 
-      auto sync_version = std::chrono::steady_clock::now();
+      // When a sync component is removed, notify server immediately
+      observer.on_destroy([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
+        if (loading_snapshot_) {
+          co_return;
+        }
+        if (auto request = ecs.template try_get<component_remove_request<ComponentT>>(e); request != nullptr) {
+          co_return;
+        }
 
-      try {
-        co_await send_component_to_server<ComponentT>(e, component, sync_version);
-      } catch (std::exception const& ex) {
-        spdlog::error("Error sending component to server: {}", ex.what());
-      } catch (...) {
-        spdlog::error("Error sending component to server: unknown exception");
-      }
+        spdlog::debug("Client-side component destroyed: {} {}", type_name<ComponentT>(), static_cast<int>(e));
+        auto sync_version = std::chrono::steady_clock::now();
 
-      co_return;
-    });
+        try {
+          co_await notify_component_removal<ComponentT>(e, sync_version);
+        } catch (std::exception const& ex) {
+          spdlog::error("Error notifying component removal to server: {}", ex.what());
+        } catch (...) {
+          spdlog::error("Error notifying component removal to server: unknown exception");
+        }
 
-    // When a sync component is updated, send it to server immediately
-    observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
-      // spdlog::debug("Client-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
-
-      if (loading_snapshot_) {
         co_return;
-      }
-      if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
-        co_return;
-      }
-
-      auto sync_version = std::chrono::steady_clock::now();
-
-      try {
-        co_await send_component_to_server<ComponentT>(e, component, sync_version);
-      } catch (std::exception const& ex) {
-        spdlog::error("Error sending component to server: {}", ex.what());
-      } catch (...) {
-        spdlog::error("Error sending component to server: unknown exception");
-      }
-
-      co_return;
-    });
-
-    // When a sync component is removed, notify server immediately
-    observer.on_destroy([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
-      if (loading_snapshot_) {
-        co_return;
-      }
-      if (auto request = ecs.template try_get<component_remove_request<ComponentT>>(e); request != nullptr) {
-        co_return;
-      }
-
-      spdlog::debug("Client-side component destroyed: {} {}", type_name<ComponentT>(), static_cast<int>(e));
-      auto sync_version = std::chrono::steady_clock::now();
-
-      try {
-        co_await notify_component_removal<ComponentT>(e, sync_version);
-      } catch (std::exception const& ex) {
-        spdlog::error("Error notifying component removal to server: {}", ex.what());
-      } catch (...) {
-        spdlog::error("Error notifying component removal to server: unknown exception");
-      }
-
-      co_return;
-    });
+      });
+    } // !ReadOnly
 
     // Set up observer for component_update_request to apply updates from server
     auto& update_request_observer = ecs_.component_observer<component_update_request<ComponentT>>();
@@ -673,6 +677,17 @@ private:
     requires requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); }
              && (!sync::is_hierarchy_component_v<ComponentT>)
   auto map_entities_async(ComponentT& component) -> asio::awaitable<void> {
+    // Create placeholder entities for unmapped server entities so map_entities succeeds
+    if constexpr (requires(ComponentT const& c) { c.entity_refs(); }) {
+      for (auto remote_entity : component.entity_refs()) {
+        if (remote_entity != entt_ext::null && continuous_loader_.map(remote_entity) == entt_ext::null) {
+          auto local = ecs_.create();
+          continuous_loader_.insert_mapping(remote_entity, local);
+          spdlog::warn("Created placeholder entity {} for unmapped server entity {}",
+                       static_cast<int>(local), static_cast<int>(remote_entity));
+        }
+      }
+    }
     component.map_entities(continuous_loader_);
     co_return;
   }
@@ -711,6 +726,17 @@ private:
     requires requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities_to_remote(l); }
              && (!sync::is_hierarchy_component_v<ComponentT>)
   auto map_component_entities_to_remote_async(ComponentT& component) -> asio::awaitable<void> {
+    // Ensure all referenced local entities have server mappings before converting
+    if constexpr (requires(ComponentT const& c) { c.entity_refs(); }) {
+      for (auto local_entity : component.entity_refs()) {
+        if (local_entity != entt_ext::null && continuous_loader_.to_remote(local_entity) == entt_ext::null) {
+          auto server_entity = co_await request_server_entity(local_entity);
+          if (server_entity != entt_ext::null) {
+            continuous_loader_.insert_mapping(server_entity, local_entity);
+          }
+        }
+      }
+    }
     component.map_entities_to_remote(continuous_loader_);
     co_return;
   }

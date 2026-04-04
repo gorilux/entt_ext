@@ -86,5 +86,40 @@ struct unwrap_hierarchy<with_entity_refs<T>> {
   using type = T;
 };
 
+// ============================================================================
+// Server-Only Wrapper - Components that only flow server → client
+// ============================================================================
+//
+// Usage:
+//   sync_client<
+//       server_only<tracking_result>,   // Server writes, client reads — never sent back
+//       server_only<detection_result>,  // Server writes, client reads — never sent back
+//       Health,                          // Bidirectional (default)
+//   > client(ecs);
+//
+// The client still receives updates from the server and applies them locally,
+// but on_construct/on_update/on_destroy observers will NOT send changes back.
+// ============================================================================
+
+template <typename T>
+struct server_only {
+  using type = T;
+};
+
+template <typename T>
+struct is_server_only : std::false_type {};
+
+template <typename T>
+struct is_server_only<server_only<T>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_server_only_v = is_server_only<T>::value;
+
+// Extend unwrap_hierarchy to also handle server_only
+template <typename T>
+struct unwrap_hierarchy<server_only<T>> {
+  using type = T;
+};
+
 } // namespace entt_ext::sync
 
