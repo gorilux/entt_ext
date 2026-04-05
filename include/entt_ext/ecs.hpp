@@ -96,6 +96,11 @@ inline constexpr bool cascade_delete_v = cascade_delete_trait<T>::value;
 template <typename Type, typename... Others>
 struct children_view {};
 
+// Marker type for system component declarations: keeps T out of the view's
+// required set but passes T* (via try_get, may be null) into the handler.
+template <typename T>
+struct optional_tag {};
+
 // Entity mapping helper functions for children (index_set<entity, Type>)
 // These are free functions that work with the children type alias
 

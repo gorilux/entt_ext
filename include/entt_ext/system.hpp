@@ -8,6 +8,31 @@ struct is_children_view<children_view<Type, Others...>> : std::true_type {};
 template <typename T>
 inline constexpr bool is_children_view_v = is_children_view<T>::value;
 
+// Type trait to detect optional_tag
+template <typename T>
+struct is_optional_tag : std::false_type {};
+
+template <typename T>
+struct is_optional_tag<optional_tag<T>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_optional_tag_v = is_optional_tag<T>::value;
+
+// Unwrap optional_tag<T> -> T
+template <typename T>
+struct unwrap_optional_tag;
+
+template <typename T>
+struct unwrap_optional_tag<optional_tag<T>> {
+  using type = T;
+};
+
+// A marker is any template parameter that is NOT a required component:
+// currently {children_view<...>, optional_tag<...>}. Markers are stripped
+// from the view query and replaced at call time with computed arguments.
+template <typename T>
+inline constexpr bool is_marker_v = is_children_view_v<T> || is_optional_tag_v<T>;
+
 // Helper to filter children_view types from component list
 template <typename... Ts>
 struct filter_children_views;
@@ -38,6 +63,22 @@ struct extract_children_views<T, Rest...> {
   using rest_type = typename extract_children_views<Rest...>::type;
   using type =
       std::conditional_t<is_children_view_v<T>, decltype(std::tuple_cat(std::declval<std::tuple<T>>(), std::declval<rest_type>())), rest_type>;
+};
+
+// Filter: keep only regular (non-marker) components. Used to build the view query.
+template <typename... Ts>
+struct filter_markers;
+
+template <>
+struct filter_markers<> {
+  using type = std::tuple<>;
+};
+
+template <typename T, typename... Rest>
+struct filter_markers<T, Rest...> {
+  using rest_type = typename filter_markers<Rest...>::type;
+  using type =
+      std::conditional_t<is_marker_v<T>, rest_type, decltype(std::tuple_cat(std::declval<std::tuple<T>>(), std::declval<rest_type>()))>;
 };
 
 // Convert tuple to entt::get_t
@@ -241,18 +282,15 @@ private:
 
   template <typename FuncT, run_policy Policy, bool IsOnce, typename... ComponentsT, typename... ExcludeT>
   static auto create_each_parallel_async(each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>&& cfg) {
-    // Check if we have any children_view types at compile time
-    constexpr bool has_children_views = (is_children_view_v<ComponentsT> || ...);
+    // Any marker (children_view or optional_tag) triggers the unified path.
+    constexpr bool has_markers = (is_marker_v<ComponentsT> || ...);
 
-    if constexpr (has_children_views) {
-      // Filter out children_view types for the actual view
-      using regular_components  = typename filter_children_views<ComponentsT...>::type;
-      using children_view_types = typename extract_children_views<ComponentsT...>::type;
+    if constexpr (has_markers) {
+      using regular_components = typename filter_markers<ComponentsT...>::type;
 
-      return create_each_parallel_async_impl_with_children<FuncT, Policy, IsOnce>(std::move(cfg),
-                                                                                  regular_components{},
-                                                                                  children_view_types{},
-                                                                                  entt::exclude_t<ExcludeT...>{});
+      return create_each_parallel_async_impl_with_markers<FuncT, Policy, IsOnce, ComponentsT...>(std::move(cfg),
+                                                                                                 regular_components{},
+                                                                                                 entt::exclude_t<ExcludeT...>{});
     } else {
       return [cfg = std::move(cfg)](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
         auto view = ecs.template view<ComponentsT...>(entt::exclude_t<running<FuncT>, delete_later, running<FuncT, run_once_tag>, ExcludeT...>{});
@@ -269,18 +307,15 @@ private:
 
   template <typename FuncT, run_policy Policy, bool IsOnce, typename... ComponentsT, typename... ExcludeT>
   static auto create_each_sequential_async(each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>&& cfg) {
-    // Check if we have any children_view types at compile time
-    constexpr bool has_children_views = (is_children_view_v<ComponentsT> || ...);
+    // Any marker (children_view or optional_tag) triggers the unified path.
+    constexpr bool has_markers = (is_marker_v<ComponentsT> || ...);
 
-    if constexpr (has_children_views) {
-      // Filter out children_view types for the actual view
-      using regular_components  = typename filter_children_views<ComponentsT...>::type;
-      using children_view_types = typename extract_children_views<ComponentsT...>::type;
+    if constexpr (has_markers) {
+      using regular_components = typename filter_markers<ComponentsT...>::type;
 
-      return create_each_sequential_async_impl_with_children<FuncT, Policy, IsOnce>(std::move(cfg),
-                                                                                    regular_components{},
-                                                                                    children_view_types{},
-                                                                                    entt::exclude_t<ExcludeT...>{});
+      return create_each_sequential_async_impl_with_markers<FuncT, Policy, IsOnce, ComponentsT...>(std::move(cfg),
+                                                                                                   regular_components{},
+                                                                                                   entt::exclude_t<ExcludeT...>{});
     } else {
       return [cfg = std::move(cfg)](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
         auto view = ecs.template view<ComponentsT...>(entt::exclude_t<running<FuncT>, delete_later, running<FuncT, run_once_tag>, ExcludeT...>{});
@@ -303,18 +338,15 @@ private:
 
   template <typename FuncT, run_policy Policy, bool IsOnce, typename... ComponentsT, typename... ExcludeT>
   static auto create_each_sequential_sync(each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>&& cfg) {
-    // Check if we have any children_view types at compile time
-    constexpr bool has_children_views = (is_children_view_v<ComponentsT> || ...);
+    // Any marker (children_view or optional_tag) triggers the unified path.
+    constexpr bool has_markers = (is_marker_v<ComponentsT> || ...);
 
-    if constexpr (has_children_views) {
-      // Filter out children_view types for the actual view
-      using regular_components  = typename filter_children_views<ComponentsT...>::type;
-      using children_view_types = typename extract_children_views<ComponentsT...>::type;
+    if constexpr (has_markers) {
+      using regular_components = typename filter_markers<ComponentsT...>::type;
 
-      return create_each_sequential_sync_impl_with_children<FuncT, Policy, IsOnce>(std::move(cfg),
-                                                                                   regular_components{},
-                                                                                   children_view_types{},
-                                                                                   entt::exclude_t<ExcludeT...>{});
+      return create_each_sequential_sync_impl_with_markers<FuncT, Policy, IsOnce, ComponentsT...>(std::move(cfg),
+                                                                                                  regular_components{},
+                                                                                                  entt::exclude_t<ExcludeT...>{});
     } else {
       return [cfg = std::move(cfg)](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
         auto view = ecs.template view<ComponentsT...>(entt::exclude_t<running<FuncT>, delete_later, running<FuncT, run_once_tag>, ExcludeT...>{});
@@ -340,18 +372,15 @@ private:
 
   template <typename FuncT, run_policy Policy, bool IsOnce, typename... ComponentsT, typename... ExcludeT>
   static auto create_each_detached(each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>&& cfg) {
-    // Check if we have any children_view types at compile time
-    constexpr bool has_children_views = (is_children_view_v<ComponentsT> || ...);
+    // Any marker (children_view or optional_tag) triggers the unified path.
+    constexpr bool has_markers = (is_marker_v<ComponentsT> || ...);
 
-    if constexpr (has_children_views) {
-      // Filter out children_view types for the actual view
-      using regular_components  = typename filter_children_views<ComponentsT...>::type;
-      using children_view_types = typename extract_children_views<ComponentsT...>::type;
+    if constexpr (has_markers) {
+      using regular_components = typename filter_markers<ComponentsT...>::type;
 
-      return create_each_detached_impl_with_children<FuncT, Policy, IsOnce>(std::move(cfg),
-                                                                            static_cast<regular_components*>(nullptr),
-                                                                            static_cast<children_view_types*>(nullptr),
-                                                                            entt::exclude_t<ExcludeT...>{});
+      return create_each_detached_impl_with_markers<FuncT, Policy, IsOnce, ComponentsT...>(std::move(cfg),
+                                                                                           static_cast<regular_components*>(nullptr),
+                                                                                           entt::exclude_t<ExcludeT...>{});
     } else {
       return [cfg = std::move(cfg)](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
         auto view = ecs.template view<ComponentsT...>(entt::exclude_t<running<FuncT>, delete_later, running<FuncT, run_once_tag>, ExcludeT...>{});
@@ -365,13 +394,25 @@ private:
     }
   }
 
-  // Helper for creating detached system with children_view types
-  template <typename FuncT, run_policy Policy, bool IsOnce, typename... RegularComponents, typename... ChildViewTypes, typename... ExcludeT>
-  static auto create_each_detached_impl_with_children(
-      each_config<FuncT, Policy, entt::get_t<RegularComponents..., ChildViewTypes...>, entt::exclude_t<ExcludeT...>>&& cfg,
-      std::tuple<RegularComponents...>*,
-      std::tuple<ChildViewTypes...>*,
-      entt::exclude_t<ExcludeT...>) {
+  // ==========================================================================
+  // Unified _impl_with_markers helpers
+  //
+  // "Markers" are template parameters in ComponentsT... that are NOT required
+  // components for the view query: currently children_view<...> and
+  // optional_tag<...>. RegularComponents is the subset of ComponentsT used to
+  // build the view. At invocation time, we rebuild the handler argument list
+  // in the user's declared order (ComponentsT...) — each position is either
+  // a reference to a regular component, a nullable pointer from try_get, or a
+  // children_range built on-the-fly.
+  //
+  // Handler signature: (ecs, self, dt, entity, handler_arg_t<ComponentsT>...)
+  // ==========================================================================
+
+  // Detached variant: spawn one coroutine per entity on the concurrent executor.
+  template <typename FuncT, run_policy Policy, bool IsOnce, typename... ComponentsT, typename... RegularComponents, typename... ExcludeT>
+  static auto create_each_detached_impl_with_markers(each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>&& cfg,
+                                                     std::tuple<RegularComponents...>*,
+                                                     entt::exclude_t<ExcludeT...>) {
 
     return [cfg = std::move(cfg)](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
       auto view = ecs.template view<RegularComponents...>(entt::exclude_t<running<FuncT>, delete_later, running<FuncT, run_once_tag>, ExcludeT...>{});
@@ -382,23 +423,17 @@ private:
 
       co_await asio::this_coro::executor;
 
-      for (auto entry : view.each()) {
-        auto entity = std::get<0>(entry);
-
+      for (auto entity : view) {
         if (!ecs.valid(entity) || ecs.template any_of<running<FuncT, each_tag>>(entity)) {
           continue;
         }
 
-        // Build the children_range objects for each children_view type
-        auto children_ranges = std::make_tuple(create_children_range<ChildViewTypes>(ecs, entity)...);
+        // Build the args tuple in declared order. children_range elements
+        // (if any) are held by value in this tuple.
+        auto args = build_args_tuple<ComponentsT...>(ecs, entity);
 
-        // Skip if any children_range is empty
-        bool should_skip = std::apply(
-            [](auto&... ranges) {
-              return any_children_range_empty(ranges...);
-            },
-            children_ranges);
-        if (should_skip) {
+        // Skip if any children_range argument is empty (preserves prior semantics).
+        if (has_empty_children_range_in_args<ComponentsT...>(args)) {
           continue;
         }
 
@@ -409,17 +444,11 @@ private:
 
         asio::co_spawn(
             cfg.concurrent_io_ctx,
-            [&ecs, entity, &self, dt, handler = cfg.handler, entry, children_ranges = std::move(children_ranges)]() mutable -> asio::awaitable<void> {
+            [&ecs, entity, &self, dt, handler = cfg.handler, args = std::move(args)]() mutable -> asio::awaitable<void> {
               co_await asio::this_coro::executor;
 
               try {
-                // Combine entry tuple with children_ranges tuple and call handler
-                // We need to unpack children_ranges into references
-                auto invoke_with_children = [&](auto&... child_ranges) -> asio::awaitable<void> {
-                  auto full_args = std::tuple_cat(std::tie(ecs, self, dt), entry, std::tie(child_ranges...));
-                  co_return co_await std::apply(handler, std::move(full_args));
-                };
-                co_await std::apply(invoke_with_children, children_ranges);
+                co_await invoke_handler_async(handler, ecs, self, dt, entity, args);
               } catch (...) {
                 // Ensure running tag is always removed even if handler throws
               }
@@ -433,13 +462,12 @@ private:
     };
   }
 
-  // Helper for creating parallel async system with children_view types
-  template <typename FuncT, run_policy Policy, bool IsOnce, typename... RegularComponents, typename... ChildViewTypes, typename... ExcludeT>
-  static auto create_each_parallel_async_impl_with_children(
-      each_config<FuncT, Policy, entt::get_t<RegularComponents..., ChildViewTypes...>, entt::exclude_t<ExcludeT...>>&& cfg,
-      std::tuple<RegularComponents...>,
-      std::tuple<ChildViewTypes...>,
-      entt::exclude_t<ExcludeT...>) {
+  // Parallel async variant: spawn all handler coroutines on the concurrent
+  // executor and wait for all to complete.
+  template <typename FuncT, run_policy Policy, bool IsOnce, typename... ComponentsT, typename... RegularComponents, typename... ExcludeT>
+  static auto create_each_parallel_async_impl_with_markers(each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>&& cfg,
+                                                           std::tuple<RegularComponents...>,
+                                                           entt::exclude_t<ExcludeT...>) {
 
     return [cfg = std::move(cfg)](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
       auto view = ecs.template view<RegularComponents...>(entt::exclude_t<running<FuncT>, delete_later, running<FuncT, run_once_tag>, ExcludeT...>{});
@@ -448,34 +476,19 @@ private:
         co_return false;
       }
 
-      // Collect all operations with children_ranges
+      // Collect all operations with their args.
       std::vector<std::function<asio::awaitable<void>()>> ops;
 
-      for (auto entry : view.each()) {
-        auto entity = std::get<0>(entry);
+      for (auto entity : view) {
+        auto args = build_args_tuple<ComponentsT...>(ecs, entity);
 
-        // Build the children_range objects for each children_view type
-        auto children_ranges = std::make_tuple(create_children_range<ChildViewTypes>(ecs, entity)...);
-
-        // Skip if any children_range is empty
-        bool should_skip = std::apply(
-            [](auto&... ranges) {
-              return any_children_range_empty(ranges...);
-            },
-            children_ranges);
-        if (should_skip) {
+        if (has_empty_children_range_in_args<ComponentsT...>(args)) {
           continue;
         }
 
-        ops.push_back(
-            [&ecs, &self, dt, handler = cfg.handler, entry, children_ranges = std::move(children_ranges)]() mutable -> asio::awaitable<void> {
-              // We need to unpack children_ranges into references
-              auto invoke_with_children = [&](auto&... child_ranges) -> asio::awaitable<void> {
-                auto full_args = std::tuple_cat(std::tie(ecs, self, dt), entry, std::tie(child_ranges...));
-                co_return co_await std::apply(handler, std::move(full_args));
-              };
-              co_await std::apply(invoke_with_children, children_ranges);
-            });
+        ops.push_back([&ecs, &self, dt, handler = cfg.handler, entity, args = std::move(args)]() mutable -> asio::awaitable<void> {
+          co_await invoke_handler_async(handler, ecs, self, dt, entity, args);
+        });
 
         if constexpr (IsOnce) {
           ecs.template emplace<running<FuncT, run_once_tag>>(entity);
@@ -495,13 +508,11 @@ private:
     };
   }
 
-  // Helper for creating sequential async system with children_view types
-  template <typename FuncT, run_policy Policy, bool IsOnce, typename... RegularComponents, typename... ChildViewTypes, typename... ExcludeT>
-  static auto create_each_sequential_async_impl_with_children(
-      each_config<FuncT, Policy, entt::get_t<RegularComponents..., ChildViewTypes...>, entt::exclude_t<ExcludeT...>>&& cfg,
-      std::tuple<RegularComponents...>,
-      std::tuple<ChildViewTypes...>,
-      entt::exclude_t<ExcludeT...>) {
+  // Sequential async variant: await each handler in turn on the main executor.
+  template <typename FuncT, run_policy Policy, bool IsOnce, typename... ComponentsT, typename... RegularComponents, typename... ExcludeT>
+  static auto create_each_sequential_async_impl_with_markers(each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>&& cfg,
+                                                             std::tuple<RegularComponents...>,
+                                                             entt::exclude_t<ExcludeT...>) {
 
     return [cfg = std::move(cfg)](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
       auto view = ecs.template view<RegularComponents...>(entt::exclude_t<running<FuncT>, delete_later, running<FuncT, run_once_tag>, ExcludeT...>{});
@@ -510,28 +521,14 @@ private:
         co_return false;
       }
 
-      for (auto entry : view.each()) {
-        auto entity = std::get<0>(entry);
+      for (auto entity : view) {
+        auto args = build_args_tuple<ComponentsT...>(ecs, entity);
 
-        // Build the children_range objects for each children_view type
-        auto children_ranges = std::make_tuple(create_children_range<ChildViewTypes>(ecs, entity)...);
-
-        // Skip if any children_range is empty
-        bool should_skip = std::apply(
-            [](auto&... ranges) {
-              return any_children_range_empty(ranges...);
-            },
-            children_ranges);
-        if (should_skip) {
+        if (has_empty_children_range_in_args<ComponentsT...>(args)) {
           continue;
         }
 
-        // We need to unpack children_ranges into references
-        auto invoke_with_children = [&](auto&... child_ranges) -> asio::awaitable<void> {
-          auto full_args = std::tuple_cat(std::tie(ecs, self, dt), entry, std::tie(child_ranges...));
-          co_return co_await std::apply(cfg.handler, std::move(full_args));
-        };
-        co_await std::apply(invoke_with_children, children_ranges);
+        co_await invoke_handler_async(cfg.handler, ecs, self, dt, entity, args);
 
         if constexpr (IsOnce) {
           ecs.template emplace<running<FuncT, run_once_tag>>(entity);
@@ -541,13 +538,11 @@ private:
     };
   }
 
-  // Helper for creating sequential sync system with children_view types
-  template <typename FuncT, run_policy Policy, bool IsOnce, typename... RegularComponents, typename... ChildViewTypes, typename... ExcludeT>
-  static auto create_each_sequential_sync_impl_with_children(
-      each_config<FuncT, Policy, entt::get_t<RegularComponents..., ChildViewTypes...>, entt::exclude_t<ExcludeT...>>&& cfg,
-      std::tuple<RegularComponents...>,
-      std::tuple<ChildViewTypes...>,
-      entt::exclude_t<ExcludeT...>) {
+  // Sequential sync variant: call handler directly.
+  template <typename FuncT, run_policy Policy, bool IsOnce, typename... ComponentsT, typename... RegularComponents, typename... ExcludeT>
+  static auto create_each_sequential_sync_impl_with_markers(each_config<FuncT, Policy, entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>&& cfg,
+                                                            std::tuple<RegularComponents...>,
+                                                            entt::exclude_t<ExcludeT...>) {
 
     return [cfg = std::move(cfg)](system& self, ecs_type& ecs, double dt) mutable -> asio::awaitable<bool> {
       auto view = ecs.template view<RegularComponents...>(entt::exclude_t<running<FuncT>, delete_later, running<FuncT, run_once_tag>, ExcludeT...>{});
@@ -556,32 +551,14 @@ private:
         co_return false;
       }
 
-      for (auto entry : view.each()) {
-        auto entity = std::get<0>(entry);
+      for (auto entity : view) {
+        auto args = build_args_tuple<ComponentsT...>(ecs, entity);
 
-        // Build the children_range objects for each children_view type
-        auto children_ranges = std::make_tuple(create_children_range<ChildViewTypes>(ecs, entity)...);
-
-        // Skip if any children_range is empty
-        bool should_skip = std::apply(
-            [](auto&... ranges) {
-              return any_children_range_empty(ranges...);
-            },
-            children_ranges);
-        if (should_skip) {
+        if (has_empty_children_range_in_args<ComponentsT...>(args)) {
           continue;
         }
 
-        // We need to unpack children_ranges into references
-        auto invoke_with_children = [&](auto&... child_ranges) {
-          auto full_args = std::tuple_cat(std::tie(ecs, self, dt), entry, std::tie(child_ranges...));
-          std::apply(
-              [&](auto&&... args) {
-                cfg.handler(std::forward<decltype(args)>(args)...);
-              },
-              full_args);
-        };
-        std::apply(invoke_with_children, children_ranges);
+        invoke_handler_sync(cfg.handler, ecs, self, dt, entity, args);
 
         if constexpr (IsOnce) {
           ecs.template emplace<running<FuncT, run_once_tag>>(entity);
@@ -612,6 +589,94 @@ private:
   template <typename... ChildRanges>
   static bool any_children_range_empty(ChildRanges&... ranges) {
     return ((!(ranges.each().begin() != ranges.each().end())) || ...);
+  }
+
+  // Compute the handler-argument type for each declared template parameter:
+  //   regular component T      -> T&
+  //   optional_tag<T>          -> T*   (nullable, via ecs.try_get<T>)
+  //   children_view<Type,...>  -> children_range<ecs_type, Type, Others...> (by value)
+  template <typename T>
+  struct handler_arg {
+    using type = T&;
+  };
+
+  template <typename T>
+  struct handler_arg<optional_tag<T>> {
+    using type = T*;
+  };
+
+  template <typename Type, typename... Others>
+  struct handler_arg<children_view<Type, Others...>> {
+    using type = children_range<ecs_type, Type, Others...>;
+  };
+
+  template <typename T>
+  using handler_arg_t = typename handler_arg<T>::type;
+
+  // Produce the handler argument for a single declared template parameter.
+  template <typename T>
+  static decltype(auto) make_handler_arg(ecs_type& ecs, entt_ext::entity entity) {
+    if constexpr (is_optional_tag_v<T>) {
+      using inner = typename unwrap_optional_tag<T>::type;
+      return ecs.template try_get<inner>(entity); // inner*
+    } else if constexpr (is_children_view_v<T>) {
+      return create_children_range<T>(ecs, entity); // children_range by value
+    } else {
+      return ecs.template get<T>(entity); // T&
+    }
+  }
+
+  // Build a tuple<handler_arg_t<ComponentsT>...> in the user's declared order.
+  template <typename... ComponentsT>
+  static auto build_args_tuple(ecs_type& ecs, entt_ext::entity entity) {
+    return std::tuple<handler_arg_t<ComponentsT>...>{make_handler_arg<ComponentsT>(ecs, entity)...};
+  }
+
+  // Check a single tuple element: if its declared type is children_view<...>,
+  // return true when its range is empty; otherwise return false. Using
+  // `if constexpr` ensures `.each()` is only instantiated for children_range
+  // elements — regular component refs and optional pointers are skipped.
+  template <typename T, std::size_t I, typename Tuple>
+  static bool check_empty_children_at(Tuple& args) {
+    if constexpr (is_children_view_v<T>) {
+      return !(std::get<I>(args).each().begin() != std::get<I>(args).each().end());
+    } else {
+      (void)args;
+      return false;
+    }
+  }
+
+  // Scan the args tuple and return true if any element that came from a
+  // children_view<...> declaration is empty. Preserves the "skip if any
+  // children_range is empty" semantics of the previous _impl_with_children path.
+  template <typename... ComponentsT, typename Tuple, std::size_t... Is>
+  static bool has_empty_children_range_in_args_impl(Tuple& args, std::index_sequence<Is...>) {
+    return (check_empty_children_at<ComponentsT, Is>(args) || ...);
+  }
+
+  template <typename... ComponentsT, typename Tuple>
+  static bool has_empty_children_range_in_args(Tuple& args) {
+    return has_empty_children_range_in_args_impl<ComponentsT...>(args, std::index_sequence_for<ComponentsT...>{});
+  }
+
+  // Invoke the handler with (ecs, self, dt, entity, args...) where args is a
+  // tuple<handler_arg_t<ComponentsT>...> built in declared order.
+  template <typename FuncT, typename Tuple>
+  static void invoke_handler_sync(FuncT& handler, ecs_type& ecs, system& self, double dt, entt_ext::entity entity, Tuple& args) {
+    std::apply(
+        [&](auto&&... a) {
+          handler(ecs, self, dt, entity, std::forward<decltype(a)>(a)...);
+        },
+        args);
+  }
+
+  template <typename FuncT, typename Tuple>
+  static asio::awaitable<void> invoke_handler_async(FuncT& handler, ecs_type& ecs, system& self, double dt, entt_ext::entity entity, Tuple& args) {
+    co_await std::apply(
+        [&](auto&&... a) -> asio::awaitable<void> {
+          co_return co_await handler(ecs, self, dt, entity, std::forward<decltype(a)>(a)...);
+        },
+        args);
   }
 
 public:
