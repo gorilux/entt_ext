@@ -115,7 +115,10 @@ void map_entities(children<Type>& child_set, LoaderT const& loader) {
   }
 
   if (child_set.size() != mapped_set.size()) {
-    spdlog::warn("[remap] children<{}> size changed: {} -> {} (some children lost)", entt::type_id<Type>().name(), child_set.size(), mapped_set.size());
+    spdlog::warn("[remap] children<{}> size changed: {} -> {} (some children lost)",
+                 entt::type_id<Type>().name(),
+                 child_set.size(),
+                 mapped_set.size());
   }
 
   // Swap with the original
@@ -1216,15 +1219,19 @@ asio::awaitable<bool> ecs::merge_snapshot(ArchiveT& ar) {
             // Diagnostic: log entity counts for each component type after merge
             auto log_component = [this]<typename T>() {
               using ActualT = sync::unwrap_hierarchy_t<T>;
-              auto count = registry_.template view<ActualT>().size();
+              auto count    = registry_.template view<ActualT>().size();
               if (count > 0) {
                 spdlog::info("[merge] {} entities with {}", count, entt::type_id<ActualT>().name());
               }
               if constexpr (sync::is_with_hierarchy_v<T>) {
-                auto parent_count = registry_.template view<entt_ext::parent<ActualT>>().size();
+                auto parent_count   = registry_.template view<entt_ext::parent<ActualT>>().size();
                 auto children_count = registry_.template view<entt_ext::children<ActualT>>().size();
                 if (parent_count > 0 || children_count > 0) {
-                  spdlog::info("[merge]   parent<{}>: {}, children<{}>: {}", entt::type_id<ActualT>().name(), parent_count, entt::type_id<ActualT>().name(), children_count);
+                  spdlog::info("[merge]   parent<{}>: {}, children<{}>: {}",
+                               entt::type_id<ActualT>().name(),
+                               parent_count,
+                               entt::type_id<ActualT>().name(),
+                               children_count);
                 }
               }
             };

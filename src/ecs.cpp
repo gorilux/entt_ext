@@ -253,19 +253,19 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
     if (!running_) {
       // spdlog::info("Stopping update loop");
       co_await wait_for_systems_to_finish();
+
+      save_state();
+      clear();
+
       asio::post(main_io_context(), [this]() {
-        // spdlog::info("Stopping concurrent io context");
         concurrent_io_context().stop();
       });
       asio::post(main_io_context(), [this]() {
-        // Close the command channel to unblock process_command_channel() coroutine
         command_channel_.close();
       });
       asio::post(main_io_context(), [this]() {
-        // spdlog::info("Main io context stopped");
         main_io_context().stop();
       });
-      // spdlog::info("All systems finished");
       co_return;
     }
 
