@@ -555,18 +555,26 @@ public:
     }
   }
 
+  // Invariant: the child must have its identity components before the parent's
+  // children<> set is patched. The children<> patch fires an on_update signal that
+  // immediately notifies sync clients; if the child has no components yet, clients
+  // create placeholder entities that pollute continuous_loader_'s remloc_ map and
+  // corrupt subsequent snapshot reloads (nuclear wipe in get<T>() strips components
+  // from ALL mapped entities).
   template <typename ParentType, typename ChildType, typename... ArgsT>
   decltype(auto) emplace_child(entt_ext::entity prnt, entt_ext::entity chld, ArgsT&&... args) {
-    register_child_relationship<ParentType, ChildType>(prnt, chld);
     emplace<parent<ParentType>>(chld, prnt);
-    return emplace<ChildType>(chld, std::forward<ArgsT>(args)...);
+    decltype(auto) result = emplace<ChildType>(chld, std::forward<ArgsT>(args)...);
+    register_child_relationship<ParentType, ChildType>(prnt, chld);
+    return result;
   }
 
   template <typename ParentType, typename ChildType, typename... ArgsT>
   decltype(auto) emplace_or_replace_child(entt_ext::entity prnt, entt_ext::entity chld, ArgsT&&... args) {
-    register_child_relationship<ParentType, ChildType>(prnt, chld);
     emplace_or_replace<parent<ParentType>>(chld, prnt);
-    return emplace_or_replace<ChildType>(chld, std::forward<ArgsT>(args)...);
+    decltype(auto) result = emplace_or_replace<ChildType>(chld, std::forward<ArgsT>(args)...);
+    register_child_relationship<ParentType, ChildType>(prnt, chld);
+    return result;
   }
 
   template <typename ParentType, typename ChildType, typename... ArgsT>
