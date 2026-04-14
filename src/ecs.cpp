@@ -1,4 +1,4 @@
-#include "entt_ext/ecs.hpp"
+#include "entt_ext/ecs_persistence.hpp"
 
 #include <boost/asio/deadline_timer.hpp>
 
@@ -255,7 +255,6 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
       co_await wait_for_systems_to_finish();
 
       save_state();
-      clear();
 
       asio::post(main_io_context(), [this]() {
         concurrent_io_context().stop();
@@ -266,6 +265,7 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
       asio::post(main_io_context(), [this]() {
         main_io_context().stop();
       });
+
       co_return;
     }
 

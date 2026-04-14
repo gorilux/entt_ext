@@ -12,10 +12,7 @@
 #include "return_type.hpp"
 #include "type_name.hpp"
 
-#include <cereal/archives/portable_binary.hpp>
-#include <cereal/cereal.hpp>
 #include <entt/entity/registry.hpp>
-#include <entt/entity/snapshot.hpp>
 #include <entt/entity/storage.hpp>
 #include <entt/graph/adjacency_matrix.hpp>
 
@@ -726,6 +723,28 @@ public:
   template <typename Type, typename... Func>
   auto patch_deferred(const entity_type entt, Func&&... func) -> asio::awaitable<void>;
 
+  // ============= Async Operations API (awaits completion on main thread) ============
+
+  auto destroy_async(const entity_type entt) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Args>
+  auto emplace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Args>
+  auto emplace_or_replace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Args>
+  auto emplace_if_not_exists_async(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Args>
+  auto replace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Other>
+  auto remove_async(const entity_type entt) -> asio::awaitable<void>;
+
+  template <typename Type, typename... Func>
+  auto patch_async(const entity_type entt, Func&&... func) -> asio::awaitable<void>;
+
   template <typename... ComponentsT, typename... ExcludeT>
   auto system(entt::exclude_t<ExcludeT...>) -> system_builder<entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>;
 
@@ -1133,128 +1152,133 @@ inline auto ecs::destroy_deferred(const entity_type entt) -> asio::awaitable<voi
   co_return;
 }
 
-// Snapshot functionality
+// ============= Async Operations Template Implementations =============
+// Unlike _deferred (fire-and-forget via command channel), _async posts directly
+// to main_io_context and resumes the caller only after execution completes.
 
-template <typename ArchiveT, typename... ComponentsT>
-asio::awaitable<void> ecs::load_snapshot(ArchiveT& ar) {
-
-  co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-      [&ar, this](auto&& self) {
-        asio::post(main_io_context(), [self = std::move(self), &ar, this]() mutable {
-          {
-            emplace<loading_tag>(global_entity_);
-            entt::snapshot_loader{registry_}.get<entt_ext::entity>(ar);
-
-            // Load components - unwrap with_hierarchy<T> to get actual type T,
-            // and also load parent<T>/children<T> if wrapped
-            auto load_component = [&]<typename T>() {
-              using ActualT = sync::unwrap_hierarchy_t<T>;
-              entt::snapshot_loader{registry_}.template get<ActualT>(ar);
-              if constexpr (sync::is_with_hierarchy_v<T>) {
-                entt::snapshot_loader{registry_}.template get<entt_ext::parent<ActualT>>(ar);
-                entt::snapshot_loader{registry_}.template get<entt_ext::children<ActualT>>(ar);
-              }
-            };
-            (load_component.template operator()<ComponentsT>(), ...);
-
-            remove<loading_tag>(global_entity_);
-          }
-          self.complete();
-        });
-      },
-      asio::use_awaitable);
-
-  co_return;
-}
-
-template <typename ArchiveT, typename... ComponentsT>
-asio::awaitable<void> ecs::save_snapshot(ArchiveT& ar) const {
-  co_return co_await asio::async_compose<decltype(asio::use_awaitable), void()>(
-      [&ar, this](auto&& self) {
-        asio::post(const_cast<asio::io_context&>(main_io_context()), [self = std::move(self), &ar, this]() mutable {
-          {
-            entt::snapshot{registry_}.get<entt_ext::entity>(ar);
-
-            // Save components - unwrap with_hierarchy<T> to get actual type T,
-            // and also save parent<T>/children<T> if wrapped
-            auto save_component = [&]<typename T>() {
-              using ActualT = sync::unwrap_hierarchy_t<T>;
-              entt::snapshot{registry_}.template get<ActualT>(ar);
-              if constexpr (sync::is_with_hierarchy_v<T>) {
-                entt::snapshot{registry_}.template get<entt_ext::parent<ActualT>>(ar);
-                entt::snapshot{registry_}.template get<entt_ext::children<ActualT>>(ar);
-              }
-            };
-            (save_component.template operator()<ComponentsT>(), ...);
-          }
-          self.complete();
+inline auto ecs::destroy_async(const entity_type entt) -> asio::awaitable<void> {
+  co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
+      [this, entt](auto handler) mutable {
+        asio::post(main_io_context(), [this, entt, handler = std::move(handler)]() mutable {
+          if (valid(entt))
+            destroy(entt);
+          std::move(handler)();
         });
       },
       asio::use_awaitable);
 }
 
-template <typename ArchiveT, typename... ComponentsT>
-asio::awaitable<bool> ecs::merge_snapshot(ArchiveT& ar) {
-  co_return co_await asio::async_compose<decltype(asio::use_awaitable), void(bool)>(
-      [&ar, this](auto&& self) {
-        asio::post(main_io_context(), [self = std::move(self), &ar, this]() mutable {
-          {
-            emplace<loading_tag>(global_entity_);
+template <typename Type, typename... Args>
+inline auto ecs::emplace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+  auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
 
-            // Load entities
-            continuous_loader_.get<entt_ext::entity>(ar);
-
-            // Load components - unwrap with_hierarchy<T> to get actual type T,
-            // and also load parent<T>/children<T> if wrapped
-            auto load_component = [&]<typename T>() {
-              using ActualT = sync::unwrap_hierarchy_t<T>;
-              continuous_loader_.template get<ActualT>(ar);
-              if constexpr (sync::is_with_hierarchy_v<T>) {
-                continuous_loader_.template get<entt_ext::parent<ActualT>>(ar);
-                continuous_loader_.template get<entt_ext::children<ActualT>>(ar);
-              }
-            };
-            (load_component.template operator()<ComponentsT>(), ...);
-
-            continuous_loader_.orphans();
-
-            // Remap entity references inside components after loading
-            auto remap_component = [this]<typename T>() {
-              using ActualT = sync::unwrap_hierarchy_t<T>;
-              remap_component_entities<ActualT>();
-              if constexpr (sync::is_with_hierarchy_v<T>) {
-                remap_component_entities<entt_ext::parent<ActualT>>();
-                remap_component_entities<entt_ext::children<ActualT>>();
-              }
-            };
-            (remap_component.template operator()<ComponentsT>(), ...);
-
-            // Diagnostic: log entity counts for each component type after merge
-            auto log_component = [this]<typename T>() {
-              using ActualT = sync::unwrap_hierarchy_t<T>;
-              auto count    = registry_.template view<ActualT>().size();
-              if (count > 0) {
-                spdlog::info("[merge] {} entities with {}", count, entt::type_id<ActualT>().name());
-              }
-              if constexpr (sync::is_with_hierarchy_v<T>) {
-                auto parent_count   = registry_.template view<entt_ext::parent<ActualT>>().size();
-                auto children_count = registry_.template view<entt_ext::children<ActualT>>().size();
-                if (parent_count > 0 || children_count > 0) {
-                  spdlog::info("[merge]   parent<{}>: {}, children<{}>: {}",
-                               entt::type_id<ActualT>().name(),
-                               parent_count,
-                               entt::type_id<ActualT>().name(),
-                               children_count);
-                }
-              }
-            };
-            (log_component.template operator()<ComponentsT>(), ...);
-
-            remove<loading_tag>(global_entity_);
+  co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
+      [this, entt, args_tuple = std::move(args_tuple)](auto handler) mutable {
+        asio::post(main_io_context(), [this, entt, args_tuple = std::move(args_tuple), handler = std::move(handler)]() mutable {
+          if (valid(entt)) {
+            std::apply(
+                [&](auto&&... args) {
+                  emplace<Type>(entt, std::forward<decltype(args)>(args)...);
+                },
+                std::move(args_tuple));
           }
-          self.complete(true);
+          std::move(handler)();
         });
       },
       asio::use_awaitable);
 }
+
+template <typename Type, typename... Args>
+inline auto ecs::emplace_or_replace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+  auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
+
+  co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
+      [this, entt, args_tuple = std::move(args_tuple)](auto handler) mutable {
+        asio::post(main_io_context(), [this, entt, args_tuple = std::move(args_tuple), handler = std::move(handler)]() mutable {
+          if (valid(entt)) {
+            std::apply(
+                [&](auto&&... args) {
+                  emplace_or_replace<Type>(entt, std::forward<decltype(args)>(args)...);
+                },
+                std::move(args_tuple));
+          }
+          std::move(handler)();
+        });
+      },
+      asio::use_awaitable);
+}
+
+template <typename Type, typename... Args>
+inline auto ecs::emplace_if_not_exists_async(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+  auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
+
+  co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
+      [this, entt, args_tuple = std::move(args_tuple)](auto handler) mutable {
+        asio::post(main_io_context(), [this, entt, args_tuple = std::move(args_tuple), handler = std::move(handler)]() mutable {
+          if (valid(entt)) {
+            std::apply(
+                [&](auto&&... args) {
+                  emplace_if_not_exists<Type>(entt, std::forward<decltype(args)>(args)...);
+                },
+                std::move(args_tuple));
+          }
+          std::move(handler)();
+        });
+      },
+      asio::use_awaitable);
+}
+
+template <typename Type, typename... Args>
+inline auto ecs::replace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+  auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
+
+  co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
+      [this, entt, args_tuple = std::move(args_tuple)](auto handler) mutable {
+        asio::post(main_io_context(), [this, entt, args_tuple = std::move(args_tuple), handler = std::move(handler)]() mutable {
+          if (valid(entt) && all_of<Type>(entt)) {
+            std::apply(
+                [&](auto&&... args) {
+                  replace<Type>(entt, std::forward<decltype(args)>(args)...);
+                },
+                std::move(args_tuple));
+          }
+          std::move(handler)();
+        });
+      },
+      asio::use_awaitable);
+}
+
+template <typename Type, typename... Other>
+inline auto ecs::remove_async(const entity_type entt) -> asio::awaitable<void> {
+  co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
+      [this, entt](auto handler) mutable {
+        asio::post(main_io_context(), [this, entt, handler = std::move(handler)]() mutable {
+          if (valid(entt) && all_of<Type>(entt))
+            remove<Type, Other...>(entt);
+          std::move(handler)();
+        });
+      },
+      asio::use_awaitable);
+}
+
+template <typename Type, typename... Func>
+inline auto ecs::patch_async(const entity_type entt, Func&&... func) -> asio::awaitable<void> {
+  auto funcs_tuple = std::make_tuple(std::forward<Func>(func)...);
+
+  co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
+      [this, entt, funcs_tuple = std::move(funcs_tuple)](auto handler) mutable {
+        asio::post(main_io_context(), [this, entt, funcs_tuple = std::move(funcs_tuple), handler = std::move(handler)]() mutable {
+          if (valid(entt) && all_of<Type>(entt)) {
+            std::apply(
+                [&](auto&&... funcs) {
+                  patch<Type>(entt, std::forward<decltype(funcs)>(funcs)...);
+                },
+                std::move(funcs_tuple));
+          }
+          std::move(handler)();
+        });
+      },
+      asio::use_awaitable);
+}
+
 } // namespace entt_ext

@@ -10,6 +10,8 @@
 #include <grlx/rpc/server.hpp>
 #include <grlx/rpc/tcp_channel.hpp>
 
+#include <entt/entity/snapshot.hpp>
+
 #include <cereal/archives/portable_binary.hpp>
 #include <cereal/types/string.hpp>
 #include <cereal/types/unordered_map.hpp>
