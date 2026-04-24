@@ -49,18 +49,27 @@ struct client_sync_state {
   }
 };
 
-// Server-side synchronization manager
-template <typename... SyncComponentsT>
-class sync_server {
+// Server-side synchronization manager.
+//
+// Parameterized over the grlx-rpc channel type so callers can pick between
+// plain tcp_channel and ssl_channel (with mTLS) at the app level. The
+// `sync_server<Components...>` alias below preserves the historical
+// "always TCP" contract; new apps that need TLS instantiate
+// sync_server_with_channel directly with ssl_channel and forward an
+// ssl::context into the constructor.
+template <typename ChannelT, typename... SyncComponentsT>
+class sync_server_with_channel {
 
-  using channel_type = grlx::rpc::tcp_channel<grlx::rpc::binary_encoder>;
+  using channel_type = ChannelT;
   using rpc_server   = grlx::rpc::server<channel_type>;
   using tcp          = asio::ip::tcp;
 
 public:
-  explicit sync_server(entt_ext::ecs& ecs_instance)
+  template <typename... ChannelArgs>
+  explicit sync_server_with_channel(entt_ext::ecs& ecs_instance, ChannelArgs&&... channel_args)
     : ecs_(ecs_instance)
-    , protocol_version_(sync_component_list<SyncComponentsT...>::generate_protocol_version()) {
+    , protocol_version_(sync_component_list<SyncComponentsT...>::generate_protocol_version())
+    , rpc_server_(std::forward<ChannelArgs>(channel_args)...) {
     // Set up RPC endpoints
     setup_rpc_endpoints(ecs_instance);
 
@@ -966,13 +975,24 @@ public:
   void set_auth_handler(auth_handler_type handler) { auth_handler_ = std::move(handler); }
 
 private:
+  // Declaration order matches the constructor initializer list; C++ initializes
+  // members in declaration order regardless of the list, so these must agree.
   ecs&                                               ecs_;
+  std::string                                        protocol_version_;                // Protocol version based on component types
   rpc_server                                         rpc_server_;
   std::unordered_map<std::string, client_sync_state> client_states_;                   // Per-client sync state
   bool                                               notifications_enabled_   = true;  // Enable real-time notifications by default
   bool                                               applying_client_changes_ = false; // Flag to prevent sync loops
-  std::string                                        protocol_version_;                // Protocol version based on component types
   auth_handler_type                                  auth_handler_;                    // Optional authentication handler
 };
+
+// Backward-compatible alias: historical `sync_server<Components...>` usage
+// keeps working and defaults to plain tcp_channel. Apps that want SSL /
+// mTLS instantiate sync_server_with_channel<ssl_channel<...>, Components...>
+// directly (typically via sync_list_traits::apply_with_channel).
+template <typename... SyncComponentsT>
+using sync_server = sync_server_with_channel<
+    grlx::rpc::tcp_channel<grlx::rpc::binary_encoder>,
+    SyncComponentsT...>;
 
 } // namespace entt_ext::sync

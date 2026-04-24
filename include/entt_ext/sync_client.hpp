@@ -31,19 +31,25 @@ namespace entt_ext::sync {
 
 namespace asio = boost::asio;
 
-// Client-side synchronization manager
-template <typename... SyncComponentsT>
-class sync_client {
-  using channel_type = grlx::rpc::tcp_channel<grlx::rpc::binary_encoder>;
+// Client-side synchronization manager.
+//
+// Mirrors sync_server: parameterized over the grlx-rpc channel type. The
+// historical `sync_client<Components...>` name is preserved below as a
+// default-tcp_channel alias so existing apps keep compiling.
+template <typename ChannelT, typename... SyncComponentsT>
+class sync_client_with_channel {
+  using channel_type = ChannelT;
   using rpc_client   = grlx::rpc::client<channel_type>;
   using tcp          = boost::asio::ip::tcp;
 
 public:
-  explicit sync_client(ecs& ecs_instance)
+  template <typename... ChannelArgs>
+  explicit sync_client_with_channel(ecs& ecs_instance, ChannelArgs&&... channel_args)
     : ecs_(ecs_instance)
     , protocol_version_(sync_component_list<SyncComponentsT...>::generate_protocol_version())
     //, protocol_version_("sync_v1_")
-    , continuous_loader_(ecs_.registry()) {
+    , continuous_loader_(ecs_.registry())
+    , rpc_client_(std::forward<ChannelArgs>(channel_args)...) {
 
     // Initialize sync state if not present
     if (!ecs_.template contains<sync_state>()) {
@@ -57,13 +63,12 @@ public:
   }
 
   // Connect to the sync server and perform handshake
-  asio::awaitable<bool>
-  connect(std::string const& host,
-          std::uint16_t      port,
-          std::string const& client_name    = "",
-          std::string const& client_version = "",
-          std::string const& username       = "",
-          std::string const& password       = "") {
+  asio::awaitable<bool> connect(std::string const& host,
+                                std::uint16_t      port,
+                                std::string const& client_name    = "",
+                                std::string const& client_version = "",
+                                std::string const& username       = "",
+                                std::string const& password       = "") {
     try {
       // First establish TCP connection
       auto          executor = co_await asio::this_coro::executor;
@@ -92,9 +97,15 @@ public:
   }
 
   // Auth info from last successful handshake
-  int                auth_role() const { return auth_role_; }
-  std::string const& auth_token() const { return auth_token_; }
-  std::string const& handshake_error() const { return handshake_error_; }
+  int auth_role() const {
+    return auth_role_;
+  }
+  std::string const& auth_token() const {
+    return auth_token_;
+  }
+  std::string const& handshake_error() const {
+    return handshake_error_;
+  }
 
   // Disconnect from the sync server
   asio::awaitable<void> disconnect(bool clear_mapping = false) {
@@ -234,6 +245,30 @@ private:
   void setup_notification_handlers() {
     // Register handlers for component-specific notifications
     (setup_component_notification_handlers<SyncComponentsT>(), ...);
+
+    // Handle entity destruction notifications from server
+    rpc_client_.register_notification_handler("entity_destroyed", [this](entity_destroy_request const& request) {
+      if (request.session_id != session_id_)
+        return;
+
+      ecs_.defer([this, request](entt_ext::ecs& ecs) {
+        entity server_entity = request.server_entity;
+        auto   client_entity = continuous_loader_.to_local(server_entity);
+
+        if (client_entity == entt_ext::null) {
+          spdlog::debug("Received entity destruction for unmapped server entity {}", static_cast<int>(server_entity));
+          return;
+        }
+
+        if (ecs.valid(client_entity)) {
+          spdlog::debug("Server requested entity destruction: server={} client={}", static_cast<int>(server_entity), static_cast<int>(client_entity));
+          // Remove mapping before destroying so the on_destroy observer
+          // won't send a redundant notification back to the server
+          continuous_loader_.remove_mapping_by_remote(server_entity);
+          ecs.destroy(client_entity);
+        }
+      });
+    });
   }
 
   // Set up notification handlers for a specific component type
@@ -312,7 +347,7 @@ private:
   // Set up automatic sync for a specific component type
   template <typename ComponentT>
   void setup_automatic_sync() {
-    using ActualT = unwrap_hierarchy_t<ComponentT>;
+    using ActualT            = unwrap_hierarchy_t<ComponentT>;
     constexpr bool read_only = is_server_only_v<ComponentT>;
 
     // Set up for the component itself
@@ -414,7 +449,7 @@ private:
             // Map entity references from remote to local IDs
             auto component_data = request.component_data;
             if constexpr (is_hierarchy_component<ComponentT>::value ||
-                         requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); }) {
+                          requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); }) {
               co_await map_entities_async(component_data);
             }
 
@@ -514,7 +549,7 @@ private:
     ComponentT component_to_send = component;
 
     if constexpr (is_hierarchy_component<ComponentT>::value ||
-                   requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities_to_remote(l); }) {
+                  requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities_to_remote(l); }) {
       co_await map_component_entities_to_remote_async(component_to_send);
     }
 
@@ -674,8 +709,8 @@ private:
 
   // Generic map_entities_async for components with a map_entities member (e.g. automation::targets)
   template <typename ComponentT>
-    requires requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); }
-             && (!sync::is_hierarchy_component_v<ComponentT>)
+    requires requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); } &&
+             (!sync::is_hierarchy_component_v<ComponentT>)
   auto map_entities_async(ComponentT& component) -> asio::awaitable<void> {
     // Create placeholder entities for unmapped server entities so map_entities succeeds
     if constexpr (requires(ComponentT const& c) { c.entity_refs(); }) {
@@ -683,8 +718,7 @@ private:
         if (remote_entity != entt_ext::null && continuous_loader_.map(remote_entity) == entt_ext::null) {
           auto local = ecs_.create();
           continuous_loader_.insert_mapping(remote_entity, local);
-          spdlog::warn("Created placeholder entity {} for unmapped server entity {}",
-                       static_cast<int>(local), static_cast<int>(remote_entity));
+          spdlog::warn("Created placeholder entity {} for unmapped server entity {}", static_cast<int>(local), static_cast<int>(remote_entity));
         }
       }
     }
@@ -723,8 +757,8 @@ private:
 
   // Generic remote mapping for components with map_entities_to_remote member (e.g. automation::targets)
   template <typename ComponentT>
-    requires requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities_to_remote(l); }
-             && (!sync::is_hierarchy_component_v<ComponentT>)
+    requires requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities_to_remote(l); } &&
+             (!sync::is_hierarchy_component_v<ComponentT>)
   auto map_component_entities_to_remote_async(ComponentT& component) -> asio::awaitable<void> {
     // Ensure all referenced local entities have server mappings before converting
     if constexpr (requires(ComponentT const& c) { c.entity_refs(); }) {
@@ -813,18 +847,28 @@ private:
 
 public:
   // Access the underlying RPC client (e.g. to register custom notification handlers)
-  rpc_client& get_rpc_client() { return rpc_client_; }
+  rpc_client& get_rpc_client() {
+    return rpc_client_;
+  }
 
 private:
+  // Declaration order matches the constructor initializer list; C++ initializes
+  // members in declaration order regardless of the list, so these must agree.
   ecs&                                           ecs_;
-  rpc_client                                     rpc_client_;
-  std::string                                    session_id_;        // Session ID obtained from handshake
-  std::string                                    protocol_version_;  // Protocol version based on component types
-  std::string                                    handshake_error_;   // Last handshake error message
-  int                                            auth_role_  = 0;   // Role from auth (0=user, 1=admin)
-  std::string                                    auth_token_;        // Auth token from handshake
-  bool                                           loading_snapshot_ = false;
+  std::string                                    protocol_version_; // Protocol version based on component types
   continuous_loader_with_mapping<entt::registry> continuous_loader_;
+  rpc_client                                     rpc_client_;
+  std::string                                    session_id_;       // Session ID obtained from handshake
+  std::string                                    handshake_error_;  // Last handshake error message
+  int                                            auth_role_ = 0;    // Role from auth (0=user, 1=admin)
+  std::string                                    auth_token_;       // Auth token from handshake
+  bool                                           loading_snapshot_ = false;
 };
+
+// Backward-compatible alias — preserves `sync_client<Components...>` for
+// existing callers that want plain TCP. For mTLS, use
+// sync_client_with_channel<ssl_channel<...>, Components...> directly.
+template <typename... SyncComponentsT>
+using sync_client = sync_client_with_channel<grlx::rpc::tcp_channel<grlx::rpc::binary_encoder>, SyncComponentsT...>;
 
 } // namespace entt_ext::sync

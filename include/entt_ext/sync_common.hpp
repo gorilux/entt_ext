@@ -104,6 +104,13 @@ struct sync_list_traits<sync_component_list<Components...>> {
 
   template <template <typename...> class Template>
   using apply = Template<Components...>;
+
+  // Instantiate a class template whose first parameter is a concrete type
+  // (e.g. the grlx-rpc channel type) and whose remaining parameters accept
+  // the component pack. Used by apps that pick a non-default channel for
+  // sync_server_with_channel / sync_client_with_channel.
+  template <template <typename, typename...> class Template, typename First>
+  using apply_with = Template<First, Components...>;
 };
 
 // Note: with_hierarchy<T>, is_with_hierarchy_v<T>, and unwrap_hierarchy_t<T>
