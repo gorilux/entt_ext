@@ -1,9 +1,10 @@
 #pragma once
 
-#include "ecs.hpp"
-#include "entity_mapping.hpp"
-#include "sync_common.hpp"
-#include "type_name.hpp"
+#include <entt_ext/ecs.hpp>
+#include <entt_ext/entity_mapping.hpp>
+#include <entt_ext/sync/owner.hpp>
+#include <entt_ext/sync_common.hpp>
+#include <entt_ext/type_name.hpp>
 
 #include <grlx/rpc/encoder.hpp>
 #include <grlx/rpc/message.hpp>
@@ -38,16 +39,31 @@ namespace asio = boost::asio;
 
 // Per-client sync state
 struct client_sync_state {
-  std::chrono::steady_clock::time_point last_sync;
+  std::chrono::steady_clock::time_point last_sync;       // Updated on every RPC access; basis for stale-client eviction
   std::chrono::steady_clock::time_point last_push;
-  std::unordered_set<entity>            dirty_entities; // Entities that changed since last sync to this client
+  std::unordered_set<entity>            dirty_entities;  // Entities that changed since last sync to this client
   std::string                           client_id;
+  bool                                  full_resync_needed = false; // Set when dirty_entities was capped, forcing the client to re-snapshot
+
+  // Multi-tenant identity (see docs/multi_tenant.md). Set during the
+  // handshake from the auth_handler's response. Empty user_id ("") =
+  // anonymous / single-tenant mode — every entity is visible.
+  std::string user_id;
+  int         role = 0; // 0 = user, 1 = admin (matches handshake_response::role)
 
   template <typename Archive>
   void serialize(Archive& archive) {
     archive(last_sync, last_push, dirty_entities, client_id);
   }
 };
+
+// Hard cap on dirty_entities per client. A wedged client whose sync calls
+// have stopped landing must not be allowed to consume unbounded memory as
+// the server keeps marking entities dirty for it. When the cap is hit we
+// clear the set and flip full_resync_needed; the next successful sync from
+// that client triggers a full snapshot rather than a delta — which is what
+// they would have needed anyway after that long a gap.
+inline constexpr std::size_t kDirtyEntitiesHardCap = 65536;
 
 // Server-side synchronization manager.
 //
@@ -185,8 +201,23 @@ public:
       // Generate unique session ID
       std::string session_id = generate_session_id();
 
-      // Create client state for this session
-      get_or_create_client_state(session_id);
+      // Phase A v2: tag the calling rpc::session with the session id so
+      // server::notify_session can later target it for per-tenant
+      // notification delivery. current_call_context() returns the
+      // active dispatch ctx for the synchronous prefix of this
+      // coroutine; we read it before any co_await so the thread-local
+      // is still valid (see grlx/rpc/security.hpp).
+      if (auto const* ctx = grlx::rpc::current_call_context();
+          ctx != nullptr && ctx->set_logical_session_id) {
+        ctx->set_logical_session_id(session_id);
+      }
+
+      // Create client state for this session and stamp the multi-tenant
+      // identity from the auth result so the snapshot + notification
+      // filters can use it later (see docs/multi_tenant.md).
+      auto& client_state    = get_or_create_client_state(session_id);
+      client_state.user_id  = request.username;
+      client_state.role     = auth_role;
 
       spdlog::info("Client connected - Name: {}, User: {}, Version: {}, Session: {}",
                    request.client_name.empty() ? "unknown" : request.client_name,
@@ -229,9 +260,18 @@ public:
       grlx::rpc::ovectorstream            ostream;
       cereal::PortableBinaryOutputArchive archive(ostream);
 
-      // Serialize the temporary registry
-      entt::snapshot{ecs_.registry()}.get<entity>(archive);
-      (save_component_and_hierarchy<SyncComponentsT>(archive), ...);
+      // Multi-tenant filter (see docs/multi_tenant.md): build a
+      // temporary registry containing only entities visible to this
+      // session, with their actual server IDs preserved via
+      // create(hint), and snapshot that. The entity table on the wire
+      // is therefore naturally filtered — no count or id-range leak.
+      auto visible = collect_visible_entities(client_state.user_id, client_state.role);
+
+      entt::registry tmp_reg;
+      build_filtered_registry<SyncComponentsT...>(tmp_reg, visible);
+
+      entt::snapshot{tmp_reg}.get<entity>(archive);
+      (save_component_and_hierarchy_from<SyncComponentsT>(tmp_reg, archive), ...);
 
       ostream.swap_vector(snapshot_buffer);
 
@@ -349,10 +389,45 @@ public:
     return notifications_enabled_;
   }
 
-  // Clean up disconnected clients (call periodically)
-  void cleanup_disconnected_clients() {
-    // In a real implementation, you'd check which clients are still connected
-    // and remove their state. This is framework-dependent.
+  // Evict client states whose last_sync is older than client_idle_timeout_.
+  //
+  // The sync server hands out fresh session_ids on every handshake but has
+  // no way to know when a client disconnects: each session_id lives in
+  // client_states_ until removed explicitly. Without this sweep, every
+  // reconnect (TLS-handshake / TCP-blip / keepalive miss) leaves an
+  // orphaned entry whose dirty_entities set grows on every server-side
+  // change — that's the >80 GB leak we observed in production. The sweep
+  // is O(N_states) and called from session-close hooks plus periodically;
+  // both paths are cheap.
+  std::size_t cleanup_disconnected_clients() {
+    auto const now    = std::chrono::steady_clock::now();
+    std::size_t evicted = 0;
+    for (auto it = client_states_.begin(); it != client_states_.end();) {
+      if (now - it->second.last_sync > client_idle_timeout_) {
+        spdlog::info("ECS-sync: evicting stale client {} (idle for {}s, dirty_entities={})",
+                     it->first,
+                     std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_sync).count(),
+                     it->second.dirty_entities.size());
+        it = client_states_.erase(it);
+        ++evicted;
+      } else {
+        ++it;
+      }
+    }
+    return evicted;
+  }
+
+  // Time after which a client_sync_state with no sync activity is considered
+  // disconnected and may be evicted by cleanup_disconnected_clients(). Must
+  // exceed the rpc-layer idle_timeout (default 5 min) plus client sync
+  // cadence so legitimate clients aren't killed mid-flight; the default of
+  // 15 minutes is comfortably above both.
+  void set_client_idle_timeout(std::chrono::milliseconds timeout) {
+    client_idle_timeout_ = timeout;
+  }
+
+  std::chrono::milliseconds get_client_idle_timeout() const noexcept {
+    return client_idle_timeout_;
   }
 
   // Remove client and cleanup their entities
@@ -456,6 +531,34 @@ private:
       update_request_observer.on_construct(
           [this](entt_ext::ecs& ecs, entt_ext::entity e, component_update_request<ComponentT>& request) -> asio::awaitable<void> {
             try {
+              // Multi-tenant write authorization (see docs/multi_tenant.md).
+              // Look up the requesting session's identity. Reject if:
+              //   - the entity already has an `owner` and the requester
+              //     isn't that owner and isn't an admin.
+              // Stamp `owner` if the entity has no owner yet — this is
+              // either a fresh client-created entity or a pre-multi-tenant
+              // legacy entity. Either way, "first writer wins" assigns
+              // ownership.
+              auto const* requester = lookup_session_identity(request.session_id);
+
+              if (auto* existing = ecs.template try_get<owner>(e)) {
+                bool is_admin     = requester != nullptr && requester->role == 1;
+                bool is_owner     = requester != nullptr && existing->user_id == requester->user_id;
+                bool is_unowned   = existing->user_id.empty();
+                if (!is_admin && !is_owner && !is_unowned) {
+                  spdlog::warn("Multi-tenant: rejecting write to {} entity {} owned by '{}' from session {} (user '{}')",
+                               type_name<ComponentT>(), static_cast<int>(e),
+                               existing->user_id, request.session_id,
+                               requester != nullptr ? requester->user_id : std::string{"<unknown>"});
+                  co_await ecs.template remove_deferred<component_update_request<ComponentT>>(e);
+                  co_return;
+                }
+              } else if (requester != nullptr && !requester->user_id.empty()) {
+                // First write to this entity by an authenticated user —
+                // stamp ownership.
+                ecs.template emplace<owner>(e, owner{requester->user_id});
+              }
+
               // Apply the component update
               spdlog::debug("Applying component update request: {} server={} client={} version={}",
                             type_name<ComponentT>(),
@@ -463,6 +566,24 @@ private:
                             std::chrono::duration_cast<std::chrono::milliseconds>(request.sync_version.time_since_epoch()).count(),
                             request.session_id);
               ecs.template emplace_or_replace<ComponentT>(e, request.component_data);
+
+              // Phase A v2: hierarchy ownership inheritance. When a child
+              // is linked to a parent via parent<T>, copy the parent's
+              // owner onto the child if the child has no owner yet or
+              // its owner is empty. This makes sub-trees consistent so
+              // a snapshot for user A includes every descendant of an
+              // A-owned root.
+              if constexpr (is_parent_v<ComponentT>) {
+                auto parent_e = request.component_data.entity;
+                if (ecs.valid(parent_e)) {
+                  if (auto* parent_owner = ecs.template try_get<owner>(parent_e)) {
+                    auto* my_owner = ecs.template try_get<owner>(e);
+                    if (my_owner == nullptr || my_owner->user_id.empty()) {
+                      ecs.template emplace_or_replace<owner>(e, owner{parent_owner->user_id});
+                    }
+                  }
+                }
+              }
 
               // Notify all other clients about the component update
               co_await notify_component_update_to_other_clients<ComponentT>(e, request.sync_version, request.component_data, request.session_id);
@@ -498,24 +619,37 @@ private:
     } // !ReadOnly
   }
 
-  // Send component update notification to all clients (server-initiated changes)
+  // Send component update notification to all clients (server-initiated changes).
+  //
+  // rpc_server_.notify() already broadcasts to every active session, so we
+  // emit the request exactly once per server-side change. Iterating
+  // client_states_ here used to multiply each broadcast by the size of
+  // client_states_ (which leaks one entry per reconnect because
+  // handle_sync_request never cleans up), saturating each session's
+  // 256-slot write_channel within milliseconds and getting the new client
+  // killed by the channel-full path in rpc_server_.notify().
   template <typename ComponentT>
   asio::awaitable<void> notify_component_update_to_all_clients(entity server_entity, version_type sync_version, ComponentT const& component_data) {
     if (!notifications_enabled_) {
       co_return; // Skip notifications if disabled
     }
 
-    std::string component_name    = std::string(type_name<ComponentT>());
-    std::string notification_name = "component_updated_" + component_name;
+    std::string endpoint_name = "component_updated_" + std::string(type_name<ComponentT>());
 
-    // Notify all clients with server entity ID
-    for (auto& [client_id, client_state] : client_states_) {
-      try {
-        co_await notify_component_update_to_client(server_entity, sync_version, component_data, client_id);
-      } catch (...) {
-        // Log error or handle notification failure
-        // Continue with other clients
-      }
+    // session_id is meaningful only for "to other clients" routing; for a
+    // global broadcast we leave it empty so the receiver doesn't mistake
+    // the notification for an echo of its own change.
+    component_update_request<ComponentT> request{.session_id     = std::string{},
+                                                 .sync_version   = sync_version,
+                                                 .target_entity  = server_entity,
+                                                 .component_data = component_data};
+
+    try {
+      co_await rpc_server_.notify(endpoint_name, std::move(request));
+    } catch (std::exception const& ex) {
+      spdlog::error("notify_component_update_to_all_clients({}): {}", type_name<ComponentT>(), ex.what());
+    } catch (...) {
+      spdlog::error("notify_component_update_to_all_clients({}): unknown exception", type_name<ComponentT>());
     }
   }
 
@@ -562,25 +696,24 @@ private:
     co_return;
   }
 
-  // Send component removal notification to all clients (server-initiated changes)
+  // Send component removal notification to all clients (server-initiated changes).
+  // See notify_component_update_to_all_clients above for why we don't iterate
+  // client_states_ here.
   template <typename ComponentT>
   asio::awaitable<void> notify_component_removal_to_all_clients(entity server_entity, version_type sync_version) {
     if (!notifications_enabled_) {
       co_return; // Skip notifications if disabled
     }
 
-    std::string component_name    = std::string(type_name<ComponentT>());
-    std::string notification_name = "component_removed_" + component_name;
+    std::string notification_name = "component_removed_" + std::string(type_name<ComponentT>());
 
-    // Notify all clients with server entity ID
-    for (auto& [client_id, client_state] : client_states_) {
-      component_remove_request<ComponentT> request{.session_id = client_id, .sync_version = sync_version, .target_entity = server_entity};
-      try {
-        co_await rpc_server_.notify(notification_name, std::move(request));
-      } catch (...) {
-        // Log error or handle notification failure
-        // Continue with other clients
-      }
+    component_remove_request<ComponentT> request{.session_id = std::string{}, .sync_version = sync_version, .target_entity = server_entity};
+    try {
+      co_await rpc_server_.notify(notification_name, std::move(request));
+    } catch (std::exception const& ex) {
+      spdlog::error("notify_component_removal_to_all_clients({}): {}", type_name<ComponentT>(), ex.what());
+    } catch (...) {
+      spdlog::error("notify_component_removal_to_all_clients({}): unknown exception", type_name<ComponentT>());
     }
   }
 
@@ -597,27 +730,25 @@ private:
     std::string component_name    = std::string(type_name<ComponentT>());
     std::string notification_name = "component_updated_" + component_name;
 
-    // Notify each client (except the one that made the change) with server entity ID
+    // Phase A v2: per-tenant targeted delivery via notify_session.
+    // Filter sessions by entity ownership so the bytes never leave the
+    // server for the wrong tenant.
     for (auto& [client_id, client_state] : client_states_) {
       if (client_id == except_client_id)
         continue;
 
-      spdlog::debug("Notifying component update to other client: {} server={} client={} except={} version={}",
-                    type_name<ComponentT>(),
-                    static_cast<int>(server_entity),
-                    client_id,
-                    except_client_id,
-                    std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
-      // Send notification with server entity ID and component data
+      if (!is_entity_visible_to(server_entity, client_state.user_id, client_state.role)) {
+        continue;
+      }
+
       component_update_request<ComponentT> request{.session_id     = client_id,
                                                    .sync_version   = sync_version,
                                                    .target_entity  = server_entity,
                                                    .component_data = component_data};
 
       try {
-        co_await rpc_server_.notify(notification_name, std::move(request));
+        co_await rpc_server_.notify_session(client_id, notification_name, std::move(request));
       } catch (...) {
-        // Log error or handle notification failure
         // Continue with other clients
       }
     }
@@ -634,17 +765,19 @@ private:
     std::string component_name    = std::string(type_name<ComponentT>());
     std::string notification_name = "component_removed_" + component_name;
 
-    // Notify each client (except the one that made the change) with server entity ID
+    // Phase A v2: per-tenant targeted delivery (see notify_component_update_to_other_clients).
     for (auto& [client_id, client_state] : client_states_) {
       if (client_id == except_client_id)
         continue;
 
-      // Send notification with server entity ID
+      if (!is_entity_visible_to(server_entity, client_state.user_id, client_state.role)) {
+        continue;
+      }
+
       component_remove_request<ComponentT> request{.session_id = client_id, .sync_version = sync_version, .target_entity = server_entity};
       try {
-        co_await rpc_server_.notify(notification_name, std::move(request));
+        co_await rpc_server_.notify_session(client_id, notification_name, std::move(request));
       } catch (...) {
-        // Log error or handle notification failure
         // Continue with other clients
       }
     }
@@ -676,30 +809,25 @@ private:
     co_return;
   }
 
-  // Send entity destruction notification to all clients (server-initiated changes)
+  // Send entity destruction notification to all clients (server-initiated changes).
+  // See notify_component_update_to_all_clients above for why we don't iterate
+  // client_states_ here.
   asio::awaitable<void> notify_entity_destruction_to_all_clients(entity server_entity, version_type sync_version) {
     if (!notifications_enabled_) {
       co_return; // Skip notifications if disabled
     }
 
-    std::string notification_name = "entity_destroyed";
-
     spdlog::debug("Notifying entity destruction to all clients: server_entity={} version={}",
                   static_cast<int>(server_entity),
                   std::chrono::duration_cast<std::chrono::milliseconds>(sync_version.time_since_epoch()).count());
 
-    // Notify all clients with server entity ID
-    for (auto& [client_id, client_state] : client_states_) {
-      entity_destroy_request request{.session_id = client_id, .server_entity = server_entity, .sync_version = sync_version};
-      try {
-        co_await rpc_server_.notify(notification_name, std::move(request));
-      } catch (std::exception const& ex) {
-        spdlog::error("Error notifying entity destruction to client {}: {}", client_id, ex.what());
-        // Continue with other clients
-      } catch (...) {
-        spdlog::error("Error notifying entity destruction to client {}: unknown exception", client_id);
-        // Continue with other clients
-      }
+    entity_destroy_request request{.session_id = std::string{}, .server_entity = server_entity, .sync_version = sync_version};
+    try {
+      co_await rpc_server_.notify("entity_destroyed", std::move(request));
+    } catch (std::exception const& ex) {
+      spdlog::error("notify_entity_destruction_to_all_clients: {}", ex.what());
+    } catch (...) {
+      spdlog::error("notify_entity_destruction_to_all_clients: unknown exception");
     }
     co_return;
   }
@@ -789,6 +917,127 @@ private:
       entt::snapshot{ecs_.registry()}.template get<entt_ext::parent<ActualT>>(archive);
       entt::snapshot{ecs_.registry()}.template get<entt_ext::children<ActualT>>(archive);
     }
+  }
+
+  // Multi-tenant variant — kept for reference. Iterator-range
+  // snapshot::get filters components but leaves the entity table
+  // unfiltered (entt has no iterator overload for entity types). The
+  // current snapshot path uses build_filtered_registry +
+  // save_component_and_hierarchy_from instead, which filters both.
+  template <typename ComponentT>
+  void save_component_and_hierarchy_filtered(cereal::PortableBinaryOutputArchive& archive,
+                                             std::vector<entity> const&           visible) {
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
+
+    entt::snapshot{ecs_.registry()}.template get<ActualT>(archive, visible.begin(), visible.end());
+
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      entt::snapshot{ecs_.registry()}.template get<entt_ext::parent<ActualT>>(archive, visible.begin(), visible.end());
+      entt::snapshot{ecs_.registry()}.template get<entt_ext::children<ActualT>>(archive, visible.begin(), visible.end());
+    }
+  }
+
+  // Save component (and hierarchy parent<T>/children<T>) from the given
+  // registry. Used by the multi-tenant snapshot path so the entity
+  // table itself is filtered and no other-tenant ids leak onto the
+  // wire — the source registry here is a tmp built by
+  // build_filtered_registry.
+  template <typename ComponentT>
+  void save_component_and_hierarchy_from(entt::registry&                      reg,
+                                         cereal::PortableBinaryOutputArchive& archive) {
+    using ActualT = unwrap_hierarchy_t<ComponentT>;
+
+    entt::snapshot{reg}.template get<ActualT>(archive);
+
+    if constexpr (is_with_hierarchy_v<ComponentT>) {
+      entt::snapshot{reg}.template get<entt_ext::parent<ActualT>>(archive);
+      entt::snapshot{reg}.template get<entt_ext::children<ActualT>>(archive);
+    }
+  }
+
+  // Populate a temporary registry with the visible entities (preserving
+  // their actual server IDs via create(hint)) and copy each sync
+  // component plus its hierarchy components. Children<T> sets and
+  // parent<T> refs that point at not-visible entities are dropped to
+  // keep the snapshot self-consistent and prevent cross-tenant id
+  // leaks via hierarchy fields.
+  template <typename... ComponentsT>
+  void build_filtered_registry(entt::registry& tmp, std::vector<entity> const& visible) {
+    std::unordered_set<entity> visible_set(visible.begin(), visible.end());
+
+    for (auto e : visible) {
+      // entt::create(hint) honors the hint exactly when the slot is
+      // free, which it always is on a fresh registry. The returned
+      // entity matches the source server id.
+      [[maybe_unused]] auto created = tmp.create(e);
+    }
+
+    auto copy_one = [&]<typename T>() {
+      using ActualT = unwrap_hierarchy_t<T>;
+      for (auto e : visible) {
+        if (auto* c = ecs_.template try_get<ActualT>(e)) {
+          tmp.template emplace<ActualT>(e, *c);
+        }
+      }
+      if constexpr (is_with_hierarchy_v<T>) {
+        for (auto e : visible) {
+          if (auto* p = ecs_.template try_get<entt_ext::parent<ActualT>>(e)) {
+            if (visible_set.contains(p->entity)) {
+              tmp.template emplace<entt_ext::parent<ActualT>>(e, *p);
+            }
+          }
+          if (auto* c = ecs_.template try_get<entt_ext::children<ActualT>>(e)) {
+            entt_ext::children<ActualT> filtered;
+            for (auto child : *c) {
+              if (visible_set.contains(child)) {
+                filtered.insert(child);
+              }
+            }
+            if (!filtered.empty()) {
+              tmp.template emplace<entt_ext::children<ActualT>>(e, std::move(filtered));
+            }
+          }
+        }
+      }
+    };
+
+    (copy_one.template operator()<ComponentsT>(), ...);
+  }
+
+  // Look up the (user_id, role) for a given session_id. Returns nullptr
+  // if the session_id isn't in client_states_ (e.g. expired session, or
+  // an internal call that didn't go through the handshake).
+  client_sync_state const* lookup_session_identity(std::string const& session_id) const {
+    auto it = client_states_.find(session_id);
+    if (it == client_states_.end()) return nullptr;
+    return &it->second;
+  }
+
+  // Single-entity multi-tenant visibility check. An entity is visible
+  // to a session iff:
+  //   - the session has admin role (1), or
+  //   - the entity has no `owner` component (unowned/global), or
+  //   - the entity's owner.user_id matches the session's user_id.
+  // Used by both the snapshot path and the notification paths.
+  bool is_entity_visible_to(entity e, std::string const& user_id, int role) {
+    if (role == 1) return true;
+    auto& reg           = ecs_.registry();
+    auto& owner_storage = reg.template storage<owner>();
+    if (!owner_storage.contains(e)) return true;
+    return owner_storage.get(e).user_id == user_id;
+  }
+
+  // Build the list of entities visible to the requesting session.
+  std::vector<entity> collect_visible_entities(std::string const& user_id, int role) {
+    std::vector<entity> out;
+
+    auto& reg            = ecs_.registry();
+    auto& entity_storage = reg.template storage<entity>();
+    for (auto e : entity_storage) {
+      if (is_entity_visible_to(e, user_id, role)) out.push_back(e);
+    }
+
+    return out;
   }
 
   template <typename ComponentT>
@@ -916,23 +1165,45 @@ private:
   }
 
 private:
-  // Client state management
+  // Client state management. Touches last_sync on every access so the
+  // stale-state sweep in cleanup_disconnected_clients() reflects activity,
+  // not just initial-create time.
   client_sync_state& get_or_create_client_state(std::string const& client_id) {
+    auto const now = std::chrono::steady_clock::now();
     auto it = client_states_.find(client_id);
     if (it == client_states_.end()) {
       auto [inserted_it, success]   = client_states_.emplace(client_id, client_sync_state{});
       inserted_it->second.client_id = client_id;
-      inserted_it->second.last_sync = std::chrono::steady_clock::now();
+      inserted_it->second.last_sync = now;
       return inserted_it->second;
     }
+    it->second.last_sync = now;
     return it->second;
+  }
+
+  // Insert into a per-client dirty set, enforcing the hard cap. When the
+  // cap is hit we drop the set and mark the client for full resync — see
+  // kDirtyEntitiesHardCap. This caps the per-client memory contribution
+  // even if the client has gone silent without disconnecting cleanly.
+  static void mark_dirty_capped(client_sync_state& state, entity entt) {
+    if (state.full_resync_needed) {
+      // Already over the cap; further inserts are wasted work.
+      return;
+    }
+    if (state.dirty_entities.size() >= kDirtyEntitiesHardCap) {
+      state.dirty_entities.clear();
+      state.full_resync_needed = true;
+      spdlog::warn("ECS-sync: client {} exceeded dirty_entities cap; forcing full resync", state.client_id);
+      return;
+    }
+    state.dirty_entities.insert(entt);
   }
 
   // Mark entity as dirty for all clients except the specified one
   void mark_entity_dirty_for_all_other_clients(entity entt, std::string const& except_client_id) {
     for (auto& [client_id, client_state] : client_states_) {
       if (client_id != except_client_id) {
-        client_state.dirty_entities.insert(entt);
+        mark_dirty_capped(client_state, entt);
       }
     }
   }
@@ -940,7 +1211,7 @@ private:
   // Mark entity as dirty for all clients
   void mark_entity_dirty_for_all_clients(entity entt) {
     for (auto& [client_id, client_state] : client_states_) {
-      client_state.dirty_entities.insert(entt);
+      mark_dirty_capped(client_state, entt);
     }
   }
 
@@ -984,6 +1255,7 @@ private:
   bool                                               notifications_enabled_   = true;  // Enable real-time notifications by default
   bool                                               applying_client_changes_ = false; // Flag to prevent sync loops
   auth_handler_type                                  auth_handler_;                    // Optional authentication handler
+  std::chrono::milliseconds                          client_idle_timeout_     = std::chrono::minutes(15); // Stale-state eviction threshold
 };
 
 // Backward-compatible alias: historical `sync_server<Components...>` usage

@@ -1,9 +1,12 @@
 #pragma once
 
-#include "ecs.hpp"
-#include "entity_mapping.hpp"
-#include "sync_common.hpp"
-#include "type_name.hpp"
+#include <entt_ext/ecs.hpp>
+#include <entt_ext/entity_mapping.hpp>
+#include <entt_ext/sync/pending_changes.hpp>
+#include <entt_ext/sync_common.hpp>
+#include <entt_ext/type_name.hpp>
+
+#include <chrono>
 
 #include <grlx/rpc/client.hpp>
 #include <grlx/rpc/encoder.hpp>
@@ -87,6 +90,15 @@ public:
         co_return false;
       }
 
+      // Phase 4 of the offline-first plan (see docs/offline_first.md):
+      // before pulling the server's snapshot, push every pending_create<T>
+      // / pending_update<T> stamped on local entities while we were
+      // disconnected. This way the server's snapshot — which arrives
+      // next — already reflects our offline edits, and the merge in
+      // continuous_loader doesn't roll them back. Failures are kept on
+      // the entity (the marker stays) so the next reconnect retries.
+      co_await reconcile_pending_changes();
+
       co_await request_snapshot();
 
       co_return true;
@@ -147,6 +159,38 @@ public:
   // Check if entity is mapped to server
   bool is_entity_mapped(entity server_entity) const {
     return continuous_loader_.contains(server_entity);
+  }
+
+  // Persist the server→client entity-id mapping. Used by offline-first
+  // sync clients that cache the registry across runs (see
+  // docs/offline_first.md). Without this, restoring the registry from
+  // disk is not enough — the next server snapshot would re-map server
+  // entity IDs to fresh client entities and duplicate everything.
+  template <typename Archive>
+  void save_mapping(Archive& archive) const {
+    continuous_loader_.save_mapping(archive);
+  }
+
+  // Inverse of save_mapping. Must be called *after* the registry has
+  // been restored from its own snapshot — the loader drops mapping
+  // entries whose local entity isn't valid.
+  template <typename Archive>
+  void load_mapping(Archive& archive) {
+    continuous_loader_.load_mapping(archive);
+  }
+
+  // Suppress the on_construct/on_update/on_destroy observers that
+  // would otherwise try to send component state to the server. Used by
+  // offline-first cache loading: emplace events fired while restoring
+  // a snapshot from disk are local-only and must not produce RPCs (the
+  // session may not even exist yet). Caller is responsible for restoring
+  // the previous value via the matching pop. Re-uses the existing
+  // `loading_snapshot_` flag the observers already check.
+  void push_suppress_observer_rpcs() {
+    loading_snapshot_ = true;
+  }
+  void pop_suppress_observer_rpcs() {
+    loading_snapshot_ = false;
   }
 
   // Request ECS snapshot from server
@@ -240,15 +284,147 @@ public:
     }
   }
 
+  // Phase 4: drain any pending_create<T> / pending_update<T> markers
+  // accumulated while disconnected and push the corresponding component
+  // values to the server via the existing send_component_to_server path.
+  // Multi-pass over creates so a hierarchy chain (parent created offline,
+  // child created offline) eventually reconciles even if the child's
+  // parent<T> ref isn't mapped yet on the first pass — once the parent
+  // is sent and acknowledged, continuous_loader.contains_local() flips
+  // true for it and the next pass picks the child up.
+  asio::awaitable<void> reconcile_pending_changes() {
+    // Creates: iterate until no entity changed marker state.
+    for (int pass = 0; pass < 16; ++pass) {
+      bool progress = false;
+      co_await reconcile_creates_helper<SyncComponentsT...>(progress);
+      if (!progress) break;
+    }
+
+    // Updates: order independent — every entity here is already mapped
+    // (it was emplaced from a server snapshot at some prior point), so
+    // a single pass is enough.
+    co_await reconcile_updates_helper<SyncComponentsT...>();
+
+    co_return;
+  }
+
+  template <typename First, typename... Rest>
+  asio::awaitable<void> reconcile_creates_helper(bool& progress) {
+    co_await reconcile_creates_for<First>(progress);
+    if constexpr (sizeof...(Rest) > 0) {
+      co_await reconcile_creates_helper<Rest...>(progress);
+    }
+    co_return;
+  }
+
+  template <typename First, typename... Rest>
+  asio::awaitable<void> reconcile_updates_helper() {
+    co_await reconcile_updates_for<First>();
+    if constexpr (sizeof...(Rest) > 0) {
+      co_await reconcile_updates_helper<Rest...>();
+    }
+    co_return;
+  }
+
+  template <typename ComponentT>
+  asio::awaitable<void> reconcile_creates_for(bool& progress) {
+    using ActualT            = unwrap_hierarchy_t<ComponentT>;
+    constexpr bool read_only = is_server_only_v<ComponentT>;
+
+    if constexpr (read_only) {
+      // server_only<T> components are never written by the client.
+      co_return;
+    } else {
+      // Snapshot the entity list — the inner send_component_to_server
+      // mutates the registry (mapping update + marker removal) and we
+      // can't iterate a view through that.
+      std::vector<entity> targets;
+      for (auto e : ecs_.template view<pending_create<ActualT>>()) {
+        targets.push_back(e);
+      }
+
+      for (auto e : targets) {
+        if (!ecs_.valid(e)) {
+          continue;
+        }
+        auto* component = ecs_.template try_get<ActualT>(e);
+        if (component == nullptr) {
+          // Component was removed locally between observer and reconcile;
+          // drop the now-stale marker and move on.
+          ecs_.template remove<pending_create<ActualT>>(e);
+          progress = true;
+          continue;
+        }
+
+        try {
+          co_await send_component_to_server<ActualT>(e, *component, std::chrono::steady_clock::now());
+          ecs_.template remove<pending_create<ActualT>>(e);
+          progress = true;
+        } catch (std::exception const& ex) {
+          spdlog::warn("[reconcile] create failed for {} entity {}: {}",
+                       type_name<ActualT>(), static_cast<int>(e), ex.what());
+        } catch (...) {
+          spdlog::warn("[reconcile] create failed for {} entity {}: unknown",
+                       type_name<ActualT>(), static_cast<int>(e));
+        }
+      }
+    }
+    co_return;
+  }
+
+  template <typename ComponentT>
+  asio::awaitable<void> reconcile_updates_for() {
+    using ActualT            = unwrap_hierarchy_t<ComponentT>;
+    constexpr bool read_only = is_server_only_v<ComponentT>;
+
+    if constexpr (read_only) {
+      co_return;
+    } else {
+      std::vector<entity> targets;
+      for (auto e : ecs_.template view<pending_update<ActualT>>()) {
+        targets.push_back(e);
+      }
+
+      for (auto e : targets) {
+        if (!ecs_.valid(e)) {
+          continue;
+        }
+        auto* component = ecs_.template try_get<ActualT>(e);
+        if (component == nullptr) {
+          ecs_.template remove<pending_update<ActualT>>(e);
+          continue;
+        }
+
+        try {
+          co_await send_component_to_server<ActualT>(e, *component, std::chrono::steady_clock::now());
+          ecs_.template remove<pending_update<ActualT>>(e);
+        } catch (std::exception const& ex) {
+          spdlog::warn("[reconcile] update failed for {} entity {}: {}",
+                       type_name<ActualT>(), static_cast<int>(e), ex.what());
+        } catch (...) {
+          spdlog::warn("[reconcile] update failed for {} entity {}: unknown",
+                       type_name<ActualT>(), static_cast<int>(e));
+        }
+      }
+    }
+    co_return;
+  }
+
 private:
   // Set up notification handlers for real-time sync updates
   void setup_notification_handlers() {
     // Register handlers for component-specific notifications
     (setup_component_notification_handlers<SyncComponentsT>(), ...);
 
-    // Handle entity destruction notifications from server
+    // Handle entity destruction notifications from server.
+    //
+    // Empty session_id means "broadcast to everyone" — the server uses that
+    // for server-initiated changes (e.g. notify_entity_destruction_to_all_clients).
+    // A non-empty session_id means the notification is addressed to a specific
+    // recipient (e.g. the "_to_other_clients" routing path) and we should
+    // only process it if it's ours.
     rpc_client_.register_notification_handler("entity_destroyed", [this](entity_destroy_request const& request) {
-      if (request.session_id != session_id_)
+      if (!request.session_id.empty() && request.session_id != session_id_)
         return;
 
       ecs_.defer([this, request](entt_ext::ecs& ecs) {
@@ -292,10 +468,11 @@ private:
 
     std::string component_name = std::string(type_name<ComponentT>());
 
-    // Handle component updates
+    // Handle component updates. Empty session_id == broadcast to everyone;
+    // see entity_destroyed handler above for the full rationale.
     std::string update_notification = "component_updated_" + component_name;
     rpc_client_.register_notification_handler(update_notification, [this](component_update_request<ComponentT> const& request) {
-      if (request.session_id != session_id_)
+      if (!request.session_id.empty() && request.session_id != session_id_)
         return;
 
       // Defer ECS modifications to avoid concurrent registry access
@@ -317,10 +494,11 @@ private:
       });
     });
 
-    // Handle component removals
+    // Handle component removals. Empty session_id == broadcast to everyone;
+    // see entity_destroyed handler above for the full rationale.
     std::string remove_notification = "component_removed_" + component_name;
     rpc_client_.register_notification_handler(remove_notification, [this](component_remove_request<ComponentT> const& request) {
-      if (request.session_id != session_id_)
+      if (!request.session_id.empty() && request.session_id != session_id_)
         return;
 
       // Defer ECS modifications to avoid concurrent registry access
@@ -368,7 +546,11 @@ private:
     auto& observer = ecs_.component_observer<ComponentT>();
 
     if constexpr (!ReadOnly) {
-      // When a sync component is added, send it to server immediately
+      // When a sync component is added: stamp pending_create<T> first so
+      // an offline (or mid-flight failed) creation is recoverable on the
+      // next reconcile (phase 4). If we're currently connected and the
+      // send succeeds, the marker is cleared immediately so we don't
+      // re-upload on reconnect.
       observer.on_construct([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
         spdlog::debug("Client-side component added: {} {}", type_name<ComponentT>(), static_cast<int>(e));
 
@@ -379,23 +561,31 @@ private:
           co_return;
         }
 
+        ecs.template emplace_or_replace<pending_create<ComponentT>>(e);
+
+        if (!is_connected()) {
+          co_return;
+        }
+
         auto sync_version = std::chrono::steady_clock::now();
 
         try {
           co_await send_component_to_server<ComponentT>(e, component, sync_version);
+          ecs.template remove<pending_create<ComponentT>>(e);
         } catch (std::exception const& ex) {
-          spdlog::error("Error sending component to server: {}", ex.what());
+          spdlog::error("Error sending component to server: {} (left as pending_create)", ex.what());
         } catch (...) {
-          spdlog::error("Error sending component to server: unknown exception");
+          spdlog::error("Error sending component to server: unknown exception (left as pending_create)");
         }
 
         co_return;
       });
 
-      // When a sync component is updated, send it to server immediately
+      // When a sync component is updated: stamp pending_update<T>{at_ms},
+      // then try to send. Same clear-on-success / leave-on-failure model
+      // as on_construct, plus a wall-clock timestamp so the server can
+      // resolve last-write-wins conflicts in phase 4.
       observer.on_update([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
-        // spdlog::debug("Client-side component updated: {} {}", type_name<ComponentT>(), static_cast<int>(e));
-
         if (loading_snapshot_) {
           co_return;
         }
@@ -403,14 +593,24 @@ private:
           co_return;
         }
 
+        auto const now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        ecs.template emplace_or_replace<pending_update<ComponentT>>(e, pending_update<ComponentT>{now_ms});
+
+        if (!is_connected()) {
+          co_return;
+        }
+
         auto sync_version = std::chrono::steady_clock::now();
 
         try {
           co_await send_component_to_server<ComponentT>(e, component, sync_version);
+          ecs.template remove<pending_update<ComponentT>>(e);
         } catch (std::exception const& ex) {
-          spdlog::error("Error sending component to server: {}", ex.what());
+          spdlog::error("Error sending component to server: {} (left as pending_update)", ex.what());
         } catch (...) {
-          spdlog::error("Error sending component to server: unknown exception");
+          spdlog::error("Error sending component to server: unknown exception (left as pending_update)");
         }
 
         co_return;

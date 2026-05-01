@@ -339,6 +339,63 @@ public:
     }
   }
 
+  /**
+   * @brief Serialize the remote→local mapping to an archive.
+   *
+   * Used by offline-first sync clients (see docs/offline_first.md): when
+   * the client persists its registry across runs it must also persist
+   * this mapping, otherwise the next snapshot from the server creates a
+   * fresh set of client entities and the persisted ones become stale
+   * duplicates. Format is a uint64 length followed by length pairs of
+   * (remote, local) entity_type values.
+   *
+   * @tparam Archive Type of output archive.
+   * @param archive A valid reference to an output archive.
+   */
+  template <typename Archive>
+  void save_mapping(Archive& archive) const {
+    std::uint64_t length = remloc_.size();
+    archive(length);
+    for (auto&& [remote, local] : remloc_) {
+      archive(remote, local);
+    }
+  }
+
+  /**
+   * @brief Restore a previously-saved mapping from an archive.
+   *
+   * Replaces the existing mapping. Skips entries whose local entity is
+   * no longer valid in the registry — the persisted snapshot of the
+   * registry may have been trimmed since the mapping was written.
+   *
+   * @tparam Archive Type of input archive.
+   * @param archive A valid reference to an input archive.
+   */
+  template <typename Archive>
+  void load_mapping(Archive& archive) {
+    remloc_.clear();
+    locrem_.clear();
+
+    std::uint64_t length{};
+    archive(length);
+
+    for (std::uint64_t i = 0; i < length; ++i) {
+      entity_type remote{null};
+      entity_type local{null};
+      archive(remote, local);
+
+      // Drop entries whose local side no longer exists. Caller is
+      // expected to have already restored the registry from its own
+      // snapshot before calling load_mapping; entities present in the
+      // saved mapping but absent from the current registry would be
+      // dangling references.
+      if (reg->valid(local)) {
+        remloc_.insert_or_assign(remote, local);
+        locrem_.insert_or_assign(local, remote);
+      }
+    }
+  }
+
 private:
   entt::dense_map<entity_type, entity_type> remloc_; // remote (archived) entity → local (live) entity
   entt::dense_map<entity_type, entity_type> locrem_; // local (live) entity → remote (archived) entity

@@ -62,6 +62,18 @@ struct parent final {
   }
 };
 
+// Type trait to detect if a type is a parent<T>.
+template <typename>
+struct is_parent : std::false_type {};
+
+template <typename Type>
+struct is_parent<parent<Type>> : std::true_type {
+  using parent_type = Type;
+};
+
+template <typename T>
+inline constexpr bool is_parent_v = is_parent<T>::value;
+
 template <typename Type>
 using children = index_set<entt_ext::entity, Type>;
 
