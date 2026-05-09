@@ -8,6 +8,8 @@
 #include <entt/container/dense_map.hpp>
 #include <entt/core/type_traits.hpp>
 
+#include <vector>
+
 namespace entt_ext {
 
 namespace internal {
@@ -337,6 +339,39 @@ public:
       remloc_.erase(it->second);
       locrem_.erase(it);
     }
+  }
+
+  /**
+   * @brief Returns a snapshot of all currently-mapped local entity IDs.
+   *
+   * Useful when the caller wants to destroy every loader-managed entity
+   * (e.g. on reconnect, to drop stale server→local mappings before pulling
+   * a fresh snapshot). Returning a vector — instead of exposing iterators
+   * over the underlying map — lets the caller mutate the loader (clear
+   * mappings, destroy entities, which fires observers that may call
+   * remove_mapping_by_local) without invalidating its iteration.
+   */
+  [[nodiscard]] std::vector<entity_type> local_entities() const {
+    std::vector<entity_type> out;
+    out.reserve(locrem_.size());
+    for (auto&& [local, _remote] : locrem_) {
+      out.push_back(local);
+    }
+    return out;
+  }
+
+  /**
+   * @brief Drop every remote↔local mapping without touching the registry.
+   *
+   * Pair with destroying the previously-mapped entities (see
+   * local_entities()) when you want to fully reset sync state — e.g. on
+   * reconnect, to ensure the next snapshot rebuilds a clean world rather
+   * than merging into stale mappings whose server-side counterparts may
+   * have changed identity.
+   */
+  void clear_mappings() {
+    remloc_.clear();
+    locrem_.clear();
   }
 
   /**

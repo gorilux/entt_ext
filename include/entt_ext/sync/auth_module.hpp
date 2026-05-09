@@ -204,7 +204,7 @@ void register_user_management_endpoints(Server& server, auth_module& auth, ecs& 
   // its dispatch::visibility expectations. The endpoints below all
   // re-validate the token explicitly so we still defend in depth.
 
-  server.attach("auth.create_user",
+  server.attach("auth_create_user",
                 [&auth, &ecs_ref](create_user_request const& req) -> user_mgmt_response {
                   auto* sess = auth.validate_token(req.auth_token);
                   if (sess == nullptr) {
@@ -228,7 +228,7 @@ void register_user_management_endpoints(Server& server, auth_module& auth, ecs& 
                   return {.success = true};
                 });
 
-  server.attach("auth.delete_user",
+  server.attach("auth_delete_user",
                 [&auth, &ecs_ref](delete_user_request const& req) -> user_mgmt_response {
                   auto* sess = auth.validate_token(req.auth_token);
                   if (sess == nullptr) {
@@ -249,7 +249,7 @@ void register_user_management_endpoints(Server& server, auth_module& auth, ecs& 
                   return {.success = false, .error_message = "User not found"};
                 });
 
-  server.attach("auth.change_password",
+  server.attach("auth_change_password",
                 [&auth, &ecs_ref](change_password_request const& req) -> user_mgmt_response {
                   auto* sess = auth.validate_token(req.auth_token);
                   if (sess == nullptr) {
@@ -277,7 +277,7 @@ void register_user_management_endpoints(Server& server, auth_module& auth, ecs& 
                   return {.success = false, .error_message = "User not found"};
                 });
 
-  server.attach("auth.list_users",
+  server.attach("auth_list_users",
                 [&auth, &ecs_ref](list_users_request const& req) -> list_users_response {
                   auto* sess = auth.validate_token(req.auth_token);
                   if (sess == nullptr) {
@@ -293,7 +293,7 @@ void register_user_management_endpoints(Server& server, auth_module& auth, ecs& 
                   return resp;
                 });
 
-  server.attach("auth.refresh",
+  server.attach("auth_refresh",
                 [&auth](auth_refresh_request const& req) -> auth_refresh_response {
                   auto* sess = auth.validate_token(req.auth_token);
                   if (sess == nullptr) {
