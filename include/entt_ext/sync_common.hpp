@@ -162,6 +162,33 @@ struct handshake_response {
   }
 };
 
+// Lightweight session keepalive. The TCP-level msg_type::ping refreshes the
+// rpc-layer idle deadline (5 min) but does not touch the sync server's
+// client_states_, whose entries live behind a separate client_idle_timeout_
+// (15 min default). Without this RPC, a client that is connected but not
+// issuing sync RPCs gets its sync session evicted after the longer timeout
+// elapses — the next write then hits the multi-tenant authorization check
+// with a null requester and returns "Not authorized" even though the TCP
+// connection is healthy. A long-running, idle client (home automation
+// dashboard left open overnight) needs to ping this RPC every couple of
+// minutes so handle_sync_keepalive can call touch_session.
+struct sync_keepalive_request {
+  std::string session_id;
+  template <typename Archive>
+  void serialize(Archive& archive) {
+    archive(session_id);
+  }
+};
+
+struct sync_keepalive_response {
+  bool        success;
+  std::string error_message; // Non-empty when the session was unknown (e.g. already evicted) so the client can re-handshake
+  template <typename Archive>
+  void serialize(Archive& archive) {
+    archive(success, error_message);
+  }
+};
+
 // Synchronization message types
 struct sync_request {
   std::string                           session_id; // Session ID from handshake

@@ -176,6 +176,15 @@ public:
   // Request ECS snapshot from server
   asio::awaitable<bool> request_snapshot(std::vector<entity> const& entities_of_interest = {});
 
+  // Sync-level keepalive: invokes "sync_keepalive" on the server to refresh
+  // last_sync for our session in client_states_. The rpc-layer try_ping()
+  // only resets the rpc msg_reader's idle deadline (5 min) — it does not
+  // touch the higher-level sync session (15 min default). For an idle but
+  // connected client (e.g. a dashboard left open overnight), only this RPC
+  // prevents server-side eviction. Returns false if the session is unknown
+  // server-side (caller should reconnect/re-handshake) or on any error.
+  asio::awaitable<bool> keepalive();
+
   // Connect to server and request initial snapshot in one operation
   asio::awaitable<bool> connect_and_sync(std::string const&         host,
                                          std::uint16_t              port,

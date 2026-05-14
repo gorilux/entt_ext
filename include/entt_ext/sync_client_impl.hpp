@@ -96,6 +96,28 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::connect(std::string cons
 
 template <typename ChannelT, typename... SyncComponentsT>
 asio::awaitable<bool>
+sync_client_with_channel<ChannelT, SyncComponentsT...>::keepalive() {
+  if (!rpc_client_.is_connected() || session_id_.empty()) {
+    co_return false;
+  }
+  try {
+    sync_keepalive_request request{.session_id = session_id_};
+    auto response = co_await rpc_client_.template invoke<sync_keepalive_response>("sync_keepalive", std::move(request));
+    if (!response.success) {
+      spdlog::warn("Sync keepalive rejected: {}", response.error_message);
+      co_return false;
+    }
+    co_return true;
+  } catch (std::exception const& ex) {
+    spdlog::warn("Sync keepalive failed: {}", ex.what());
+    co_return false;
+  } catch (...) {
+    co_return false;
+  }
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+asio::awaitable<bool>
 sync_client_with_channel<ChannelT, SyncComponentsT...>::request_snapshot(std::vector<entity> const& entities_of_interest) {
   if (!rpc_client_.is_connected()) {
     co_return false;

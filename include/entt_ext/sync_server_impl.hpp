@@ -231,6 +231,22 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_sync_request(sync
 }
 
 template <typename ChannelT, typename... SyncComponentsT>
+asio::awaitable<sync_keepalive_response>
+sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_sync_keepalive(sync_keepalive_request const& request) {
+  if (request.session_id.empty()) {
+    co_return sync_keepalive_response{.success = false, .error_message = "Empty session_id"};
+  }
+  // touch_session is a no-op when the session is unknown — surface that to
+  // the client as an error so it can re-handshake instead of believing the
+  // session is healthy.
+  if (lookup_session_identity(request.session_id) == nullptr) {
+    co_return sync_keepalive_response{.success = false, .error_message = "Unknown session"};
+  }
+  touch_session(request.session_id);
+  co_return sync_keepalive_response{.success = true, .error_message = ""};
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
 template <typename ComponentT>
 asio::awaitable<component_update_response<ComponentT>>
 sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_component_update(component_update_request<ComponentT> const& request) {
@@ -825,6 +841,11 @@ void sync_server_with_channel<ChannelT, SyncComponentsT...>::setup_rpc_endpoints
     // Note: For now, sync requests don't require session context since they work with anonymous clients
     // In a more complete implementation, you'd extract session_id from request or connection context
     co_return co_await handle_sync_request(request);
+  });
+
+  // Register sync-level keepalive endpoint
+  rpc_server_.attach("sync_keepalive", [this](sync_keepalive_request const& request) -> asio::awaitable<sync_keepalive_response> {
+    co_return co_await handle_sync_keepalive(request);
   });
 
   // Register entity creation endpoint

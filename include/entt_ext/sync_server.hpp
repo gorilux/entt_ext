@@ -112,6 +112,12 @@ public:
   // RPC endpoint for synchronization
   asio::awaitable<sync_response> handle_sync_request(sync_request const& request);
 
+  // Lightweight session keepalive — touches last_sync for the given
+  // session_id so cleanup_disconnected_clients() doesn't evict a connected
+  // but otherwise idle client. See sync_keepalive_request in sync_common.hpp
+  // for the broader rationale.
+  asio::awaitable<sync_keepalive_response> handle_sync_keepalive(sync_keepalive_request const& request);
+
   // Component-specific insert/update handlers (type-safe, no registry needed)
   template <typename ComponentT>
   asio::awaitable<component_update_response<ComponentT>> handle_component_update(component_update_request<ComponentT> const& request);
