@@ -8,6 +8,8 @@
 
 #include <entt_ext/sync_client.hpp>
 
+#include <entt/entity/snapshot.hpp>
+
 #include <cereal/types/string.hpp>
 #include <cereal/types/unordered_map.hpp>
 #include <cereal/types/unordered_set.hpp>
@@ -171,16 +173,10 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::apply_sync_response(sync
       loading_snapshot_ = true;
       grlx::rpc::ibufferstream           istream(&response.snapshot_data[0], response.snapshot_data.size());
       cereal::PortableBinaryInputArchive archive(istream);
-      // load entities
-      continuous_loader_.get<entt_ext::entity>(archive);
 
-      // Load components (including hierarchy components)
-      (load_component_and_hierarchy<SyncComponentsT>(archive), ...);
-
-      continuous_loader_.orphans();
-
-      // Remap entity references inside components after loading (including hierarchy components)
-      (co_await remap_component_and_hierarchy<SyncComponentsT>(), ...);
+      // Single shared snapshot-ingest path (also used by the offline-first
+      // restore_cached_snapshot): entities → components → orphans → remap.
+      co_await load_snapshot_from_archive(archive);
 
       ecs_.defer_async([this](entt_ext::ecs&) -> asio::awaitable<void> {
         loading_snapshot_ = false;
@@ -201,6 +197,140 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::apply_sync_response(sync
     loading_snapshot_ = false;
     co_return false;
   }
+}
+
+// ============================================================================
+// Snapshot ingest (shared by live sync and offline-first cache restore)
+// ============================================================================
+
+template <typename ChannelT, typename... SyncComponentsT>
+asio::awaitable<void>
+sync_client_with_channel<ChannelT, SyncComponentsT...>::load_snapshot_from_archive(
+    cereal::PortableBinaryInputArchive& archive) {
+  // Entity table first (server IDs → fresh local IDs, recorded in the
+  // continuous_loader's remote↔local maps), then every sync component
+  // (and hierarchy) into the mapped locals, then orphan cleanup, then
+  // remap any entity references the components carry.
+  continuous_loader_.get<entt_ext::entity>(archive);
+  (load_component_and_hierarchy<SyncComponentsT>(archive), ...);
+  continuous_loader_.orphans();
+  (co_await remap_component_and_hierarchy<SyncComponentsT>(), ...);
+  co_return;
+}
+
+// ============================================================================
+// Offline-first registry cache (see docs/offline_first.md)
+// ============================================================================
+
+template <typename ChannelT, typename... SyncComponentsT>
+template <typename ComponentT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::copy_component_to_server_keyed(
+    entt::registry& tmp, std::vector<entity> const& mapped_local,
+    std::vector<entity> const& mapped_server) {
+  using ActualT = unwrap_hierarchy_t<ComponentT>;
+
+  for (std::size_t i = 0; i < mapped_local.size(); ++i) {
+    auto loc = mapped_local[i];
+    auto srv = mapped_server[i];
+    if (auto* c = ecs_.template try_get<ActualT>(loc)) {
+      ActualT value = *c;
+      // Translate any entity references the component carries from local
+      // to server IDs — same hook the live send path uses.
+      if constexpr (requires(ActualT& x, continuous_loader_with_mapping<entt::registry> const& l) {
+                      x.map_entities_to_remote(l);
+                    }) {
+        value.map_entities_to_remote(continuous_loader_);
+      }
+      tmp.template emplace<ActualT>(srv, std::move(value));
+    }
+  }
+
+  if constexpr (is_with_hierarchy_v<ComponentT>) {
+    for (std::size_t i = 0; i < mapped_local.size(); ++i) {
+      auto loc = mapped_local[i];
+      auto srv = mapped_server[i];
+
+      if (auto* p = ecs_.template try_get<entt_ext::parent<ActualT>>(loc)) {
+        auto parent_srv = continuous_loader_.to_remote(p->entity);
+        if (parent_srv != entt_ext::null) {
+          entt_ext::parent<ActualT> np = *p;
+          np.entity                    = parent_srv;
+          tmp.template emplace<entt_ext::parent<ActualT>>(srv, np);
+        }
+      }
+
+      if (auto* ch = ecs_.template try_get<entt_ext::children<ActualT>>(loc)) {
+        entt_ext::children<ActualT> filtered;
+        for (auto child : *ch) {
+          auto child_srv = continuous_loader_.to_remote(child);
+          if (child_srv != entt_ext::null) {
+            filtered.insert(child_srv);
+          }
+        }
+        if (!filtered.empty()) {
+          tmp.template emplace<entt_ext::children<ActualT>>(srv, std::move(filtered));
+        }
+      }
+    }
+  }
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_cached_snapshot(
+    cereal::PortableBinaryOutputArchive& archive) {
+  // Gather every synced local entity that already has a server mapping,
+  // paired with its server ID. Offline-only entities (no server ID yet)
+  // are intentionally not cached — that is the documented phase-2
+  // limitation; they will be handled by phase-3 pending-change tracking.
+  std::vector<entity> mapped_local;
+  std::vector<entity> mapped_server;
+  std::unordered_set<entity> seen;
+
+  auto collect = [&]<typename T>() {
+    using ActualT = unwrap_hierarchy_t<T>;
+    for (auto e : ecs_.view<ActualT>()) {
+      if (seen.contains(e)) {
+        continue;
+      }
+      auto srv = continuous_loader_.to_remote(e);
+      if (srv != entt_ext::null) {
+        seen.insert(e);
+        mapped_local.push_back(e);
+        mapped_server.push_back(srv);
+      }
+    }
+  };
+  (collect.template operator()<SyncComponentsT>(), ...);
+
+  // Build a server-keyed temporary registry (mirror of the server's
+  // build_filtered_registry): the entity table on disk holds server IDs,
+  // so the cache survives across runs that assign different local IDs.
+  entt::registry tmp;
+  for (auto srv : mapped_server) {
+    [[maybe_unused]] auto created = tmp.create(srv);
+  }
+  (copy_component_to_server_keyed<SyncComponentsT>(tmp, mapped_local, mapped_server), ...);
+
+  entt::snapshot{tmp}.get<entt_ext::entity>(archive);
+  auto save_one = [&]<typename T>() {
+    using ActualT = unwrap_hierarchy_t<T>;
+    entt::snapshot{tmp}.template get<ActualT>(archive);
+    if constexpr (is_with_hierarchy_v<T>) {
+      entt::snapshot{tmp}.template get<entt_ext::parent<ActualT>>(archive);
+      entt::snapshot{tmp}.template get<entt_ext::children<ActualT>>(archive);
+    }
+  };
+  (save_one.template operator()<SyncComponentsT>(), ...);
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+asio::awaitable<void>
+sync_client_with_channel<ChannelT, SyncComponentsT...>::restore_cached_snapshot(
+    cereal::PortableBinaryInputArchive& archive) {
+  // Identical ingest path to a live server snapshot — the cache file is
+  // shaped exactly like sync_response.snapshot_data.
+  co_await load_snapshot_from_archive(archive);
+  co_return;
 }
 
 // ============================================================================

@@ -24,11 +24,13 @@
 #include <entt_ext/sync/pending_changes.hpp>
 
 #include <cereal/archives/portable_binary.hpp>
-#include <entt/entity/snapshot.hpp>
+
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
 
 #include <spdlog/spdlog.h>
 
-#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -84,8 +86,6 @@ public:
     try {
       cereal::PortableBinaryInputArchive archive(ifs);
 
-      auto& reg = ecs_.registry();
-
       // Suppress sync_client's "send to server" observers while the
       // registry rehydrates — the emplace events here are local restore
       // events, not user-driven mutations, and the session may not even
@@ -96,29 +96,31 @@ public:
         ~guard() { c.pop_suppress_observer_rpcs(); }
       } _suppress{client_};
 
-      // Entities first — must be loaded before components so component
-      // storages have somewhere to put their values.
-      entt::snapshot_loader{reg}.template get<entt_ext::entity>(archive);
-
-      // Each synced component, plus parent<T>/children<T> when wrapped,
-      // plus the pending_create<T>/pending_update<T> markers stamped by
-      // sync_client's observers (phase 3). Order matters and must match
-      // save_now() exactly.
-      auto load_component = [&]<typename T>() {
-        using ActualT = unwrap_hierarchy_t<T>;
-        entt::snapshot_loader{reg}.template get<ActualT>(archive);
-        if constexpr (is_with_hierarchy_v<T>) {
-          entt::snapshot_loader{reg}.template get<entt_ext::parent<ActualT>>(archive);
-          entt::snapshot_loader{reg}.template get<entt_ext::children<ActualT>>(archive);
-        }
-        entt::snapshot_loader{reg}.template get<pending_create<ActualT>>(archive);
-        entt::snapshot_loader{reg}.template get<pending_update<ActualT>>(archive);
-      };
-      (load_component.template operator()<ComponentsT>(), ...);
-
-      // Mapping last — entity validity check inside load_mapping needs
-      // the registry to already be repopulated.
-      client_.load_mapping(archive);
+      // The cache file is a server-keyed snapshot, byte-identical to a
+      // live sync_response. Replay it through the sync_client's own
+      // continuous_loader so the restored entities are remapped and
+      // tracked exactly as if the server had just pushed them — a later
+      // server snapshot then reuses them instead of duplicating. This is
+      // also why we don't use entt::snapshot_loader: EnTT 4.0 asserts an
+      // empty registry, which entt_ext never has (global entity).
+      //
+      // restore_cached_snapshot is a coroutine (it shares the live
+      // remap path). load_now() is intentionally synchronous — called
+      // from the module constructor before ecs::run() — so drive it to
+      // completion on a transient io_context. The restore touches only
+      // the registry/loader (no network), so run() returns immediately.
+      boost::asio::io_context drive_ctx;
+      std::exception_ptr      restore_error;
+      boost::asio::co_spawn(
+          drive_ctx,
+          [this, &archive]() -> boost::asio::awaitable<void> {
+            co_await client_.restore_cached_snapshot(archive);
+          },
+          [&restore_error](std::exception_ptr ep) { restore_error = ep; });
+      drive_ctx.run();
+      if (restore_error) {
+        std::rethrow_exception(restore_error);
+      }
 
       spdlog::info("[sync cache] restored from {}", filename_);
     } catch (std::exception const& ex) {
@@ -142,23 +144,13 @@ public:
       }
 
       cereal::PortableBinaryOutputArchive archive(ofs);
-      auto&                               reg = ecs_.registry();
 
-      entt::snapshot{reg}.template get<entt_ext::entity>(archive);
-
-      auto save_component = [&]<typename T>() {
-        using ActualT = unwrap_hierarchy_t<T>;
-        entt::snapshot{reg}.template get<ActualT>(archive);
-        if constexpr (is_with_hierarchy_v<T>) {
-          entt::snapshot{reg}.template get<entt_ext::parent<ActualT>>(archive);
-          entt::snapshot{reg}.template get<entt_ext::children<ActualT>>(archive);
-        }
-        entt::snapshot{reg}.template get<pending_create<ActualT>>(archive);
-        entt::snapshot{reg}.template get<pending_update<ActualT>>(archive);
-      };
-      (save_component.template operator()<ComponentsT>(), ...);
-
-      client_.save_mapping(archive);
+      // Persist a server-keyed snapshot (the sync_client translates the
+      // live local entity IDs to their server IDs). The file is therefore
+      // independent of the local IDs this run happened to assign and is
+      // restored through the same continuous_loader path as a live server
+      // snapshot — see sync_client::save_cached_snapshot.
+      client_.save_cached_snapshot(archive);
     }
 
     // Atomic rename so a crash mid-write can't leave a half-written

@@ -159,6 +159,24 @@ public:
     continuous_loader_.load_mapping(archive);
   }
 
+  // Offline-first registry cache (see docs/offline_first.md).
+  //
+  // The cache file is a *server-keyed* snapshot: byte-for-byte the same
+  // shape the server emits in a live sync_response. save_cached_snapshot
+  // mirrors the server's build_filtered_registry — it builds a temporary
+  // registry whose entity table holds server IDs (translated from the
+  // live client IDs via the continuous_loader), so the persisted file is
+  // independent of the arbitrary local IDs this run happened to assign.
+  // restore_cached_snapshot then replays it through the exact same
+  // continuous_loader path used for a live snapshot, so a subsequent
+  // server snapshot reuses the restored entities instead of duplicating
+  // them. Neither requires an empty registry (unlike entt::snapshot_loader,
+  // which EnTT 4.0 hard-asserts — incompatible with entt_ext's always-present
+  // global entity).
+  void save_cached_snapshot(cereal::PortableBinaryOutputArchive& archive);
+
+  asio::awaitable<void> restore_cached_snapshot(cereal::PortableBinaryInputArchive& archive);
+
   // Suppress the on_construct/on_update/on_destroy observers that
   // would otherwise try to send component state to the server. Used by
   // offline-first cache loading: emplace events fired while restoring
@@ -390,6 +408,23 @@ private:
                                           std::string const& password = "");
 
   void setup_entity_sync();
+
+  // Shared restore path: load the entity table + every sync component
+  // (and hierarchy) from a snapshot archive through the continuous_loader,
+  // drop orphans, then remap entity references. Used by both the live
+  // apply_sync_response and the offline-first restore_cached_snapshot so
+  // there is exactly one snapshot-ingest implementation.
+  asio::awaitable<void> load_snapshot_from_archive(cereal::PortableBinaryInputArchive& archive);
+
+  // Copy one sync component (and its hierarchy parent<T>/children<T>)
+  // for the given mapped entities into a server-keyed temporary registry,
+  // translating every entity reference local→server and dropping refs
+  // that have no server mapping. Client-side mirror of the server's
+  // build_filtered_registry copy_one lambda.
+  template <typename ComponentT>
+  void copy_component_to_server_keyed(entt::registry&            tmp,
+                                      std::vector<entity> const& mapped_local,
+                                      std::vector<entity> const& mapped_server);
 
 public:
   // Access the underlying RPC client (e.g. to register custom notification handlers)
