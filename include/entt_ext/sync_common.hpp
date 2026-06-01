@@ -140,10 +140,12 @@ struct handshake_request {
   std::string protocol_version; // Protocol version based on component types and order
   std::string username;         // Authentication username (empty = no auth)
   std::string password;         // Authentication password (plaintext, validated server-side)
+  std::string device_id;        // Stable per-install UUID. Empty for apps that don't use it (auth still works);
+                                // file_sync version vectors are keyed on this, so reconnects keep their identity.
 
   template <typename Archive>
   void serialize(Archive& archive) {
-    archive(client_name, client_version, protocol_version, username, password);
+    archive(client_name, client_version, protocol_version, username, password, device_id);
   }
 };
 
@@ -155,10 +157,11 @@ struct handshake_response {
   std::chrono::steady_clock::time_point server_timestamp;
   int                                   role = 0;         // User role (0=user, 1=admin)
   std::string                           auth_token;       // Session auth token for subsequent requests
+  std::string                           server_device_id; // Server's stable device_id (echoed back so the client knows the server identity for vv).
 
   template <typename Archive>
   void serialize(Archive& archive) {
-    archive(success, session_id, error_message, protocol_version, server_timestamp, role, auth_token);
+    archive(success, session_id, error_message, protocol_version, server_timestamp, role, auth_token, server_device_id);
   }
 };
 

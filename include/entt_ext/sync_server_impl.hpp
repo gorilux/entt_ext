@@ -454,7 +454,13 @@ void sync_server_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
     // Set up observer for component_update_request to apply updates from clients
     auto& update_request_observer = ecs.component_observer<component_update_request<ComponentT>>();
 
-    update_request_observer.on_construct(
+    // Apply an inbound client update. Connected to BOTH on_construct and
+    // on_update: handle_component_update places the marker with
+    // emplace_or_replace_deferred, so a second update that arrives before the
+    // previous marker is cleared is a *replace* — it fires on_update, not
+    // on_construct. Wiring only on_construct silently dropped that second
+    // update on the server.
+    auto apply_component_update =
         [this](entt_ext::ecs& ecs, entt_ext::entity e, component_update_request<ComponentT>& request) -> asio::awaitable<void> {
           try {
             // Multi-tenant write authorization is enforced synchronously
@@ -504,12 +510,16 @@ void sync_server_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
           }
 
           co_return;
-        });
+        };
+    update_request_observer.on_construct(apply_component_update);
+    update_request_observer.on_update(apply_component_update);
 
     // Set up observer for component_remove_request to apply removals from clients
     auto& remove_request_observer = ecs.component_observer<component_remove_request<ComponentT>>();
 
-    remove_request_observer.on_construct(
+    // Connected to BOTH on_construct and on_update for the same reason as
+    // apply_component_update above — the marker is placed with emplace_or_replace.
+    auto apply_component_remove =
         [this](entt_ext::ecs& ecs, entt_ext::entity e, component_remove_request<ComponentT>& request) -> asio::awaitable<void> {
           try {
             ecs.template remove<ComponentT>(e);
@@ -522,7 +532,9 @@ void sync_server_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
           }
 
           co_return;
-        });
+        };
+    remove_request_observer.on_construct(apply_component_remove);
+    remove_request_observer.on_update(apply_component_remove);
   } // !ReadOnly
 }
 

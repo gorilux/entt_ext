@@ -39,8 +39,8 @@ ecs::ecs(ecs&& other) noexcept
   : registry_{std::move(other.registry_)}
   , global_entity_{std::move(other.global_entity_)}
   , continuous_loader_{std::move(other.continuous_loader_)}
-  , defered_tasks_{std::move(other.defered_tasks_)}
   , running_{other.running_}
+  , detached_each_in_flight_{other.detached_each_in_flight_}
   , command_channel_size_{other.command_channel_size_}
   , command_channel_{main_io_context(), other.command_channel_size_}
   , registered_cleanup_handlers_{std::move(other.registered_cleanup_handlers_)} {
@@ -53,9 +53,9 @@ ecs& ecs::operator=(ecs&& other) noexcept {
     registry_             = std::move(other.registry_);
     global_entity_        = std::move(other.global_entity_);
     continuous_loader_    = std::move(other.continuous_loader_);
-    defered_tasks_        = std::move(other.defered_tasks_);
-    running_              = other.running_;
-    command_channel_size_ = other.command_channel_size_;
+    running_                 = other.running_;
+    detached_each_in_flight_  = other.detached_each_in_flight_;
+    command_channel_size_     = other.command_channel_size_;
     // Note: io_contexts and command_channel cannot be moved/assigned
     // The moved-to object keeps its own io_contexts and command_channel
     registered_cleanup_handlers_ = std::move(other.registered_cleanup_handlers_);
@@ -178,7 +178,6 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
 
   auto wait_for_systems_to_finish = [&]() -> asio::awaitable<void> {
     auto systems_running = view<running<system_tag>>();
-    auto each_running    = view<running<each_tag>>();
 
     while (systems_running.begin() != systems_running.end()) {
       timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
@@ -186,10 +185,17 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
       // spdlog::debug("waiting for systems to finish");
     }
 
-    while (each_running.begin() != each_running.end()) {
+    // Detached .each() coroutines are tracked by running<FuncT, each_tag>,
+    // which is templated on an unnameable lambda and cannot be viewed here.
+    // detached_each_in_flight_ is the non-templated equivalent: ++ at spawn
+    // (main executor, in sys.run) and -- via a deferred command (main
+    // executor, in process_command_channel) after the handler returns. The
+    // co_await below yields the main thread so process_command_channel can
+    // apply those decrements — do NOT gate command processing on this barrier.
+    while (detached_each_in_flight_ > 0) {
       timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
       co_await timer.async_wait(use_nothrow_awaitable);
-      // spdlog::debug("waiting for parallel each to finish");
+      // spdlog::debug("waiting for detached each coroutines to finish");
     }
     co_return;
   };
@@ -197,28 +203,13 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
   while (running_) {
     timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
 
-    auto last_stage = stage::val::input;
     for (auto [entt, sys] : outstanding_systems.each()) {
 
       auto const diff_time = std::chrono::high_resolution_clock::now() - sys.last_invoke;
       auto const elapsed   = (std::chrono::duration_cast<std::chrono::milliseconds>(diff_time).count() / 1000.0);
       try {
         if (elapsed >= sys.interval && co_await sys.run(sys, *this, elapsed)) {
-          sys.last_invoke    = std::chrono::high_resolution_clock::now();
-          auto current_stage = static_cast<stage::val>((sys.stage / 1000) * 1000);
-          if (current_stage != last_stage && defered_tasks_.size() > 0) {
-
-            co_await wait_for_systems_to_finish();
-            for (auto& task : defered_tasks_) {
-              try {
-                co_await task(*this);
-              } catch (std::exception const& e) {
-                //  spdlog::error("run_update_loop: {}", e.what());
-              }
-            }
-            defered_tasks_.clear();
-          }
-          last_stage = current_stage;
+          sys.last_invoke = std::chrono::high_resolution_clock::now();
         }
 
       } catch (std::exception const& e) {
@@ -229,19 +220,9 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
 
     // Need to sync all systems before we can delete any entities
     auto entities_pending_delete = view<entt_ext::delete_later>();
-    if (entities_pending_delete.begin() != entities_pending_delete.end() || defered_tasks_.size() > 0) {
+    if (entities_pending_delete.begin() != entities_pending_delete.end()) {
 
       co_await wait_for_systems_to_finish();
-
-      // spdlog::info("Running {} defered tasks", defered_tasks_.size());
-      for (auto& task : defered_tasks_) {
-        try {
-          co_await task(*this);
-        } catch (std::exception const& e) {
-          //  spdlog::error("run_update_loop: {}", e.what());
-        }
-      }
-      defered_tasks_.clear();
 
       // spdlog::info("Deleting {} entities", entities_pending_delete.size());
       for (auto [delete_entity] : entities_pending_delete.each()) {
@@ -320,6 +301,25 @@ asio::awaitable<void> ecs::process_command_channel() {
       }
     }
   }
+}
+
+// Decrement the detached-each in-flight counter on the main executor. Routed
+// through the command channel (drained by process_command_channel on the main
+// thread) so it is serialized with detached_each_acquire(), which runs on the
+// main thread inside sys.run(). Sent from the detached completion coroutine
+// after the handler has returned.
+auto ecs::detached_each_release_deferred() -> asio::awaitable<void> {
+  deferred_command cmd{.operation      = deferred_command::op_type::custom,
+                        .entity         = entt_ext::null,
+                        .component_type = 0,
+                        .executor       = [](ecs& ecs_ref) -> asio::awaitable<void> {
+                          if (ecs_ref.detached_each_in_flight_ > 0)
+                            --ecs_ref.detached_each_in_flight_;
+                          co_return;
+                        }};
+
+  co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
+  co_return;
 }
 
 // Legacy deferred operations (simplified - channels handle everything now)

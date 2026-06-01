@@ -110,16 +110,28 @@ asio::awaitable<bool> ecs::merge_snapshot(ArchiveT& ar) {
             };
             (remap_component.template operator()<ComponentsT>(), ...);
 
-            // Diagnostic: log entity counts for each component type after merge
-            auto log_component = [this]<typename T>() {
+            // Diagnostic: log entity counts for each component type after merge.
+            // Counts are obtained by iterating the view, not via view.size():
+            // a single-component view over in_place_delete storage (e.g.
+            // children<T>, which is index_set<entity, T>) has no size() — its
+            // packed array carries tombstones. Iterating skips tombstones and
+            // yields the true live count, and works for both storage policies.
+            auto live_count = [](auto view) {
+              std::size_t n = 0;
+              for ([[maybe_unused]] auto entity : view) {
+                ++n;
+              }
+              return n;
+            };
+            auto log_component = [this, &live_count]<typename T>() {
               using ActualT = sync::unwrap_hierarchy_t<T>;
-              auto count    = registry_.template view<ActualT>().size();
+              auto count    = live_count(registry_.template view<ActualT>());
               if (count > 0) {
                 spdlog::info("[merge] {} entities with {}", count, entt::type_id<ActualT>().name());
               }
               if constexpr (sync::is_with_hierarchy_v<T>) {
-                auto parent_count   = registry_.template view<entt_ext::parent<ActualT>>().size();
-                auto children_count = registry_.template view<entt_ext::children<ActualT>>().size();
+                auto parent_count   = live_count(registry_.template view<entt_ext::parent<ActualT>>());
+                auto children_count = live_count(registry_.template view<entt_ext::children<ActualT>>());
                 if (parent_count > 0 || children_count > 0) {
                   spdlog::info("[merge]   parent<{}>: {}, children<{}>: {}",
                                entt::type_id<ActualT>().name(),

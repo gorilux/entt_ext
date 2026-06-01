@@ -262,14 +262,30 @@ nexus to entt_ext. Nexus keeps working through a thin shim.
 - Login screen on first launch.
 - Bootstrap admin via env / first-run flow.
 
-**Phase D — admin role + user management.**
-- Reuse nexus's user-management RPCs (create/edit/delete users).
-- Gym admin UI for adding the wife as a user.
+**Phase D — admin role + user management.** *(done)*
+- User-management RPCs (`auth_create_user`, `auth_delete_user`,
+  `auth_change_password`, `auth_list_users`) registered by
+  `entt_ext::sync::register_user_management_endpoints`. Naming aligned
+  with nexus (underscored, not dotted) so the same UI code works on
+  both apps.
+- Gym `user_management_dialog` (admin-only) — gear icon next to the
+  link-state badge opens a floating window with the user list, a
+  "Create user" form and a per-user "Change password" form.
+- `gym::ecs_sync::rpc_client_ref` exposed on the global entity so the
+  dialog can issue RPCs without holding a `client_module` reference.
 
-**Phase E — hardening.**
-- Rate limiter integration.
-- Token rotation.
-- Tests for "user A cannot read user B's data" path.
+**Phase E — hardening.** *(in progress)*
+- Rate limiting was already integrated in phase B
+  (`entt_ext::sync::login_rate_limiter`, called from
+  `auth_module::auth_handler`).
+- Token rotation: gym client now refreshes its token every 6h while
+  connected (`auth_refresh` RPC; server TTL defaults to 24h, so we
+  have 4× headroom). The new token replaces both
+  `connection_state.auth_token` (live) and `config.auth_token`
+  (persisted).
+- TODO: tests for "user A cannot read user B's data" — defer until the
+  test scaffolding for entt_ext::sync exists (currently apps test
+  against a real server).
 
 ## Migration
 

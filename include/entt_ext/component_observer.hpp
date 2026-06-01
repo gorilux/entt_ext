@@ -202,7 +202,11 @@ public:
       handler(ecs, entt);
     }
 
-    if (on_construct_async_handlers.empty()) {
+    // Bulk-load paths (e.g. sync snapshot ingest) set ecs.async_observers_muted()
+    // to skip queueing async handler bodies that would just bail on a
+    // loading_snapshot_-style check. Avoids saturating command_channel_
+    // during large snapshots.
+    if (on_construct_async_handlers.empty() || ecs.async_observers_muted()) {
       return;
     }
 
@@ -222,7 +226,7 @@ public:
       handler(ecs, entt);
     }
 
-    if (on_destroy_async_handlers.empty()) {
+    if (on_destroy_async_handlers.empty() || ecs.async_observers_muted()) {
       return;
     }
 
@@ -247,7 +251,7 @@ public:
       handler(ecs, entt);
     }
 
-    if (on_update_async_handlers.empty()) {
+    if (on_update_async_handlers.empty() || ecs.async_observers_muted()) {
       return;
     }
 

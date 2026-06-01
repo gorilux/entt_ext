@@ -33,6 +33,12 @@ class double_buffer {
   std::atomic<size_t> m_index{0}; // index of the READ buffer
 
 public:
+  // Pointer-stable storage when used as an ECS component. double_buffer is
+  // movable, so entt would default it to swap-and-pop storage; a cross-entity
+  // erase then relocates the slot and dangles any reference a detached
+  // coroutine holds across a co_await.
+  static constexpr bool in_place_delete = true;
+
   double_buffer() = default;
   double_buffer(const double_buffer& other)
     : m_buffer(other.m_buffer)

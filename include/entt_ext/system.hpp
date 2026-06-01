@@ -441,6 +441,7 @@ private:
         if constexpr (IsOnce) {
           ecs.template emplace<running<FuncT, run_once_tag>>(entity);
         }
+        ecs.detached_each_acquire();
 
         asio::co_spawn(
             cfg.concurrent_io_ctx,
@@ -454,6 +455,7 @@ private:
               }
 
               co_await ecs.remove_deferred<running<FuncT, each_tag>>(entity);
+              co_await ecs.detached_each_release_deferred();
               co_return;
             },
             asio::detached);
@@ -723,6 +725,7 @@ public:
       if constexpr (Policy == run_policy::once) {
         ecs.template emplace<running<FuncT, run_once_tag>>(entity);
       }
+      ecs.detached_each_acquire();
       asio::co_spawn(
           concurrent_executor,
           [&main_executor, entity, &ecs, &self, dt, handler, entry]() -> asio::awaitable<void> {
@@ -734,6 +737,7 @@ public:
             }
 
             co_await ecs.remove_deferred<running<FuncT, each_tag>>(entity);
+            co_await ecs.detached_each_release_deferred();
             co_return;
           },
           asio::detached);

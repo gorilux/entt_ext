@@ -171,6 +171,12 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::apply_sync_response(sync
       // Note: The snapshot contains server entity IDs that get mapped to client entity IDs
       spdlog::debug("Loading snapshot from server");
       loading_snapshot_ = true;
+      // Suppress async observer queueing during the bulk load. The
+      // writeable on_construct/on_update bodies already bail on
+      // loading_snapshot_, but each emplace would still queue a defer that
+      // saturates command_channel_ for large snapshots. The flag stays set
+      // until the matching clear below runs on the same channel.
+      ecs.set_async_observers_muted(true);
       grlx::rpc::ibufferstream           istream(&response.snapshot_data[0], response.snapshot_data.size());
       cereal::PortableBinaryInputArchive archive(istream);
 
@@ -178,8 +184,9 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::apply_sync_response(sync
       // restore_cached_snapshot): entities → components → orphans → remap.
       co_await load_snapshot_from_archive(archive);
 
-      ecs_.defer_async([this](entt_ext::ecs&) -> asio::awaitable<void> {
+      ecs_.defer_async([this](entt_ext::ecs& ecs_inner) -> asio::awaitable<void> {
         loading_snapshot_ = false;
+        ecs_inner.set_async_observers_muted(false);
         spdlog::debug("Snapshot loaded from server");
         co_return;
       });
@@ -195,6 +202,10 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::apply_sync_response(sync
 
   } catch (...) {
     loading_snapshot_ = false;
+    // Best-effort: if we caught above before queueing the mute, this is a
+    // no-op; if the mute was already set we may leave it stuck. The catch
+    // path is for snapshot decode errors that abort before reaching the
+    // deferred body, so the mute hasn't been set yet — safe.
     co_return false;
   }
 }
@@ -630,14 +641,31 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
 
       auto sync_version = std::chrono::steady_clock::now();
 
-      try {
-        co_await send_component_to_server<ComponentT>(e, component, sync_version);
-        ecs.template remove<pending_create<ComponentT>>(e);
-      } catch (std::exception const& ex) {
-        spdlog::error("Error sending component to server: {} (left as pending_create)", ex.what());
-      } catch (...) {
-        spdlog::error("Error sending component to server: unknown exception (left as pending_create)");
-      }
+      // Spawn the RPC on a separate executor so the channel processor is
+      // not blocked for the round-trip. If we co_await here, every
+      // observer body for every emplaced sync component pauses the
+      // single-threaded process_command_channel until the server replies,
+      // and inbound notifications (60Hz steady state) saturate the buffer.
+      // The pending_create<T> marker handles retry on RPC failure.
+      // mutable: send_component_to_server takes a non-const ComponentT&,
+      // so the captured comp must be writable inside the lambda body.
+      asio::co_spawn(
+          ecs.concurrent_io_context(),
+          [this, e, comp = component, sync_version]() mutable -> asio::awaitable<void> {
+            try {
+              co_await send_component_to_server<ComponentT>(e, comp, sync_version);
+              ecs_.defer([e](entt_ext::ecs& ecs_ref) {
+                if (ecs_ref.valid(e) && ecs_ref.template all_of<pending_create<ComponentT>>(e)) {
+                  ecs_ref.template remove<pending_create<ComponentT>>(e);
+                }
+              });
+            } catch (std::exception const& ex) {
+              spdlog::error("Error sending component to server: {} (left as pending_create)", ex.what());
+            } catch (...) {
+              spdlog::error("Error sending component to server: unknown exception (left as pending_create)");
+            }
+          },
+          asio::detached);
 
       co_return;
     });
@@ -665,14 +693,26 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
 
       auto sync_version = std::chrono::steady_clock::now();
 
-      try {
-        co_await send_component_to_server<ComponentT>(e, component, sync_version);
-        ecs.template remove<pending_update<ComponentT>>(e);
-      } catch (std::exception const& ex) {
-        spdlog::error("Error sending component to server: {} (left as pending_update)", ex.what());
-      } catch (...) {
-        spdlog::error("Error sending component to server: unknown exception (left as pending_update)");
-      }
+      // See on_construct above: the RPC is spawned externally so we don't
+      // block process_command_channel. pending_update<T> handles retry.
+      // mutable: send_component_to_server takes a non-const ComponentT&.
+      asio::co_spawn(
+          ecs.concurrent_io_context(),
+          [this, e, comp = component, sync_version]() mutable -> asio::awaitable<void> {
+            try {
+              co_await send_component_to_server<ComponentT>(e, comp, sync_version);
+              ecs_.defer([e](entt_ext::ecs& ecs_ref) {
+                if (ecs_ref.valid(e) && ecs_ref.template all_of<pending_update<ComponentT>>(e)) {
+                  ecs_ref.template remove<pending_update<ComponentT>>(e);
+                }
+              });
+            } catch (std::exception const& ex) {
+              spdlog::error("Error sending component to server: {} (left as pending_update)", ex.what());
+            } catch (...) {
+              spdlog::error("Error sending component to server: unknown exception (left as pending_update)");
+            }
+          },
+          asio::detached);
 
       co_return;
     });
@@ -689,13 +729,21 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
       spdlog::debug("Client-side component destroyed: {} {}", type_name<ComponentT>(), static_cast<int>(e));
       auto sync_version = std::chrono::steady_clock::now();
 
-      try {
-        co_await notify_component_removal<ComponentT>(e, sync_version);
-      } catch (std::exception const& ex) {
-        spdlog::error("Error notifying component removal to server: {}", ex.what());
-      } catch (...) {
-        spdlog::error("Error notifying component removal to server: unknown exception");
-      }
+      // RPC spawned externally — see on_construct/on_update above. No retry
+      // marker here because the component has already been destroyed; the
+      // server reconciles by version. Errors are logged only.
+      asio::co_spawn(
+          ecs.concurrent_io_context(),
+          [this, e, sync_version]() -> asio::awaitable<void> {
+            try {
+              co_await notify_component_removal<ComponentT>(e, sync_version);
+            } catch (std::exception const& ex) {
+              spdlog::error("Error notifying component removal to server: {}", ex.what());
+            } catch (...) {
+              spdlog::error("Error notifying component removal to server: unknown exception");
+            }
+          },
+          asio::detached);
 
       co_return;
     });
@@ -704,7 +752,14 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
   // Set up observer for component_update_request to apply updates from server
   auto& update_request_observer = ecs_.component_observer<component_update_request<ComponentT>>();
 
-  update_request_observer.on_construct(
+  // Apply an inbound server update. Connected to BOTH on_construct and
+  // on_update: the notification handler places the marker with
+  // emplace_or_replace, so a second update that arrives before the previous
+  // marker is cleared (it is cleared several command cycles later, via the
+  // double-defer below) is a *replace* — it fires on_update, not
+  // on_construct. Wiring only on_construct silently dropped that second
+  // update, leaving the entity stale until the next full snapshot.
+  auto apply_component_update =
       [this](entt_ext::ecs& ecs, entt_ext::entity e, component_update_request<ComponentT>& request) -> asio::awaitable<void> {
         // `this` is consumed by `map_entities_async(...)` below, but only on the
         // `if constexpr` branch that runs for hierarchy components or types
@@ -712,28 +767,49 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
         // branch fires, the capture would otherwise be flagged unused.
         (void)this;
         try {
+          // The marker was placed on a valid entity (see notification handler),
+          // but this body runs from a co_spawned async observer. Between the
+          // marker emplace and here, an entity_destroyed notification or a
+          // snapshot reload (reconnect path) can destroy `e`. emplace_or_replace
+          // asserts on invalid entities — drop the update silently if it's gone.
+          if (!ecs.valid(e)) {
+            spdlog::debug("Dropping stale component update for destroyed entity {} ({})",
+                          static_cast<int>(e), type_name<ComponentT>());
+            co_return;
+          }
+
           // Map entity references from remote to local IDs
           auto component_data = request.component_data;
           if constexpr (is_hierarchy_component<ComponentT>::value ||
                         requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); }) {
             co_await map_entities_async(component_data);
+            // Re-check after the suspension point — entity may have been
+            // destroyed while we were mapping.
+            if (!ecs.valid(e)) {
+              spdlog::debug("Dropping stale component update for destroyed entity {} ({}) after map_entities",
+                            static_cast<int>(e), type_name<ComponentT>());
+              co_return;
+            }
           }
 
-          // Apply the component update
-          // Note: emplace_or_replace triggers on_update which queues an async handler.
-          // We must NOT remove the request marker until after that async handler has
-          // had a chance to check it. Since both handlers go through the same command
-          // channel, we use defer_async with a double-defer pattern to ensure the
-          // removal happens after the on_update handler completes.
+          // Apply the component update.
+          //
+          // emplace_or_replace synchronously fires dispatch_on_update for T,
+          // which (for non-server_only types) queues T's writeable on_update
+          // observer onto command_channel_. That observer body checks for the
+          // marker (component_update_request<T>) and bails — so the marker
+          // must still be present when the body runs.
+          //
+          // defer/defer_async preserve call order in command_channel_ (see
+          // ecs::defer's contract), so a plain ecs.defer(remove_marker) here
+          // lands BEHIND the just-queued observer body. The historical
+          // double-defer was a workaround for an earlier broken ordering and
+          // is no longer needed — one defer is enough and halves the channel
+          // pressure per inbound update.
           ecs.template emplace_or_replace<ComponentT>(e, component_data);
 
-          // First defer: This gets queued after the on_update async handler
-          // Second defer inside: This ensures removal happens after on_update executes
-          ecs.defer_async([e](entt_ext::ecs& ecs_ref) -> asio::awaitable<void> {
-            ecs_ref.defer([e](entt_ext::ecs& ecs_inner) {
-              ecs_inner.template remove<component_update_request<ComponentT>>(e);
-            });
-            co_return;
+          ecs.defer([e](entt_ext::ecs& ecs_ref) {
+            ecs_ref.template remove<component_update_request<ComponentT>>(e);
           });
         } catch (std::exception const& ex) {
           spdlog::error("Error applying component update request: {}", ex.what());
@@ -742,14 +818,27 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
         }
 
         co_return;
-      });
+      };
+  update_request_observer.on_construct(apply_component_update);
+  update_request_observer.on_update(apply_component_update);
 
   // Set up observer for component_remove_request to apply removals from server
   auto& remove_request_observer = ecs_.component_observer<component_remove_request<ComponentT>>();
 
-  remove_request_observer.on_construct(
+  // Connected to BOTH on_construct and on_update for the same reason as
+  // apply_component_update above — the marker is placed with emplace_or_replace.
+  auto apply_component_remove =
       [this](entt_ext::ecs& ecs, entt_ext::entity e, component_remove_request<ComponentT>& request) -> asio::awaitable<void> {
+        (void)request;
         try {
+          // Same window as apply_component_update: the entity can be destroyed
+          // between marker emplace and this body running. remove<T> asserts
+          // on invalid entities — drop the request silently if it's gone.
+          if (!ecs.valid(e)) {
+            spdlog::debug("Dropping stale component remove for destroyed entity {} ({})",
+                          static_cast<int>(e), type_name<ComponentT>());
+            co_return;
+          }
           ecs.template remove<ComponentT>(e);
           co_await ecs.template remove_deferred<component_remove_request<ComponentT>>(e);
         } catch (std::exception const& ex) {
@@ -759,7 +848,9 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
         }
 
         co_return;
-      });
+      };
+  remove_request_observer.on_construct(apply_component_remove);
+  remove_request_observer.on_update(apply_component_remove);
 }
 
 // ============================================================================
@@ -998,16 +1089,45 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_entity_sync()
 
       auto sync_version = std::chrono::steady_clock::now();
 
-      try {
-        co_await notify_entity_destruction_to_server(e, sync_version);
-      } catch (std::exception const& ex) {
-        spdlog::error("Error notifying entity destruction to server: {} {}", static_cast<int>(e), ex.what());
-      } catch (...) {
-        spdlog::error("Error notifying entity destruction to server: unknown exception");
-      }
+      // Resolve server_entity NOW (before we remove the mapping) and skip
+      // the RPC entirely if we're disconnected or there's no mapping —
+      // this matches what notify_entity_destruction_to_server would do
+      // internally but avoids putting it inside the spawned coroutine,
+      // where it would race with the synchronous mapping removal below.
+      auto server_entity = continuous_loader_.to_remote(e);
+      bool should_notify =
+          !loading_snapshot_ && server_entity != entt_ext::null && rpc_client_.is_connected() && !session_id_.empty();
 
-      // Remove entity mapping after notifying server
+      // Remove the mapping synchronously now. The spawned RPC has the
+      // server_entity captured by value, so it doesn't depend on the
+      // map any more.
       continuous_loader_.remove_mapping_by_local(e);
+
+      if (should_notify) {
+        // Spawn the RPC externally so the channel processor isn't blocked
+        // for the round-trip. See the on_construct/on_update comments in
+        // setup_automatic_sync_impl for the channel-saturation rationale.
+        auto sid = session_id_;
+        asio::co_spawn(
+            ecs.concurrent_io_context(),
+            [this, e, server_entity, sync_version, sid = std::move(sid)]() -> asio::awaitable<void> {
+              try {
+                entity_destroy_request request{.session_id = sid, .server_entity = server_entity, .sync_version = sync_version};
+                auto response = co_await rpc_client_.template invoke<entity_destroy_response>("entity_destroy", std::move(request));
+                if (!response.success) {
+                  spdlog::error("Entity destruction sync failed: {}", response.error_message);
+                } else {
+                  spdlog::debug("Entity destruction notification sent successfully: client={} server={}",
+                                static_cast<int>(e), static_cast<int>(server_entity));
+                }
+              } catch (std::exception const& ex) {
+                spdlog::error("Error notifying entity destruction to server: {} {}", static_cast<int>(e), ex.what());
+              } catch (...) {
+                spdlog::error("Error notifying entity destruction to server: unknown exception");
+              }
+            },
+            asio::detached);
+      }
     }
     co_return;
   });

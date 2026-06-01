@@ -100,11 +100,13 @@ public:
       continuous_loader_.clear_mappings();
 
       loading_snapshot_ = true;
+      ecs_.set_async_observers_muted(true);
       for (auto e : locals) {
         if (ecs_.valid(e)) {
           ecs_.destroy(e);
         }
       }
+      ecs_.set_async_observers_muted(false);
       loading_snapshot_ = false;
     }
 
@@ -186,9 +188,11 @@ public:
   // `loading_snapshot_` flag the observers already check.
   void push_suppress_observer_rpcs() {
     loading_snapshot_ = true;
+    ecs_.set_async_observers_muted(true);
   }
   void pop_suppress_observer_rpcs() {
     loading_snapshot_ = false;
+    ecs_.set_async_observers_muted(false);
   }
 
   // Request ECS snapshot from server

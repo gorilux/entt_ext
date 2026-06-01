@@ -14,6 +14,12 @@ namespace entt_ext {
 template <typename K, typename... Tag>
 class index_set {
 public:
+  // Pointer-stable storage when used as an ECS component (notably children<T>,
+  // which is index_set<entity, T>). A children_range holds children<T> by
+  // reference and detached systems carry that range across co_await; entt's
+  // default swap-and-pop storage would relocate it on a cross-entity erase.
+  static constexpr bool in_place_delete = true;
+
   // Nested iterator class
   class iterator {
   public:

@@ -24,6 +24,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <source_location>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -670,40 +671,92 @@ public:
     co_return;
   }
 
-  // Defers a synchronous function to be executed on the ECS command queue
-  inline void defer(std::move_only_function<void(ecs&)> func) {
+  // Defers a synchronous function to be executed on the ECS command queue.
+  //
+  // Ordering contract: two sequential defer/defer_async calls land in the
+  // command_channel_ in call order. Several places depend on this:
+  //   - sync_client_impl.hpp's apply_component_update double-defer (marker
+  //     removal must run after the writeable on_update observer's queued body
+  //     so the echo-prevention try_get<component_update_request<T>> sees the
+  //     marker).
+  //   - apply_sync_response's "loading_snapshot_ = false" clear must land
+  //     behind every observer body queued while loading_snapshot_ was true.
+  //
+  // We achieve this by calling concurrent_channel::try_send synchronously on
+  // the caller's thread (channel is thread-safe). The older co_spawn+async_send
+  // approach raced multiple detached senders across concurrent_io_context's
+  // worker threads — the order they reached async_send was scheduler-defined
+  // and broke both invariants above. If the channel is full (default 1000
+  // slots), we fall back to co_spawn+async_send; that path no longer preserves
+  // strict order, so a warning is logged. Bump command_channel_size if seen.
+  inline void defer(std::move_only_function<void(ecs&)> func,
+                    std::source_location loc = std::source_location::current()) {
+    deferred_command cmd{.operation      = deferred_command::op_type::custom,
+                         .entity         = entt_ext::null,
+                         .component_type = 0,
+                         .executor       = [func = std::move(func)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
+                           func(ecs_ref);
+                           co_return;
+                         }};
+
+    // try_send returns false WITHOUT consuming the payload when the channel
+    // is full or closed (see boost/asio/experimental/detail/impl/channel_service.hpp,
+    // try_send: the `block` and `closed` cases `return false` before the
+    // payload-forwarding constructor runs). So `cmd` is still intact below.
+    if (command_channel_.try_send(boost::system::error_code{}, std::move(cmd))) {
+      return;
+    }
+
+    // Tag the overflow warning with the caller's file:line so a saturation
+    // burst points at the producer call site. Without this we can only see
+    // "the channel is full" with no hint of which defer site is filling it.
+    spdlog::warn("ecs::defer: command_channel full from {}:{} ({}), falling back to async_send (ordering not preserved on this path)",
+                  loc.file_name(), loc.line(), loc.function_name());
     asio::co_spawn(
         concurrent_io_context(),
-        [this, func = std::move(func)]() mutable -> asio::awaitable<void> {
-          deferred_command cmd{.operation      = deferred_command::op_type::custom,
-                               .entity         = entt_ext::null,
-                               .component_type = 0,
-                               .executor       = [func = std::move(func)](ecs& ecs_ref) mutable -> asio::awaitable<void> {
-                                 func(ecs_ref);
-                                 co_return;
-                               }};
-
+        [this, cmd = std::move(cmd)]() mutable -> asio::awaitable<void> {
           co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
           co_return;
         },
         asio::detached);
   }
 
-  // Defers an async function to be executed on the ECS command queue
-  inline void defer_async(std::move_only_function<asio::awaitable<void>(ecs&)> func) {
+  // Defers an async function to be executed on the ECS command queue.
+  // See defer() above for the ordering contract and try_send rationale.
+  inline void defer_async(std::move_only_function<asio::awaitable<void>(ecs&)> func,
+                          std::source_location loc = std::source_location::current()) {
+    deferred_command cmd{.operation      = deferred_command::op_type::custom,
+                         .entity         = entt_ext::null,
+                         .component_type = 0,
+                         .executor       = std::move(func)};
+
+    if (command_channel_.try_send(boost::system::error_code{}, std::move(cmd))) {
+      return;
+    }
+
+    spdlog::warn("ecs::defer_async: command_channel full from {}:{} ({}), falling back to async_send (ordering not preserved on this path)",
+                  loc.file_name(), loc.line(), loc.function_name());
     asio::co_spawn(
         concurrent_io_context(),
-        [this, func = std::move(func)]() mutable -> asio::awaitable<void> {
-          deferred_command cmd{.operation      = deferred_command::op_type::custom,
-                               .entity         = entt_ext::null,
-                               .component_type = 0,
-                               .executor       = std::move(func)};
-
+        [this, cmd = std::move(cmd)]() mutable -> asio::awaitable<void> {
           co_await command_channel_.async_send(boost::system::error_code{}, std::move(cmd), asio::use_awaitable);
           co_return;
         },
         asio::detached);
   }
+
+  // Detached .each() coroutine in-flight tracking.
+  //
+  // running<FuncT, each_tag> brackets the true lifetime of a detached each
+  // coroutine, but FuncT is an unnameable lambda so wait_for_systems_to_finish()
+  // cannot view it generically. This counter is the non-templated equivalent:
+  // acquire() runs on the main executor inside sys.run() at spawn; release is
+  // routed through the command channel so the decrement also lands on the main
+  // executor (via process_command_channel) after the handler returns. Both ends
+  // are therefore serialized on the single main thread — no atomic needed.
+  void                      detached_each_acquire() noexcept { ++detached_each_in_flight_; }
+  [[nodiscard]] std::size_t detached_each_in_flight() const noexcept { return detached_each_in_flight_; }
+  auto                      detached_each_release_deferred() -> asio::awaitable<void>;
 
   void run(int timeout_ms = 16, size_t concurrency = std::thread::hardware_concurrency());
   void stop();
@@ -775,6 +828,17 @@ public:
 public:
   // Channel processor coroutine (public so systems can spawn their own processors)
   asio::awaitable<void> process_command_channel();
+
+  // Async observer mute switch. When true, component_observer::dispatch_on_*
+  // skips queueing async (defer_async-based) observer bodies. Sync observers
+  // still fire normally. Intended for bulk-load paths (e.g. sync_client's
+  // snapshot ingest) where every emplace would otherwise queue an observer
+  // body that immediately bails on a loading_snapshot_ check — pure channel
+  // pressure with no useful effect. Caller is responsible for clearing the
+  // flag when the bulk path completes. Not thread-safe: set/clear only from
+  // the same executor (typically the command channel processor thread).
+  void set_async_observers_muted(bool muted) noexcept { async_observers_muted_ = muted; }
+  bool async_observers_muted() const noexcept { return async_observers_muted_; }
 
 private:
   // Helper to register cleanup and add child to parent's children set
@@ -861,11 +925,14 @@ private:
   continuous_loader_with_mapping<registry_type>                     continuous_loader_;
   asio::io_context                                                  main_io_context_       = asio::io_context{};
   asio::io_context                                                  concurrent_io_context_ = asio::io_context{};
-  std::vector<std::function<asio::awaitable<void>(entt_ext::ecs&)>> defered_tasks_;
-  bool                                                              running_ = true;
+  bool                                                              running_                 = true;
+  std::size_t                                                       detached_each_in_flight_ = 0;
   std::size_t                                                       command_channel_size_;
   command_channel                                                   command_channel_;
   std::unordered_set<entt::id_type>                                 registered_cleanup_handlers_;
+  // Set to true during bulk-load paths to suppress async observer queueing.
+  // See set_async_observers_muted() for rationale. Single-thread access only.
+  bool                                                              async_observers_muted_ = false;
 };
 
 template <typename T, typename... ArgsT>

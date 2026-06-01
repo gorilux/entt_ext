@@ -216,6 +216,39 @@ they outlive any one editing pass. Phase numbers refer to the phasing
 section above; "follow-up" items below are deltas on the v1 phase that
 already shipped.
 
+### Phase 2 follow-up: server-keyed cache (shipped)
+
+The original phase-2 `client_state_cache` snapshotted the **live client
+registry verbatim** (`entt::snapshot` of local IDs) and restored it with
+`entt::snapshot_loader`, then layered `save_mapping`/`load_mapping` on
+top. EnTT 4.0's `basic_snapshot_loader` constructor hard-asserts
+`registry.storage<entity>().free_list() == 0` ("Registry must be
+empty"), and `entt_ext::ecs` always owns a global entity (plus any
+modules imported before the sync client) — so the loader aborts on
+startup the moment a cache file exists.
+
+The fix realigns the implementation with the design above: the cache
+file is now a **server-keyed snapshot**, byte-identical to a live
+`sync_response.snapshot_data`.
+
+- `sync_client::save_cached_snapshot` mirrors the server's
+  `build_filtered_registry`: it builds a temporary registry whose
+  entity table holds *server* IDs (translated from local IDs via the
+  continuous_loader, dropping refs with no server mapping), then
+  `entt::snapshot`s that.
+- `sync_client::restore_cached_snapshot` replays the file through the
+  **same** `continuous_loader_` ingest path as a live snapshot
+  (`load_snapshot_from_archive`, shared with `apply_sync_response`), so
+  no empty-registry precondition applies and a subsequent server
+  snapshot reuses the restored entities instead of duplicating them.
+
+The persisted entity-id mapping is now implicit in the server-keyed
+table (the continuous_loader rebuilds it on restore), so
+`client_state_cache` no longer calls `save_mapping`/`load_mapping` — the
+thin `sync_client` wrappers remain for any external caller. Offline-only
+entities (no server ID yet) are still not cached; that remains the
+documented phase-2 limitation closed by phase 3/4.
+
 ### Phase 4 follow-up: pending_delete tombstones
 
 Today an entity destroyed offline cannot be propagated to the server —
