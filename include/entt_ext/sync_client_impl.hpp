@@ -29,13 +29,12 @@ namespace entt_ext::sync {
 
 template <typename ChannelT, typename... SyncComponentsT>
 template <typename... ChannelArgs>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::sync_client_with_channel(
-    ecs& ecs_instance, ChannelArgs&&... channel_args)
-    : ecs_(ecs_instance)
-    , protocol_version_(sync_component_list<SyncComponentsT...>::generate_protocol_version())
-    //, protocol_version_("sync_v1_")
-    , continuous_loader_(ecs_.registry())
-    , rpc_client_(std::forward<ChannelArgs>(channel_args)...) {
+sync_client_with_channel<ChannelT, SyncComponentsT...>::sync_client_with_channel(ecs& ecs_instance, ChannelArgs&&... channel_args)
+  : ecs_(ecs_instance)
+  , protocol_version_(sync_component_list<SyncComponentsT...>::generate_protocol_version())
+  //, protocol_version_("sync_v1_")
+  , continuous_loader_(ecs_.registry())
+  , rpc_client_(std::forward<ChannelArgs>(channel_args)...) {
 
   // Initialize sync state if not present
   if (!ecs_.template contains<sync_state>()) {
@@ -53,30 +52,45 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::sync_client_with_channel
 // ============================================================================
 
 template <typename ChannelT, typename... SyncComponentsT>
-asio::awaitable<bool>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::connect(std::string const& host,
-                                                                 std::uint16_t      port,
-                                                                 std::string const& client_name,
-                                                                 std::string const& client_version,
-                                                                 std::string const& username,
-                                                                 std::string const& password) {
+asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::connect(std::string const& host,
+                                                                                      std::uint16_t      port,
+                                                                                      std::string const& client_name,
+                                                                                      std::string const& client_version,
+                                                                                      std::string const& username,
+                                                                                      std::string const& password) {
   try {
+    spdlog::info("sync_client::connect: connecting to {}:{} as '{}' (client='{}' v{})", host, port, username, client_name, client_version);
+
     // First establish TCP connection
     auto          executor = co_await asio::this_coro::executor;
     tcp::resolver resolver(executor);
     auto          endpoints = co_await resolver.async_resolve(host, std::to_string(port), asio::use_awaitable);
     co_await rpc_client_.connect(*endpoints.begin());
+    spdlog::info("sync_client::connect: TCP/TLS channel established to {}:{}", host, port);
 
-    // Set up notification handlers for real-time sync
+    // Set up notification handlers for real-time sync.
+    //
+    // This is intentionally done BEFORE the handshake, not after it succeeds.
+    // Registration is a purely local map insert (no network), it is idempotent
+    // across reconnects, and each handler self-guards on session_id_ so it stays
+    // inert until the handshake assigns one. Doing it first closes a drop window:
+    // the instant the server accepts the handshake it may start pushing component
+    // updates / entity events (and request_snapshot fires right after), and the
+    // dispatch path silently drops any frame whose handler isn't registered yet.
+    // On handshake failure the disconnect() below calls clear_notification_handlers(),
+    // so there is no leak from registering early.
     setup_notification_handlers();
 
     // Perform handshake to get session ID (includes authentication)
+    spdlog::info("sync_client::connect: starting handshake");
     bool handshake_success = co_await perform_handshake(client_name, client_version, username, password);
     if (!handshake_success) {
+      spdlog::warn("sync_client::connect: handshake failed (auth rejected or no session); disconnecting");
       // Disconnect on handshake failure
       co_await disconnect();
       co_return false;
     }
+    spdlog::info("sync_client::connect: handshake ok, session_id='{}'", session_id_);
 
     // Phase 4 of the offline-first plan (see docs/offline_first.md):
     // before pulling the server's snapshot, push every pending_create<T>
@@ -86,25 +100,34 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::connect(std::string cons
     // continuous_loader doesn't roll them back. Failures are kept on
     // the entity (the marker stays) so the next reconnect retries.
     co_await reconcile_pending_changes();
+    spdlog::info("sync_client::connect: reconciled pending offline changes");
 
     co_await request_snapshot();
+    // NB: request_snapshot only *queues* the snapshot load (defer_async to the
+    // main-thread channel); the actual ingest + mapping happens later and is
+    // marked by "snapshot fully loaded from server". Don't read this as "applied".
+    spdlog::info("sync_client::connect: snapshot received; load queued on main-thread channel; connect returning true");
 
     co_return true;
+  } catch (std::exception const& ex) {
+    spdlog::error("sync_client::connect: failed for {}:{} — {}", host, port, ex.what());
+    session_id_.clear();
+    throw; // Let the caller see the actual error
   } catch (...) {
+    spdlog::error("sync_client::connect: failed for {}:{} — unknown exception", host, port);
     session_id_.clear();
     throw; // Let the caller see the actual error
   }
 }
 
 template <typename ChannelT, typename... SyncComponentsT>
-asio::awaitable<bool>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::keepalive() {
+asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::keepalive() {
   if (!rpc_client_.is_connected() || session_id_.empty()) {
     co_return false;
   }
   try {
     sync_keepalive_request request{.session_id = session_id_};
-    auto response = co_await rpc_client_.template invoke<sync_keepalive_response>("sync_keepalive", std::move(request));
+    auto                   response = co_await rpc_client_.template invoke<sync_keepalive_response>("sync_keepalive", std::move(request));
     if (!response.success) {
       spdlog::warn("Sync keepalive rejected: {}", response.error_message);
       co_return false;
@@ -119,8 +142,7 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::keepalive() {
 }
 
 template <typename ChannelT, typename... SyncComponentsT>
-asio::awaitable<bool>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::request_snapshot(std::vector<entity> const& entities_of_interest) {
+asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::request_snapshot(std::vector<entity> const& entities_of_interest) {
   if (!rpc_client_.is_connected()) {
     co_return false;
   }
@@ -142,12 +164,11 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::request_snapshot(std::ve
 }
 
 template <typename ChannelT, typename... SyncComponentsT>
-asio::awaitable<bool>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::connect_and_sync(std::string const&         host,
-                                                                          std::uint16_t              port,
-                                                                          std::vector<entity> const& entities_of_interest,
-                                                                          std::string const&         client_name,
-                                                                          std::string const&         client_version) {
+asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::connect_and_sync(std::string const&         host,
+                                                                                               std::uint16_t              port,
+                                                                                               std::vector<entity> const& entities_of_interest,
+                                                                                               std::string const&         client_name,
+                                                                                               std::string const&         client_version) {
   bool connected = co_await connect(host, port, client_name, client_version);
   if (!connected) {
     co_return false;
@@ -158,8 +179,7 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::connect_and_sync(std::st
 }
 
 template <typename ChannelT, typename... SyncComponentsT>
-asio::awaitable<bool>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::apply_sync_response(sync_response const& response) {
+asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::apply_sync_response(sync_response const& response) {
   try {
     if (response.snapshot_data.empty()) {
       co_return false;
@@ -169,7 +189,7 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::apply_sync_response(sync
       // Load the snapshot into our ECS
       // Use continuous loader to merge entities without conflicts
       // Note: The snapshot contains server entity IDs that get mapped to client entity IDs
-      spdlog::debug("Loading snapshot from server");
+      spdlog::info("sync_client: loading snapshot from server (deferred body now running on main thread)");
       loading_snapshot_ = true;
       // Suppress async observer queueing during the bulk load. The
       // writeable on_construct/on_update bodies already bail on
@@ -177,35 +197,63 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::apply_sync_response(sync
       // saturates command_channel_ for large snapshots. The flag stays set
       // until the matching clear below runs on the same channel.
       ecs.set_async_observers_muted(true);
-      grlx::rpc::ibufferstream           istream(&response.snapshot_data[0], response.snapshot_data.size());
-      cereal::PortableBinaryInputArchive archive(istream);
 
-      // Single shared snapshot-ingest path (also used by the offline-first
-      // restore_cached_snapshot): entities → components → orphans → remap.
-      co_await load_snapshot_from_archive(archive);
+      // The decode + ingest below can throw (short/corrupt snapshot, cereal
+      // PortableBinaryInputArchive underflow, a bad entity in the stream). This
+      // runs as its OWN coroutine on the command channel — it is NOT covered by
+      // apply_sync_response's outer try/catch. An escaping exception here would
+      // be swallowed by the channel with no log AND leave loading_snapshot_
+      // stuck true + observers muted, silently killing all future sync. So
+      // catch it here: log it loudly and restore sync state before bailing.
+      try {
+        grlx::rpc::ibufferstream           istream(&response.snapshot_data[0], response.snapshot_data.size());
+        cereal::PortableBinaryInputArchive archive(istream);
+
+        // Single shared snapshot-ingest path (also used by the offline-first
+        // restore_cached_snapshot): entities → components → orphans → remap.
+        co_await load_snapshot_from_archive(archive);
+
+        // Stamp last-sync here, on the command-channel (main) thread. Doing it
+        // on apply_sync_response's own (connect-path / POOL) coroutine raced the
+        // main loop's registry access — a concurrent ecs_.get<sync_state>() +
+        // write while the main thread mutates the registry.
+        ecs.template get<sync_state>().last_sync = response.server_timestamp;
+      } catch (std::exception const& ex) {
+        spdlog::error("sync_client: snapshot load FAILED (decode/ingest threw): {} — restoring sync state", ex.what());
+        loading_snapshot_ = false;
+        ecs.set_async_observers_muted(false);
+        co_return;
+      } catch (...) {
+        spdlog::error("sync_client: snapshot load FAILED (unknown exception during decode/ingest) — restoring sync state");
+        loading_snapshot_ = false;
+        ecs.set_async_observers_muted(false);
+        co_return;
+      }
 
       ecs_.defer_async([this](entt_ext::ecs& ecs_inner) -> asio::awaitable<void> {
         loading_snapshot_ = false;
         ecs_inner.set_async_observers_muted(false);
-        spdlog::debug("Snapshot loaded from server");
+        spdlog::info("sync_client: snapshot fully loaded from server (mappings established, observers unmuted)");
         co_return;
       });
 
       co_return;
     });
 
-    // Update sync state
-    auto& state     = ecs_.template get<sync_state>();
-    state.last_sync = response.server_timestamp;
-
     co_return true;
 
-  } catch (...) {
+  } catch (std::exception const& ex) {
+    // This outer catch only covers the SYNCHRONOUS prefix — the empty check and
+    // the defer_async *enqueue* call. The decode/ingest runs in the deferred
+    // body and has its own try/catch above. Reaching here means we failed to
+    // even queue the load (e.g. the command channel rejected it). Previously
+    // this swallowed the exception with no log, hiding the failure entirely.
+    spdlog::error("sync_client::apply_sync_response: failed to queue snapshot load: {}", ex.what());
     loading_snapshot_ = false;
-    // Best-effort: if we caught above before queueing the mute, this is a
-    // no-op; if the mute was already set we may leave it stuck. The catch
-    // path is for snapshot decode errors that abort before reaching the
-    // deferred body, so the mute hasn't been set yet — safe.
+    co_return false;
+  } catch (...) {
+    spdlog::error("sync_client::apply_sync_response: failed to queue snapshot load (unknown exception)");
+    loading_snapshot_ = false;
     co_return false;
   }
 }
@@ -216,8 +264,7 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::apply_sync_response(sync
 
 template <typename ChannelT, typename... SyncComponentsT>
 asio::awaitable<void>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::load_snapshot_from_archive(
-    cereal::PortableBinaryInputArchive& archive) {
+sync_client_with_channel<ChannelT, SyncComponentsT...>::load_snapshot_from_archive(cereal::PortableBinaryInputArchive& archive) {
   // Entity table first (server IDs → fresh local IDs, recorded in the
   // continuous_loader's remote↔local maps), then every sync component
   // (and hierarchy) into the mapped locals, then orphan cleanup, then
@@ -235,9 +282,9 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::load_snapshot_from_archi
 
 template <typename ChannelT, typename... SyncComponentsT>
 template <typename ComponentT>
-void sync_client_with_channel<ChannelT, SyncComponentsT...>::copy_component_to_server_keyed(
-    entt::registry& tmp, std::vector<entity> const& mapped_local,
-    std::vector<entity> const& mapped_server) {
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::copy_component_to_server_keyed(entt::registry&            tmp,
+                                                                                            std::vector<entity> const& mapped_local,
+                                                                                            std::vector<entity> const& mapped_server) {
   using ActualT = unwrap_hierarchy_t<ComponentT>;
 
   for (std::size_t i = 0; i < mapped_local.size(); ++i) {
@@ -247,9 +294,7 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::copy_component_to_s
       ActualT value = *c;
       // Translate any entity references the component carries from local
       // to server IDs — same hook the live send path uses.
-      if constexpr (requires(ActualT& x, continuous_loader_with_mapping<entt::registry> const& l) {
-                      x.map_entities_to_remote(l);
-                    }) {
+      if constexpr (requires(ActualT& x, continuous_loader_with_mapping<entt::registry> const& l) { x.map_entities_to_remote(l); }) {
         value.map_entities_to_remote(continuous_loader_);
       }
       tmp.template emplace<ActualT>(srv, std::move(value));
@@ -287,14 +332,13 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::copy_component_to_s
 }
 
 template <typename ChannelT, typename... SyncComponentsT>
-void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_cached_snapshot(
-    cereal::PortableBinaryOutputArchive& archive) {
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_cached_snapshot(cereal::PortableBinaryOutputArchive& archive) {
   // Gather every synced local entity that already has a server mapping,
   // paired with its server ID. Offline-only entities (no server ID yet)
   // are intentionally not cached — that is the documented phase-2
   // limitation; they will be handled by phase-3 pending-change tracking.
-  std::vector<entity> mapped_local;
-  std::vector<entity> mapped_server;
+  std::vector<entity>        mapped_local;
+  std::vector<entity>        mapped_server;
   std::unordered_set<entity> seen;
 
   auto collect = [&]<typename T>() {
@@ -335,9 +379,7 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_cached_snapsho
 }
 
 template <typename ChannelT, typename... SyncComponentsT>
-asio::awaitable<void>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::restore_cached_snapshot(
-    cereal::PortableBinaryInputArchive& archive) {
+asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::restore_cached_snapshot(cereal::PortableBinaryInputArchive& archive) {
   // Identical ingest path to a live server snapshot — the cache file is
   // shaped exactly like sync_response.snapshot_data.
   co_await load_snapshot_from_archive(archive);
@@ -349,13 +391,13 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::restore_cached_snapshot(
 // ============================================================================
 
 template <typename ChannelT, typename... SyncComponentsT>
-asio::awaitable<void>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_pending_changes() {
+asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_pending_changes() {
   // Creates: iterate until no entity changed marker state.
   for (int pass = 0; pass < 16; ++pass) {
     bool progress = false;
     co_await reconcile_creates_helper<SyncComponentsT...>(progress);
-    if (!progress) break;
+    if (!progress)
+      break;
   }
 
   // Updates: order independent — every entity here is already mapped
@@ -368,8 +410,7 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_pending_change
 
 template <typename ChannelT, typename... SyncComponentsT>
 template <typename First, typename... Rest>
-asio::awaitable<void>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_creates_helper(bool& progress) {
+asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_creates_helper(bool& progress) {
   co_await reconcile_creates_for<First>(progress);
   if constexpr (sizeof...(Rest) > 0) {
     co_await reconcile_creates_helper<Rest...>(progress);
@@ -379,8 +420,7 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_creates_helper
 
 template <typename ChannelT, typename... SyncComponentsT>
 template <typename First, typename... Rest>
-asio::awaitable<void>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_updates_helper() {
+asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_updates_helper() {
   co_await reconcile_updates_for<First>();
   if constexpr (sizeof...(Rest) > 0) {
     co_await reconcile_updates_helper<Rest...>();
@@ -390,8 +430,7 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_updates_helper
 
 template <typename ChannelT, typename... SyncComponentsT>
 template <typename ComponentT>
-asio::awaitable<void>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_creates_for(bool& progress) {
+asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_creates_for(bool& progress) {
   using ActualT            = unwrap_hierarchy_t<ComponentT>;
   constexpr bool read_only = is_server_only_v<ComponentT>;
 
@@ -425,11 +464,9 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_creates_for(bo
         ecs_.template remove<pending_create<ActualT>>(e);
         progress = true;
       } catch (std::exception const& ex) {
-        spdlog::warn("[reconcile] create failed for {} entity {}: {}",
-                     type_name<ActualT>(), static_cast<int>(e), ex.what());
+        spdlog::warn("[reconcile] create failed for {} entity {}: {}", type_name<ActualT>(), static_cast<int>(e), ex.what());
       } catch (...) {
-        spdlog::warn("[reconcile] create failed for {} entity {}: unknown",
-                     type_name<ActualT>(), static_cast<int>(e));
+        spdlog::warn("[reconcile] create failed for {} entity {}: unknown", type_name<ActualT>(), static_cast<int>(e));
       }
     }
   }
@@ -438,8 +475,7 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_creates_for(bo
 
 template <typename ChannelT, typename... SyncComponentsT>
 template <typename ComponentT>
-asio::awaitable<void>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_updates_for() {
+asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_updates_for() {
   using ActualT            = unwrap_hierarchy_t<ComponentT>;
   constexpr bool read_only = is_server_only_v<ComponentT>;
 
@@ -465,11 +501,9 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_updates_for() 
         co_await send_component_to_server<ActualT>(e, *component, std::chrono::steady_clock::now());
         ecs_.template remove<pending_update<ActualT>>(e);
       } catch (std::exception const& ex) {
-        spdlog::warn("[reconcile] update failed for {} entity {}: {}",
-                     type_name<ActualT>(), static_cast<int>(e), ex.what());
+        spdlog::warn("[reconcile] update failed for {} entity {}: {}", type_name<ActualT>(), static_cast<int>(e), ex.what());
       } catch (...) {
-        spdlog::warn("[reconcile] update failed for {} entity {}: unknown",
-                     type_name<ActualT>(), static_cast<int>(e));
+        spdlog::warn("[reconcile] update failed for {} entity {}: unknown", type_name<ActualT>(), static_cast<int>(e));
       }
     }
   }
@@ -682,9 +716,7 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
         co_return;
       }
 
-      auto const now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::system_clock::now().time_since_epoch())
-                              .count();
+      auto const now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
       ecs.template emplace_or_replace<pending_update<ComponentT>>(e, pending_update<ComponentT>{now_ms});
 
       if (!is_connected()) {
@@ -761,64 +793,64 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
   // update, leaving the entity stale until the next full snapshot.
   auto apply_component_update =
       [this](entt_ext::ecs& ecs, entt_ext::entity e, component_update_request<ComponentT>& request) -> asio::awaitable<void> {
-        // `this` is consumed by `map_entities_async(...)` below, but only on the
-        // `if constexpr` branch that runs for hierarchy components or types
-        // that opt into entity-id mapping. For ComponentTs where neither
-        // branch fires, the capture would otherwise be flagged unused.
-        (void)this;
-        try {
-          // The marker was placed on a valid entity (see notification handler),
-          // but this body runs from a co_spawned async observer. Between the
-          // marker emplace and here, an entity_destroyed notification or a
-          // snapshot reload (reconnect path) can destroy `e`. emplace_or_replace
-          // asserts on invalid entities — drop the update silently if it's gone.
-          if (!ecs.valid(e)) {
-            spdlog::debug("Dropping stale component update for destroyed entity {} ({})",
-                          static_cast<int>(e), type_name<ComponentT>());
-            co_return;
-          }
-
-          // Map entity references from remote to local IDs
-          auto component_data = request.component_data;
-          if constexpr (is_hierarchy_component<ComponentT>::value ||
-                        requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); }) {
-            co_await map_entities_async(component_data);
-            // Re-check after the suspension point — entity may have been
-            // destroyed while we were mapping.
-            if (!ecs.valid(e)) {
-              spdlog::debug("Dropping stale component update for destroyed entity {} ({}) after map_entities",
-                            static_cast<int>(e), type_name<ComponentT>());
-              co_return;
-            }
-          }
-
-          // Apply the component update.
-          //
-          // emplace_or_replace synchronously fires dispatch_on_update for T,
-          // which (for non-server_only types) queues T's writeable on_update
-          // observer onto command_channel_. That observer body checks for the
-          // marker (component_update_request<T>) and bails — so the marker
-          // must still be present when the body runs.
-          //
-          // defer/defer_async preserve call order in command_channel_ (see
-          // ecs::defer's contract), so a plain ecs.defer(remove_marker) here
-          // lands BEHIND the just-queued observer body. The historical
-          // double-defer was a workaround for an earlier broken ordering and
-          // is no longer needed — one defer is enough and halves the channel
-          // pressure per inbound update.
-          ecs.template emplace_or_replace<ComponentT>(e, component_data);
-
-          ecs.defer([e](entt_ext::ecs& ecs_ref) {
-            ecs_ref.template remove<component_update_request<ComponentT>>(e);
-          });
-        } catch (std::exception const& ex) {
-          spdlog::error("Error applying component update request: {}", ex.what());
-        } catch (...) {
-          spdlog::error("Error applying component update request: unknown exception");
-        }
-
+    // `this` is consumed by `map_entities_async(...)` below, but only on the
+    // `if constexpr` branch that runs for hierarchy components or types
+    // that opt into entity-id mapping. For ComponentTs where neither
+    // branch fires, the capture would otherwise be flagged unused.
+    (void)this;
+    try {
+      // The marker was placed on a valid entity (see notification handler),
+      // but this body runs from a co_spawned async observer. Between the
+      // marker emplace and here, an entity_destroyed notification or a
+      // snapshot reload (reconnect path) can destroy `e`. emplace_or_replace
+      // asserts on invalid entities — drop the update silently if it's gone.
+      if (!ecs.valid(e)) {
+        spdlog::debug("Dropping stale component update for destroyed entity {} ({})", static_cast<int>(e), type_name<ComponentT>());
         co_return;
-      };
+      }
+
+      // Map entity references from remote to local IDs
+      auto component_data = request.component_data;
+      if constexpr (is_hierarchy_component<ComponentT>::value ||
+                    requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); }) {
+        co_await map_entities_async(component_data);
+        // Re-check after the suspension point — entity may have been
+        // destroyed while we were mapping.
+        if (!ecs.valid(e)) {
+          spdlog::debug("Dropping stale component update for destroyed entity {} ({}) after map_entities",
+                        static_cast<int>(e),
+                        type_name<ComponentT>());
+          co_return;
+        }
+      }
+
+      // Apply the component update.
+      //
+      // emplace_or_replace synchronously fires dispatch_on_update for T,
+      // which (for non-server_only types) queues T's writeable on_update
+      // observer onto command_channel_. That observer body checks for the
+      // marker (component_update_request<T>) and bails — so the marker
+      // must still be present when the body runs.
+      //
+      // defer/defer_async preserve call order in command_channel_ (see
+      // ecs::defer's contract), so a plain ecs.defer(remove_marker) here
+      // lands BEHIND the just-queued observer body. The historical
+      // double-defer was a workaround for an earlier broken ordering and
+      // is no longer needed — one defer is enough and halves the channel
+      // pressure per inbound update.
+      ecs.template emplace_or_replace<ComponentT>(e, component_data);
+
+      ecs.defer([e](entt_ext::ecs& ecs_ref) {
+        ecs_ref.template remove<component_update_request<ComponentT>>(e);
+      });
+    } catch (std::exception const& ex) {
+      spdlog::error("Error applying component update request: {}", ex.what());
+    } catch (...) {
+      spdlog::error("Error applying component update request: unknown exception");
+    }
+
+    co_return;
+  };
   update_request_observer.on_construct(apply_component_update);
   update_request_observer.on_update(apply_component_update);
 
@@ -829,26 +861,25 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
   // apply_component_update above — the marker is placed with emplace_or_replace.
   auto apply_component_remove =
       [this](entt_ext::ecs& ecs, entt_ext::entity e, component_remove_request<ComponentT>& request) -> asio::awaitable<void> {
-        (void)request;
-        try {
-          // Same window as apply_component_update: the entity can be destroyed
-          // between marker emplace and this body running. remove<T> asserts
-          // on invalid entities — drop the request silently if it's gone.
-          if (!ecs.valid(e)) {
-            spdlog::debug("Dropping stale component remove for destroyed entity {} ({})",
-                          static_cast<int>(e), type_name<ComponentT>());
-            co_return;
-          }
-          ecs.template remove<ComponentT>(e);
-          co_await ecs.template remove_deferred<component_remove_request<ComponentT>>(e);
-        } catch (std::exception const& ex) {
-          spdlog::error("Error applying component remove request: {}", ex.what());
-        } catch (...) {
-          spdlog::error("Error applying component remove request: unknown exception");
-        }
-
+    (void)request;
+    try {
+      // Same window as apply_component_update: the entity can be destroyed
+      // between marker emplace and this body running. remove<T> asserts
+      // on invalid entities — drop the request silently if it's gone.
+      if (!ecs.valid(e)) {
+        spdlog::debug("Dropping stale component remove for destroyed entity {} ({})", static_cast<int>(e), type_name<ComponentT>());
         co_return;
-      };
+      }
+      ecs.template remove<ComponentT>(e);
+      co_await ecs.template remove_deferred<component_remove_request<ComponentT>>(e);
+    } catch (std::exception const& ex) {
+      spdlog::error("Error applying component remove request: {}", ex.what());
+    } catch (...) {
+      spdlog::error("Error applying component remove request: unknown exception");
+    }
+
+    co_return;
+  };
   remove_request_observer.on_construct(apply_component_remove);
   remove_request_observer.on_update(apply_component_remove);
 }
@@ -858,8 +889,7 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
 // ============================================================================
 
 template <typename ChannelT, typename... SyncComponentsT>
-asio::awaitable<entity>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::request_server_entity(entity client_entity) {
+asio::awaitable<entity> sync_client_with_channel<ChannelT, SyncComponentsT...>::request_server_entity(entity client_entity) {
   if (!rpc_client_.is_connected() || session_id_.empty()) {
     co_return entt_ext::null;
   }
@@ -942,8 +972,7 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::send_component_to_server
 
 template <typename ChannelT, typename... SyncComponentsT>
 template <typename ComponentT>
-asio::awaitable<void>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::notify_component_removal(entity e, version_type sync_version) {
+asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::notify_component_removal(entity e, version_type sync_version) {
   // Get server entity for this client entity
   auto server_entity = continuous_loader_.map(e);
 
@@ -968,8 +997,8 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::notify_component_removal
 }
 
 template <typename ChannelT, typename... SyncComponentsT>
-asio::awaitable<void>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::notify_entity_destruction_to_server(entity e, version_type sync_version) {
+asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::notify_entity_destruction_to_server(entity       e,
+                                                                                                                  version_type sync_version) {
 
   if (loading_snapshot_) {
     spdlog::debug("Skipping entity destruction notification for client entity {} during snapshot load", static_cast<int>(e));
@@ -1012,8 +1041,7 @@ template <typename ChannelT, typename... SyncComponentsT>
 template <typename ComponentT>
   requires requires(ComponentT& c, continuous_loader_with_mapping<entt::registry> const& l) { c.map_entities(l); } &&
            (!sync::is_hierarchy_component_v<ComponentT>)
-asio::awaitable<void>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::map_entities_async(ComponentT& component) {
+asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::map_entities_async(ComponentT& component) {
   // Create placeholder entities for unmapped server entities so map_entities succeeds
   if constexpr (requires(ComponentT const& c) { c.entity_refs(); }) {
     for (auto remote_entity : component.entity_refs()) {
@@ -1033,19 +1061,30 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::map_entities_async(Compo
 // ============================================================================
 
 template <typename ChannelT, typename... SyncComponentsT>
-asio::awaitable<bool>
-sync_client_with_channel<ChannelT, SyncComponentsT...>::perform_handshake(std::string const& client_name,
-                                                                           std::string const& client_version,
-                                                                           std::string const& username,
-                                                                           std::string const& password) {
+asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::perform_handshake(std::string const& client_name,
+                                                                                                std::string const& client_version,
+                                                                                                std::string const& username,
+                                                                                                std::string const& password) {
   try {
+    // handshake_error_ doubles as the "server actively rejected us" signal
+    // (callers treat non-empty as auth failure, which suppresses auto-retry).
+    // Clear any stale value from a previous attempt before starting.
+    handshake_error_.clear();
+
     handshake_request request{.client_name      = client_name,
                               .client_version   = client_version,
                               .protocol_version = protocol_version_,
                               .username         = username,
-                              .password         = password};
+                              .password         = password,
+                              .device_id        = device_id_};
 
-    auto response = co_await rpc_client_.template invoke<handshake_response>("handshake", std::move(request));
+    // Short timeout: a handshake normally completes in <100 ms. If the
+    // request gets lost in transit (observed: fresh session receives server
+    // broadcasts but the outbound handshake never reaches the server), the
+    // default 30 s call timeout turns into a long "Connecting..." stall.
+    // Failing fast hands control to the auto-retry, which reconnects on a
+    // fresh session and reliably succeeds.
+    auto response = co_await rpc_client_.template invoke_with_timeout<handshake_response>(std::chrono::seconds(30), "handshake", std::move(request));
 
     if (response.success) {
       // Validate protocol version match
@@ -1068,13 +1107,16 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::perform_handshake(std::s
     }
 
   } catch (std::exception const& ex) {
+    // Transport-level failure (timeout, dropped socket) — NOT a server
+    // rejection. Leave handshake_error_ empty so callers classify this as
+    // transient and the auto-retry keeps reconnecting; setting it here used
+    // to flag the attempt as auth_failed and wedge the client on the
+    // connection screen until a manual retry.
     spdlog::error("Handshake exception: {}", ex.what());
-    handshake_error_ = ex.what();
     session_id_.clear();
     co_return false;
   } catch (...) {
     spdlog::error("Handshake unknown exception");
-    handshake_error_ = "Unknown handshake error";
     session_id_.clear();
     co_return false;
   }
@@ -1085,7 +1127,8 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_entity_sync()
   auto& observer = ecs_.component_observer<entt_ext::entity>();
   observer.on_destroy([this](entt_ext::ecs& ecs, entt_ext::entity e) -> asio::awaitable<void> {
     if (continuous_loader_.contains_local(e)) {
-      spdlog::debug("Entity destroyed, notifying server and removing mapping: {}", static_cast<int>(e));
+      spdlog::info("sync_client: local entity {} destroyed (mapped→server {}); will notify server + drop mapping",
+                   static_cast<int>(e), static_cast<int>(continuous_loader_.to_remote(e)));
 
       auto sync_version = std::chrono::steady_clock::now();
 
@@ -1095,8 +1138,7 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_entity_sync()
       // internally but avoids putting it inside the spawned coroutine,
       // where it would race with the synchronous mapping removal below.
       auto server_entity = continuous_loader_.to_remote(e);
-      bool should_notify =
-          !loading_snapshot_ && server_entity != entt_ext::null && rpc_client_.is_connected() && !session_id_.empty();
+      bool should_notify = !loading_snapshot_ && server_entity != entt_ext::null && rpc_client_.is_connected() && !session_id_.empty();
 
       // Remove the mapping synchronously now. The spawned RPC has the
       // server_entity captured by value, so it doesn't depend on the
@@ -1113,12 +1155,13 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_entity_sync()
             [this, e, server_entity, sync_version, sid = std::move(sid)]() -> asio::awaitable<void> {
               try {
                 entity_destroy_request request{.session_id = sid, .server_entity = server_entity, .sync_version = sync_version};
-                auto response = co_await rpc_client_.template invoke<entity_destroy_response>("entity_destroy", std::move(request));
+                auto                   response = co_await rpc_client_.template invoke<entity_destroy_response>("entity_destroy", std::move(request));
                 if (!response.success) {
                   spdlog::error("Entity destruction sync failed: {}", response.error_message);
                 } else {
                   spdlog::debug("Entity destruction notification sent successfully: client={} server={}",
-                                static_cast<int>(e), static_cast<int>(server_entity));
+                                static_cast<int>(e),
+                                static_cast<int>(server_entity));
                 }
               } catch (std::exception const& ex) {
                 spdlog::error("Error notifying entity destruction to server: {} {}", static_cast<int>(e), ex.what());

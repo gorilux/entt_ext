@@ -810,6 +810,22 @@ public:
   template <typename Type, typename... Func>
   auto patch_async(const entity_type entt, Func&&... func) -> asio::awaitable<void>;
 
+  // Create an entity on the main thread and resume the caller with it. Use
+  // from a concurrent coroutine instead of create_deferred when you need the
+  // new entity id back.
+  auto create_async() -> asio::awaitable<entity_type>;
+
+  // Run an arbitrary callable on the main thread — the only place registry
+  // access (view iteration, get, create, emplace, …) is safe — and resume the
+  // caller with its return value. The callable receives `ecs&` and runs to
+  // completion while the awaiting coroutine is suspended, so it may safely
+  // capture the caller's locals by reference. Return by VALUE (never a
+  // reference/pointer into the registry — that would dangle once the caller
+  // resumes off-thread). This is the primitive that lets concurrent coroutines
+  // (RPC handlers, transfer workers) touch the registry without racing it.
+  template <typename Func>
+  auto run_async(Func&& func) -> asio::awaitable<std::invoke_result_t<Func, ecs&>>;
+
   template <typename... ComponentsT, typename... ExcludeT>
   auto system(entt::exclude_t<ExcludeT...>) -> system_builder<entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>;
 
@@ -1358,6 +1374,40 @@ inline auto ecs::patch_async(const entity_type entt, Func&&... func) -> asio::aw
         });
       },
       asio::use_awaitable);
+}
+
+inline auto ecs::create_async() -> asio::awaitable<entity_type> {
+  co_return co_await asio::async_initiate<decltype(asio::use_awaitable), void(entity_type)>(
+      [this](auto handler) mutable {
+        asio::post(main_io_context(), [this, handler = std::move(handler)]() mutable {
+          std::move(handler)(create());
+        });
+      },
+      asio::use_awaitable);
+}
+
+template <typename Func>
+inline auto ecs::run_async(Func&& func) -> asio::awaitable<std::invoke_result_t<Func, ecs&>> {
+  using result_t = std::invoke_result_t<Func, ecs&>;
+  if constexpr (std::is_void_v<result_t>) {
+    co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
+        [this, func = std::forward<Func>(func)](auto handler) mutable {
+          asio::post(main_io_context(), [this, func = std::move(func), handler = std::move(handler)]() mutable {
+            func(*this);
+            std::move(handler)();
+          });
+        },
+        asio::use_awaitable);
+    co_return;
+  } else {
+    co_return co_await asio::async_initiate<decltype(asio::use_awaitable), void(result_t)>(
+        [this, func = std::forward<Func>(func)](auto handler) mutable {
+          asio::post(main_io_context(), [this, func = std::move(func), handler = std::move(handler)]() mutable {
+            std::move(handler)(func(*this));
+          });
+        },
+        asio::use_awaitable);
+  }
 }
 
 } // namespace entt_ext

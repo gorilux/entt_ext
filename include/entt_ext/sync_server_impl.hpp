@@ -113,10 +113,16 @@ template <typename ChannelT, typename... SyncComponentsT>
 asio::awaitable<handshake_response>
 sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_handshake_request(handshake_request const& request) {
   try {
+    spdlog::info("sync_server::handshake: request from user='{}' client='{}' v{} protocol='{}'",
+                 request.username.empty() ? "anonymous" : request.username,
+                 request.client_name.empty() ? "unknown" : request.client_name,
+                 request.client_version.empty() ? "unknown" : request.client_version,
+                 request.protocol_version.empty() ? "(none)" : request.protocol_version);
+
     // Validate protocol version
     if (!request.protocol_version.empty() && request.protocol_version != protocol_version_) {
       std::string error_msg = "Protocol version mismatch! Server: " + protocol_version_ + ", Client: " + request.protocol_version;
-      spdlog::error("{}", error_msg);
+      spdlog::error("sync_server::handshake: {}", error_msg);
       co_return handshake_response{.success          = false,
                                    .session_id       = "",
                                    .error_message    = error_msg,
@@ -130,7 +136,7 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_handshake_request
     if (auth_handler_) {
       auto auth_result = auth_handler_(request);
       if (!auth_result.success) {
-        spdlog::warn("Authentication failed for user '{}': {}",
+        spdlog::warn("sync_server::handshake: authentication failed for user '{}': {}",
                      request.username, auth_result.error_message);
         auth_result.protocol_version = protocol_version_;
         auth_result.server_timestamp = std::chrono::steady_clock::now();
@@ -154,6 +160,16 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_handshake_request
       ctx->set_logical_session_id(session_id);
     }
 
+    // Bind the client's stable device_id to this session now that auth has
+    // succeeded (we only reach this point past the auth gate above). From here
+    // on, application handlers read current_call_context()->logical_device_id to
+    // authorize per-share access against peer_acl, instead of trusting a
+    // per-request device_id field that any authenticated caller could forge.
+    if (auto const* ctx = grlx::rpc::current_call_context();
+        ctx != nullptr && ctx->set_logical_device_id) {
+      ctx->set_logical_device_id(request.device_id);
+    }
+
     // Create client state for this session and stamp the multi-tenant
     // identity from the auth result so the snapshot + notification
     // filters can use it later (see docs/multi_tenant.md).
@@ -161,9 +177,10 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_handshake_request
     client_state.user_id  = request.username;
     client_state.role     = auth_role;
 
-    spdlog::info("Client connected - Name: {}, User: {}, Version: {}, Session: {}",
+    spdlog::info("sync_server::handshake: client connected - Name: {}, User: {}, Role: {}, Version: {}, Session: {}",
                  request.client_name.empty() ? "unknown" : request.client_name,
                  request.username.empty() ? "anonymous" : request.username,
+                 auth_role,
                  request.client_version.empty() ? "unknown" : request.client_version,
                  session_id);
 
@@ -176,6 +193,8 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_handshake_request
                                  .auth_token       = auth_token};
 
   } catch (std::exception const& ex) {
+    spdlog::error("sync_server::handshake: failed for user='{}' — {}",
+                  request.username.empty() ? "anonymous" : request.username, ex.what());
     co_return handshake_response{.success          = false,
                                  .session_id       = "",
                                  .error_message    = std::string("Handshake failed: ") + ex.what(),

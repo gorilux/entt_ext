@@ -114,6 +114,20 @@ asio::awaitable<bool> save(std::string const& filename, entt_ext::ecs const& ecs
   co_return true;
 }
 
+// Serialize the snapshot into a caller-provided stream instead of a file. The
+// registry read still hops to the main thread internally (save_snapshot posts
+// there), but with an in-memory stream the only main-thread cost is the cereal
+// serialize — no blocking disk I/O. The caller can then write the buffer off the
+// main thread. The archive is a local, so it is flushed when this coroutine's
+// frame is destroyed (i.e. by the time the co_await on it completes).
+template <typename SettingsCollectionT>
+asio::awaitable<void> save_to_stream(std::ostream& os, entt_ext::ecs const& ecs) {
+  OutputArchiveType archive(os);
+  settings_header   header{.version = SettingsCollectionT::latest_version};
+  archive(header);
+  co_await SettingsCollectionT::save(header.version, archive, ecs);
+}
+
 template <typename SettingsCollectionT>
 asio::awaitable<entt_ext::ecs> load(std::string const& filename) {
 

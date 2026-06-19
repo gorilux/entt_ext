@@ -22,6 +22,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -91,23 +92,31 @@ public:
     session_id_.clear(); // Clear session on disconnect
 
     if (clear_mapping) {
-      // Snapshot first, then clear the maps, *then* destroy. The component
-      // and entity on_destroy observers consult continuous_loader_ /
-      // loading_snapshot_ to decide whether to send removal RPCs; with
-      // maps already empty and the suppression flag set, both short-circuit
-      // — which is what we want, since we're already disconnected.
-      auto locals = continuous_loader_.local_entities();
-      continuous_loader_.clear_mappings();
+      // This block destroys registry entities and toggles the observer-mute /
+      // loading_snapshot_ flags — all of which MUST run on the main
+      // command-channel thread. disconnect() is co_awaited from POOL system
+      // bodies (health-check / app-foreground / user-disconnect), so doing the
+      // destroy loop inline raced the main loop's registry access. Hop to main.
+      //
+      // Snapshot first, then clear the maps, *then* destroy. The component and
+      // entity on_destroy observers consult continuous_loader_ /
+      // loading_snapshot_ to decide whether to send removal RPCs; with maps
+      // already empty and the suppression flag set, both short-circuit — which
+      // is what we want, since we're already disconnected.
+      co_await ecs_.run_async([this](entt_ext::ecs& ecs) {
+        auto locals = continuous_loader_.local_entities();
+        continuous_loader_.clear_mappings();
 
-      loading_snapshot_ = true;
-      ecs_.set_async_observers_muted(true);
-      for (auto e : locals) {
-        if (ecs_.valid(e)) {
-          ecs_.destroy(e);
+        loading_snapshot_ = true;
+        ecs.set_async_observers_muted(true);
+        for (auto e : locals) {
+          if (ecs.valid(e)) {
+            ecs.destroy(e);
+          }
         }
-      }
-      ecs_.set_async_observers_muted(false);
-      loading_snapshot_ = false;
+        ecs.set_async_observers_muted(false);
+        loading_snapshot_ = false;
+      });
     }
 
     co_return;
@@ -245,6 +254,12 @@ public:
 
   template <typename ComponentT>
   asio::awaitable<void> reconcile_updates_for();
+
+  // Stable per-install device id, sent in the handshake so the server binds it
+  // to this session and can authorize per-share access (peer_acl) against the
+  // authenticated device rather than a forgeable per-request field. Set by the
+  // app before connect(); empty if the app doesn't use device identity.
+  void set_device_id(std::string id) { device_id_ = std::move(id); }
 
 private:
   // Set up notification handlers for real-time sync updates
@@ -447,7 +462,11 @@ private:
   std::string                                    handshake_error_;  // Last handshake error message
   int                                            auth_role_ = 0;    // Role from auth (0=user, 1=admin)
   std::string                                    auth_token_;       // Auth token from handshake
-  bool                                           loading_snapshot_ = false;
+  // Atomic: written from the main command-channel thread (snapshot-ingest
+  // defer bodies, disconnect's main-hopped teardown) AND from the POOL in
+  // apply_sync_response's catch path. A plain bool there was a data race.
+  std::atomic<bool>                              loading_snapshot_{false};
+  std::string                                    device_id_;        // sent in the handshake; bound to the session for ACL
 };
 
 // Backward-compatible alias — preserves `sync_client<Components...>` for
