@@ -520,6 +520,15 @@ public:
   using auth_handler_type = std::function<handshake_response(handshake_request const&)>;
   void set_auth_handler(auth_handler_type handler) { auth_handler_ = std::move(handler); }
 
+  // WI-4 (fail-closed handshake): when NO auth handler is installed the
+  // handshake is rejected by default. An app that deliberately runs without
+  // authentication — e.g. a 127.0.0.1-only loopback control server — must
+  // consciously opt in here, which grants the single local peer an admin
+  // session. NEVER enable this on a listener reachable from an untrusted
+  // network: it turns the server into an open door.
+  void set_allow_anonymous(bool v) { allow_anonymous_ = v; }
+  bool get_allow_anonymous() const noexcept { return allow_anonymous_; }
+
 private:
   // Declaration order matches the constructor initializer list; C++ initializes
   // members in declaration order regardless of the list, so these must agree.
@@ -531,6 +540,7 @@ private:
   bool                                               applying_client_changes_ = false; // Flag to prevent sync loops
   auth_handler_type                                  auth_handler_;                    // Optional authentication handler
   std::chrono::milliseconds                          client_idle_timeout_     = std::chrono::minutes(15); // Stale-state eviction threshold
+  bool                                               allow_anonymous_         = false;  // WI-4: opt-in anonymous handshake (loopback/trusted only)
 };
 
 // Backward-compatible alias: historical `sync_server<Components...>` usage

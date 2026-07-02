@@ -20,11 +20,17 @@
 #include <cereal/archives/portable_binary.hpp>
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/strand.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace entt_ext::sync {
@@ -467,6 +473,28 @@ private:
   // apply_sync_response's catch path. A plain bool there was a data race.
   std::atomic<bool>                              loading_snapshot_{false};
   std::string                                    device_id_;        // sent in the handshake; bound to the session for ACL
+
+  // Single-flight coalescing for entity_create, keyed by client entity. When a
+  // freshly created client entity carries several synced components, each
+  // component's send path calls request_server_entity() before any reply
+  // lands; without coalescing they would each issue an entity_create RPC and
+  // the server would mint a separate server entity per component, scattering
+  // the entity's components across several server entities. The first caller
+  // (leader) issues the one RPC and records the mapping; concurrent callers
+  // (followers) wait on a per-entity event and read the mapping once it wakes.
+  //
+  // Leader-election is serialized on a dedicated strand rather than a mutex:
+  // the strand orders the inflight-map check/insert without an OS lock and
+  // makes "held across a co_await" impossible by construction (the RPC await
+  // releases it). Mirrors grlx-rpc's sessions_strand_. The per-entity "event"
+  // is a steady_timer parked at time_point::max(); the leader cancel()s it to
+  // wake every follower at once. Because all of its operations (the followers'
+  // async_wait and the leader's cancel) run on the strand, a plain timer is
+  // safe here — no thread-safe channel needed. The strand runs on the
+  // concurrent pool's executor, where every send coroutine already lives.
+  using entity_create_event = asio::steady_timer;
+  asio::strand<asio::io_context::executor_type>                   entity_create_strand_;
+  std::unordered_map<entity, std::shared_ptr<entity_create_event>> entity_create_inflight_;
 };
 
 // Backward-compatible alias — preserves `sync_client<Components...>` for

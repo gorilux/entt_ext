@@ -18,6 +18,9 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -179,6 +182,42 @@ inline bool verify(std::string const& stored,
 // should be upgraded on the next successful login.
 inline bool needs_rehash(std::string const& stored) {
   return !detail::starts_with(stored, "pbkdf2$");
+}
+
+// Generate a random, human-typeable one-time password from the CSPRNG. Uses a
+// 32-symbol alphabet with the ambiguous glyphs removed (no 0/O, 1/I) so it can
+// be read off a console and typed once. 256 is divisible by 32, so `byte % 32`
+// is unbiased. `length` symbols ⇒ length*5 bits of entropy (default 24 ⇒ 120).
+inline std::string generate_random_password(std::size_t length = 24) {
+  static constexpr char kAlphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 32 chars, no 0/O/1/I
+  std::vector<unsigned char> buf(length);
+  if (RAND_bytes(buf.data(), static_cast<int>(length)) != 1) {
+    throw std::runtime_error("RAND_bytes failed");
+  }
+  std::string out;
+  out.reserve(length);
+  for (unsigned char c : buf) out.push_back(kAlphabet[c % 32]);
+  return out;
+}
+
+// Write a secret (e.g. a generated bootstrap password) to `path`, creating it
+// with mode 0600 ATOMICALLY (permissions applied at open, so there is no
+// world-readable window as a create-then-chmod would have). Returns false on
+// any I/O failure. Server-side only; harmless if this header is included on a
+// client that never calls it.
+inline bool write_secret_file(std::string const& path, std::string const& contents) {
+  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) return false;
+  std::string const data = contents + "\n";
+  std::size_t        off = 0;
+  bool               ok  = true;
+  while (off < data.size()) {
+    ssize_t n = ::write(fd, data.data() + off, data.size() - off);
+    if (n <= 0) { ok = false; break; }
+    off += static_cast<std::size_t>(n);
+  }
+  ::close(fd);
+  return ok;
 }
 
 } // namespace entt_ext::sync::password

@@ -41,12 +41,17 @@ public:
   struct config {
     login_rate_limiter::config rate_limit{};
     token_store::config        tokens{};
-    // Optional bootstrap admin. Created with the given password if no
-    // user_account components exist after deserialization. Username
-    // empty disables bootstrap (apps that prefer to seed users out of
-    // band).
+    // Optional bootstrap admin, created iff no user_account exists after
+    // deserialization. Empty username disables bootstrap (seed out of band).
     std::string bootstrap_admin_username = "admin";
-    std::string bootstrap_admin_password = "admin";
+    // Bootstrap password. EMPTY (the default) => generate a random one-time
+    // password at first boot and write it to bootstrap_password_out_path
+    // (mode 0600). Never ship a fixed default here (WI-5) — a known password on
+    // an internet-reachable server is equivalent to no password.
+    std::string bootstrap_admin_password = "";
+    // Where a generated random bootstrap password is written (mode 0600).
+    // Relative to the server's working directory by default.
+    std::string bootstrap_password_out_path = "initial-admin-password.txt";
   };
 
   explicit auth_module(ecs& e)
@@ -154,14 +159,35 @@ public:
       return;
     }
 
-    auto hash = password::hash(cfg_.bootstrap_admin_password);
+    // WI-5: never seed a KNOWN password. An empty configured password means
+    // "generate a random one-time password and write it out (0600)"; only an
+    // explicitly-configured password is used verbatim.
+    std::string password  = cfg_.bootstrap_admin_password;
+    bool const  generated = password.empty();
+    if (generated) {
+      password = password::generate_random_password();
+    }
+
+    auto hash = password::hash(password);
     auto e    = ecs_.create();
     ecs_.emplace<user_account>(e,
                                user_account{.username      = cfg_.bootstrap_admin_username,
                                             .password_hash = hash,
                                             .salt          = "",
                                             .role          = user_role::admin});
-    spdlog::info("auth: created bootstrap admin '{}'", cfg_.bootstrap_admin_username);
+
+    if (!generated) {
+      spdlog::info("auth: created bootstrap admin '{}' (configured password)", cfg_.bootstrap_admin_username);
+    } else if (password::write_secret_file(cfg_.bootstrap_password_out_path, password)) {
+      spdlog::warn("auth: created bootstrap admin '{}' with a RANDOM initial password written to '{}' "
+                   "(mode 0600) — read it, log in, and change it",
+                   cfg_.bootstrap_admin_username, cfg_.bootstrap_password_out_path);
+    } else {
+      // Falling back to the log is worse than a 0600 file but far better than
+      // hiding the only credential for the new admin account.
+      spdlog::warn("auth: created bootstrap admin '{}'; could NOT write '{}' — initial password is: {}",
+                   cfg_.bootstrap_admin_username, cfg_.bootstrap_password_out_path, password);
+    }
   }
 
   // De-duplicate user_account entities. Old init-order bugs could

@@ -16,6 +16,8 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <stdexcept>
+#include <string>
 
 namespace entt_ext {
 struct settings_header {
@@ -62,13 +64,30 @@ struct settings_collection {
 
   constexpr static int latest_version = sizeof...(SettingsT) + base_version - 1;
 
+  // Map a snapshot's stored version onto the model table index, bounds-checked.
+  // header.version is read raw from disk; a corrupt field or a file written by a
+  // newer build (then opened by an older one) would otherwise index the function
+  // table out of range — an out-of-bounds read of a function pointer that is
+  // then called (UB), which the std::exception catch around load/merge would NOT
+  // intercept. Throwing here routes such files through that catch (e.g. the
+  // .bak-rename fallback) instead.
+  static int model_index(int version) {
+    int const idx = version - base_version;
+    if (idx < 0 || idx >= static_cast<int>(sizeof...(SettingsT))) {
+      throw std::runtime_error("settings_collection: snapshot version " + std::to_string(version)
+                               + " out of range [" + std::to_string(base_version) + ", "
+                               + std::to_string(latest_version) + "]");
+    }
+    return idx;
+  }
+
   template <typename ArchiveT>
   static asio::awaitable<void> load(int version, ArchiveT& archive, entt_ext::ecs& ecs) {
 
     using fptr = asio::awaitable<void> (*)(ArchiveT&, entt_ext::ecs&);
 
     static constexpr fptr table[] = {SettingsT::load...};
-    co_await table[version - base_version](archive, ecs);
+    co_await table[model_index(version)](archive, ecs);
 
     co_return;
   }
@@ -79,7 +98,7 @@ struct settings_collection {
     using fptr = asio::awaitable<void> (*)(ArchiveT&, entt_ext::ecs const&);
 
     static constexpr fptr table[] = {SettingsT::save...};
-    co_await table[version - base_version](archive, ecs);
+    co_await table[model_index(version)](archive, ecs);
 
     co_return;
   }
@@ -91,7 +110,7 @@ struct settings_collection {
 
     static constexpr fptr table[] = {SettingsT::merge...};
 
-    co_return co_await table[version - base_version](archive, ecs);
+    co_return co_await table[model_index(version)](archive, ecs);
   }
 };
 

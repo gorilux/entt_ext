@@ -49,15 +49,31 @@ template <typename ChannelT, typename... SyncComponentsT>
 asio::awaitable<entity_create_response>
 sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_entity_create(entity_create_request const& request) {
   try {
+    // WI-1: require an authenticated session before allocating anything.
+    auto const* requester = lookup_session_identity(request.session_id);
+    if (requester == nullptr) {
+      co_return entity_create_response{.success = false, .server_entity = entt_ext::null, .error_message = "Not authorized"};
+    }
     touch_session(request.session_id);
 
     // Create new server entity
     entity server_entity = ecs_.create();
 
-    spdlog::info("Created server entity {} for client entity {} (session {})",
+    // WI-2: stamp ownership so the creator (and admins) can later mutate or
+    // destroy it while other tenants cannot. Server-created shared entities
+    // go through create_server_entity() instead and stay unowned (visible to
+    // every authenticated tenant). A trusted-anonymous peer has an empty
+    // user_id and role=admin, so its entities stay unowned (still fully
+    // visible/mutable to it via the admin bypass).
+    if (!requester->user_id.empty()) {
+      ecs_.template emplace<owner>(server_entity, owner{requester->user_id});
+    }
+
+    spdlog::info("Created server entity {} for client entity {} (session {}, user '{}')",
                  static_cast<int>(server_entity),
                  static_cast<int>(request.client_entity),
-                 request.session_id);
+                 request.session_id,
+                 requester->user_id);
 
     co_return entity_create_response{.success = true, .server_entity = server_entity, .error_message = ""};
 
@@ -71,6 +87,11 @@ template <typename ChannelT, typename... SyncComponentsT>
 asio::awaitable<entity_destroy_response>
 sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_entity_destroy(entity_destroy_request const& request) {
   try {
+    // WI-1: require an authenticated session.
+    auto const* requester = lookup_session_identity(request.session_id);
+    if (requester == nullptr) {
+      co_return entity_destroy_response{.success = false, .error_message = "Not authorized"};
+    }
     touch_session(request.session_id);
 
     entity server_entity = request.server_entity;
@@ -85,6 +106,25 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_entity_destroy(en
       std::string error_msg = "Server entity does not exist";
       spdlog::warn("{}: {}", error_msg, static_cast<int>(server_entity));
       co_return entity_destroy_response{.success = false, .error_message = error_msg};
+    }
+
+    // WI-2: only the owner or an admin may destroy an entity. Unowned
+    // entities are shared server resources — destroyable by admins only,
+    // never by a regular user walking entity ids (1,2,3,…) to wipe state.
+    {
+      bool const is_admin = requester->role == 1;
+      if (auto* o = ecs_.template try_get<owner>(server_entity)) {
+        bool const is_owner = !requester->user_id.empty() && o->user_id == requester->user_id;
+        if (!is_admin && !is_owner) {
+          spdlog::warn("Multi-tenant: rejecting destroy of entity {} owned by '{}' from session {} (user '{}')",
+                       static_cast<int>(server_entity), o->user_id, request.session_id, requester->user_id);
+          co_return entity_destroy_response{.success = false, .error_message = "Not authorized"};
+        }
+      } else if (!is_admin) {
+        spdlog::warn("Multi-tenant: rejecting destroy of shared entity {} from non-admin session {} (user '{}')",
+                     static_cast<int>(server_entity), request.session_id, requester->user_id);
+        co_return entity_destroy_response{.success = false, .error_message = "Not authorized"};
+      }
     }
 
     // Notify other clients about the entity destruction before destroying it
@@ -130,7 +170,12 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_handshake_request
                                    .server_timestamp = std::chrono::steady_clock::now()};
     }
 
-    // Run authentication if handler is set
+    // Run authentication. When NO handler is installed the handshake fails
+    // CLOSED (WI-4) unless the app consciously opted into anonymous mode via
+    // set_allow_anonymous(true) — reserved for 127.0.0.1-only / trusted
+    // listeners, where the single local peer is treated as an admin. A
+    // missing handler must never silently mint an anonymous role-0 session
+    // on a network-facing server.
     int         auth_role  = 0;
     std::string auth_token;
     if (auth_handler_) {
@@ -144,6 +189,16 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_handshake_request
       }
       auth_role  = auth_result.role;
       auth_token = auth_result.auth_token;
+    } else if (allow_anonymous_) {
+      auth_role = 1; // trusted local peer == admin on this instance
+    } else {
+      spdlog::error("sync_server::handshake: REJECTED — no auth handler installed "
+                    "(install one, or set_allow_anonymous(true) for a trusted loopback listener)");
+      co_return handshake_response{.success          = false,
+                                   .session_id       = "",
+                                   .error_message    = "Server not accepting connections",
+                                   .protocol_version = protocol_version_,
+                                   .server_timestamp = std::chrono::steady_clock::now()};
     }
 
     // Generate unique session ID
@@ -168,6 +223,16 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_handshake_request
     if (auto const* ctx = grlx::rpc::current_call_context();
         ctx != nullptr && ctx->set_logical_device_id) {
       ctx->set_logical_device_id(request.device_id);
+    }
+
+    // WI-3: stamp the authenticated role onto the session so the dispatch
+    // auth_callback can enforce visibility::authenticated/admin on every
+    // subsequent RPC. Until this runs the session's logical_role is -1
+    // (unauthenticated) and the callback denies non-public methods — which is
+    // exactly why "handshake" itself is registered visibility::public_.
+    if (auto const* ctx = grlx::rpc::current_call_context();
+        ctx != nullptr && ctx->set_logical_role) {
+      ctx->set_logical_role(auth_role);
     }
 
     // Create client state for this session and stamp the multi-tenant
@@ -210,6 +275,14 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_sync_request(sync
   std::string const& client_id = request.session_id;
   if (client_id.empty()) {
     // Return empty response for invalid session
+    co_return sync_response{.server_timestamp = std::chrono::steady_clock::now(), .snapshot_data = {}};
+  }
+
+  // WI-1: only a session minted by a successful handshake may read state.
+  // Never fabricate anonymous role-0 state from a client-supplied id — an
+  // unknown/forged session_id is rejected (empty snapshot) rather than
+  // welcomed with a full copy of every unowned entity.
+  if (lookup_session_identity(client_id) == nullptr) {
     co_return sync_response{.server_timestamp = std::chrono::steady_clock::now(), .snapshot_data = {}};
   }
 
@@ -294,6 +367,11 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_component_update(
     // the same as a non-owner non-admin: reject. The client should react
     // by re-handshaking; for now it just sees the failure.
     auto const* requester = lookup_session_identity(request.session_id);
+    // WI-1: an unknown/forged session (never handshook, or evicted) is not
+    // authorized to write anything — reject before touching the registry.
+    if (requester == nullptr) {
+      co_return component_update_response<ComponentT>{.success = false, .error_message = "Not authorized"};
+    }
     if (auto* existing = ecs_.template try_get<owner>(server_entity)) {
       bool const is_admin   = requester != nullptr && requester->role == 1;
       bool const is_owner   = requester != nullptr && existing->user_id == requester->user_id;
@@ -332,6 +410,11 @@ template <typename ComponentT>
 asio::awaitable<component_remove_response<ComponentT>>
 sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_component_remove(component_remove_request<ComponentT> const& request) {
   try {
+    // WI-1: require an authenticated session.
+    auto const* requester = lookup_session_identity(request.session_id);
+    if (requester == nullptr) {
+      co_return component_remove_response<ComponentT>{.success = false, .error_message = "Not authorized"};
+    }
     touch_session(request.session_id);
 
     // target_entity is always the server entity
@@ -342,6 +425,17 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_component_remove(
     // Validate server entity exists
     if (!ecs_.valid(server_entity)) {
       co_return component_remove_response<ComponentT>{.success = false, .error_message = "Server entity does not exist"};
+    }
+
+    // WI-2: same ownership rule as component update — the owner, an admin, or
+    // an unowned (shared) entity may be modified; another tenant's entity may not.
+    if (auto* o = ecs_.template try_get<owner>(server_entity)) {
+      bool const is_admin   = requester->role == 1;
+      bool const is_owner   = !requester->user_id.empty() && o->user_id == requester->user_id;
+      bool const is_unowned = o->user_id.empty();
+      if (!is_admin && !is_owner && !is_unowned) {
+        co_return component_remove_response<ComponentT>{.success = false, .error_message = "Not authorized"};
+      }
     }
 
     spdlog::debug("Removing component {} from server entity: {}", type_name<ComponentT>(), static_cast<int>(server_entity));
@@ -862,8 +956,14 @@ void sync_server_with_channel<ChannelT, SyncComponentsT...>::save_component_and_
 
 template <typename ChannelT, typename... SyncComponentsT>
 void sync_server_with_channel<ChannelT, SyncComponentsT...>::setup_rpc_endpoints(entt_ext::ecs& ecs) {
-  // Register handshake endpoint (no session context needed for handshake)
-  rpc_server_.attach("handshake", [this](handshake_request const& request) -> asio::awaitable<handshake_response> {
+  // Register handshake endpoint. WI-3: this is the ONE endpoint that must run
+  // pre-authentication (it is how a peer authenticates), so it is public_ — the
+  // dispatch auth_callback is skipped for it. Every other endpoint below stays
+  // visibility::authenticated (the attach default), so once the callback is
+  // installed it denies them until this handshake has stamped an authenticated
+  // role onto the session.
+  rpc_server_.attach("handshake", grlx::rpc::visibility::public_,
+                     [this](handshake_request const& request) -> asio::awaitable<handshake_response> {
     co_return co_await handle_handshake_request(request);
   });
 

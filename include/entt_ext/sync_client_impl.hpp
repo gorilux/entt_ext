@@ -34,7 +34,8 @@ sync_client_with_channel<ChannelT, SyncComponentsT...>::sync_client_with_channel
   , protocol_version_(sync_component_list<SyncComponentsT...>::generate_protocol_version())
   //, protocol_version_("sync_v1_")
   , continuous_loader_(ecs_.registry())
-  , rpc_client_(std::forward<ChannelArgs>(channel_args)...) {
+  , rpc_client_(std::forward<ChannelArgs>(channel_args)...)
+  , entity_create_strand_(asio::make_strand(ecs_.concurrent_io_context().get_executor())) {
 
   // Initialize sync state if not present
   if (!ecs_.template contains<sync_state>()) {
@@ -438,36 +439,60 @@ asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::re
     // server_only<T> components are never written by the client.
     co_return;
   } else {
-    // Snapshot the entity list — the inner send_component_to_server
-    // mutates the registry (mapping update + marker removal) and we
-    // can't iterate a view through that.
-    std::vector<entity> targets;
-    for (auto e : ecs_.template view<pending_create<ActualT>>()) {
-      targets.push_back(e);
-    }
-
-    for (auto e : targets) {
-      if (!ecs_.valid(e)) {
-        continue;
+    // Registry access (view / try_get / remove) MUST run on the main thread.
+    // This reconcile runs inside the connect coroutine, which executes on the
+    // concurrent_io_context; touching the registry here races the main loop's
+    // systems (e.g. the startup `deserialize` snapshot load) over entt's
+    // component-pool map. TSan flags it as a data race on
+    // dense_map<type_id, sparse_set> (concurrent assure/find), and on Android
+    // NDK/scudo the corrupted map surfaces as a heap-corruption crash-loop
+    // (reportInvalidChunkState) the instant the daemon auto-connects. So:
+    // snapshot the pending entities + their component values on the main thread,
+    // do the network I/O off-thread, then remove the markers back on main.
+    struct create_batch {
+      std::vector<std::pair<entity, ActualT>> items;
+      bool                                    removed_stale = false;
+    };
+    auto batch = co_await ecs_.run_async([](entt_ext::ecs& ecs) {
+      create_batch b;
+      for (auto e : ecs.template view<pending_create<ActualT>>()) {
+        if (auto* component = ecs.template try_get<ActualT>(e)) {
+          b.items.emplace_back(e, *component);
+        } else {
+          // Component was removed locally between observer and reconcile;
+          // drop the now-stale marker.
+          ecs.template remove<pending_create<ActualT>>(e);
+          b.removed_stale = true;
+        }
       }
-      auto* component = ecs_.template try_get<ActualT>(e);
-      if (component == nullptr) {
-        // Component was removed locally between observer and reconcile;
-        // drop the now-stale marker and move on.
-        ecs_.template remove<pending_create<ActualT>>(e);
-        progress = true;
-        continue;
-      }
+      return b;
+    });
 
+    std::vector<entity> sent;
+    for (auto& [e, component] : batch.items) {
       try {
-        co_await send_component_to_server<ActualT>(e, *component, std::chrono::steady_clock::now());
-        ecs_.template remove<pending_create<ActualT>>(e);
-        progress = true;
+        co_await send_component_to_server<ActualT>(e, component, std::chrono::steady_clock::now());
+        sent.push_back(e);
       } catch (std::exception const& ex) {
         spdlog::warn("[reconcile] create failed for {} entity {}: {}", type_name<ActualT>(), static_cast<int>(e), ex.what());
       } catch (...) {
         spdlog::warn("[reconcile] create failed for {} entity {}: unknown", type_name<ActualT>(), static_cast<int>(e));
       }
+    }
+
+    if (!sent.empty()) {
+      co_await ecs_.run_async([sent = std::move(sent)](entt_ext::ecs& ecs) {
+        for (auto e : sent) {
+          if (ecs.valid(e)) {
+            ecs.template remove<pending_create<ActualT>>(e);
+          }
+        }
+        return 0;
+      });
+      progress = true;
+    }
+    if (batch.removed_stale) {
+      progress = true;
     }
   }
   co_return;
@@ -482,29 +507,43 @@ asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::re
   if constexpr (read_only) {
     co_return;
   } else {
-    std::vector<entity> targets;
-    for (auto e : ecs_.template view<pending_update<ActualT>>()) {
-      targets.push_back(e);
-    }
-
-    for (auto e : targets) {
-      if (!ecs_.valid(e)) {
-        continue;
+    // Same threading rule as reconcile_creates_for: iterate/mutate the registry
+    // only on the main thread (this runs on the concurrent_io_context and would
+    // otherwise race the main loop over entt's component-pool map). Snapshot on
+    // main, send off-thread, remove markers back on main.
+    auto items = co_await ecs_.run_async([](entt_ext::ecs& ecs) {
+      std::vector<std::pair<entity, ActualT>> out;
+      for (auto e : ecs.template view<pending_update<ActualT>>()) {
+        if (auto* component = ecs.template try_get<ActualT>(e)) {
+          out.emplace_back(e, *component);
+        } else {
+          ecs.template remove<pending_update<ActualT>>(e);
+        }
       }
-      auto* component = ecs_.template try_get<ActualT>(e);
-      if (component == nullptr) {
-        ecs_.template remove<pending_update<ActualT>>(e);
-        continue;
-      }
+      return out;
+    });
 
+    std::vector<entity> sent;
+    for (auto& [e, component] : items) {
       try {
-        co_await send_component_to_server<ActualT>(e, *component, std::chrono::steady_clock::now());
-        ecs_.template remove<pending_update<ActualT>>(e);
+        co_await send_component_to_server<ActualT>(e, component, std::chrono::steady_clock::now());
+        sent.push_back(e);
       } catch (std::exception const& ex) {
         spdlog::warn("[reconcile] update failed for {} entity {}: {}", type_name<ActualT>(), static_cast<int>(e), ex.what());
       } catch (...) {
         spdlog::warn("[reconcile] update failed for {} entity {}: unknown", type_name<ActualT>(), static_cast<int>(e));
       }
+    }
+
+    if (!sent.empty()) {
+      co_await ecs_.run_async([sent = std::move(sent)](entt_ext::ecs& ecs) {
+        for (auto e : sent) {
+          if (ecs.valid(e)) {
+            ecs.template remove<pending_update<ActualT>>(e);
+          }
+        }
+        return 0;
+      });
     }
   }
   co_return;
@@ -894,26 +933,75 @@ asio::awaitable<entity> sync_client_with_channel<ChannelT, SyncComponentsT...>::
     co_return entt_ext::null;
   }
 
+  // Single-flight: coalesce concurrent requests for the SAME client entity so
+  // exactly one entity_create RPC is issued. Several synced components emplaced
+  // on one fresh entity each reach here before any reply lands; without this
+  // each would mint a distinct server entity and the entity's components would
+  // scatter across them.
+  //
+  // Leader-election runs on entity_create_strand_: hopping onto it serializes
+  // the inflight-map check/insert without a lock, and the RPC co_await below
+  // releases the strand so followers register while the leader waits. The
+  // in-flight entry is a steady_timer parked at time_point::max(); the leader
+  // cancel()s it to wake every follower, which then read the mapping the leader
+  // recorded. Only the inflight map + timer need the strand — and because every
+  // timer op (the followers' async_wait, the leader's cancel) runs on it, the
+  // plain timer is safe without any extra synchronization; the continuous_loader
+  // has its own internal mutex.
+  co_await asio::dispatch(entity_create_strand_, asio::use_awaitable);
+
+  // --- on entity_create_strand_: synchronous critical section, no co_await ---
+  // Another caller may already have established the mapping.
+  if (auto existing = continuous_loader_.to_remote(client_entity); existing != entt_ext::null) {
+    co_return existing;
+  }
+
+  std::shared_ptr<entity_create_event> event;
+  bool                                 is_leader = false;
+  if (auto it = entity_create_inflight_.find(client_entity); it != entity_create_inflight_.end()) {
+    event = it->second; // follower: a leader is already creating this entity
+  } else {
+    event     = std::make_shared<entity_create_event>(entity_create_strand_, entity_create_event::time_point::max());
+    entity_create_inflight_.emplace(client_entity, event);
+    is_leader = true;
+  }
+
+  if (!is_leader) {
+    // Wait for the leader to finish (it cancel()s the timer), then read the
+    // mapping it recorded. The async_wait is initiated here on the strand, so
+    // it is ordered against the leader's cancel() — no missed wakeup.
+    boost::system::error_code ec;
+    co_await event->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+    co_return continuous_loader_.to_remote(client_entity);
+  }
+
+  // Leader: issue the single entity_create RPC. The co_await releases the strand.
+  entity server_entity = entt_ext::null;
   try {
     entity_create_request request{.session_id = session_id_, .client_entity = client_entity};
 
     auto response = co_await rpc_client_.template invoke<entity_create_response>("entity_create", std::move(request));
 
-    if (!response.success) {
+    if (response.success) {
+      server_entity = response.server_entity;
+      continuous_loader_.insert_mapping(server_entity, client_entity);
+      spdlog::debug("Requested server entity {} for client entity {}", static_cast<int>(server_entity), static_cast<int>(client_entity));
+    } else {
       spdlog::error("Entity creation failed: {}", response.error_message);
-      co_return entt_ext::null;
     }
-
-    continuous_loader_.insert_mapping(response.server_entity, client_entity);
-
-    spdlog::debug("Requested server entity {} for client entity {}", static_cast<int>(response.server_entity), static_cast<int>(client_entity));
-
-    co_return response.server_entity;
-
   } catch (std::exception const& ex) {
     spdlog::error("Exception requesting server entity: {}", ex.what());
-    co_return entt_ext::null;
   }
+
+  // Re-enter the strand to drop the in-flight entry, then wake every follower
+  // by cancelling the timer. Followers read to_remote() — the mapping just
+  // recorded, or null on failure, in which case they fail their send and keep
+  // their pending_create<T> marker for retry, exactly as a direct failure would.
+  co_await asio::dispatch(entity_create_strand_, asio::use_awaitable);
+  entity_create_inflight_.erase(client_entity);
+  event->cancel();
+
+  co_return server_entity;
 }
 
 template <typename ChannelT, typename... SyncComponentsT>

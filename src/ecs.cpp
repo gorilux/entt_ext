@@ -267,8 +267,23 @@ void ecs::stop() {
 // ============= Deferred Operations Implementation =============
 
 // Channel processor coroutine - runs on main executor
+//
+// Loops until the channel is CLOSED (channel_closed / operation_aborted below),
+// NOT until running_ is false. The shutdown handshake depends on this: when
+// stop() flips running_ to false, run_update_loop still has to drain the
+// command channel inside wait_for_systems_to_finish() — that is how a detached
+// .each() coroutine in flight at stop time delivers its
+// detached_each_release_deferred() decrement (and its remove_deferred<running<>>
+// cleanup). A `while (running_)` guard here would process at most one more
+// command after running_ went false and then exit, stranding those decrements
+// in the channel buffer forever: detached_each_in_flight_ never reaches 0,
+// wait_for_systems_to_finish() spins, main_io_context never stops, and the
+// process hangs on exit (reproduces reliably when a video is decoding at close,
+// because only then is a detached decode coroutine in flight). run_update_loop
+// closes the channel explicitly once the systems have quiesced, which is what
+// terminates this loop.
 asio::awaitable<void> ecs::process_command_channel() {
-  while (running_) {
+  for (;;) {
     // Use a separate scope to control cmd lifetime
     boost::system::error_code                            ec;
     std::move_only_function<asio::awaitable<void>(ecs&)> executor;
