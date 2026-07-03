@@ -212,7 +212,7 @@ public:
 
     auto snapshot = snapshot_component(ecs, entt);
     for (auto& [id, handler] : on_construct_async_handlers) {
-      ecs.defer_async([handler, entt, snapshot](EcsT& ecs_ref) -> asio::awaitable<void> {
+      ecs.defer_awaitable([handler, entt, snapshot](EcsT& ecs_ref) -> asio::awaitable<void> {
         co_await handler(ecs_ref, entt, snapshot);
       });
     }
@@ -237,7 +237,7 @@ public:
     // which is what caused the out-of-bounds crash in element_at.
     auto snapshot = snapshot_component(ecs, entt);
     for (auto& [id, handler] : on_destroy_async_handlers) {
-      ecs.defer_async([handler, entt, snapshot](EcsT& ecs_ref) -> asio::awaitable<void> {
+      ecs.defer_awaitable([handler, entt, snapshot](EcsT& ecs_ref) -> asio::awaitable<void> {
         co_await handler(ecs_ref, entt, snapshot);
       });
     }
@@ -257,7 +257,7 @@ public:
 
     auto snapshot = snapshot_component(ecs, entt);
     for (auto& [id, handler] : on_update_async_handlers) {
-      ecs.defer_async([handler, entt, snapshot](EcsT& ecs_ref) -> asio::awaitable<void> {
+      ecs.defer_awaitable([handler, entt, snapshot](EcsT& ecs_ref) -> asio::awaitable<void> {
         co_await handler(ecs_ref, entt, snapshot);
       });
     }

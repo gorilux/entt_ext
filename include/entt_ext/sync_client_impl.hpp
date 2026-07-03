@@ -104,7 +104,7 @@ asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::co
     spdlog::info("sync_client::connect: reconciled pending offline changes");
 
     co_await request_snapshot();
-    // NB: request_snapshot only *queues* the snapshot load (defer_async to the
+    // NB: request_snapshot only *queues* the snapshot load (defer_awaitable to the
     // main-thread channel); the actual ingest + mapping happens later and is
     // marked by "snapshot fully loaded from server". Don't read this as "applied".
     spdlog::info("sync_client::connect: snapshot received; load queued on main-thread channel; connect returning true");
@@ -186,7 +186,7 @@ asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::ap
       co_return false;
     }
 
-    ecs_.defer_async([this, response](entt_ext::ecs& ecs) -> asio::awaitable<void> {
+    ecs_.defer_awaitable([this, response](entt_ext::ecs& ecs) -> asio::awaitable<void> {
       // Load the snapshot into our ECS
       // Use continuous loader to merge entities without conflicts
       // Note: The snapshot contains server entity IDs that get mapped to client entity IDs
@@ -231,7 +231,7 @@ asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::ap
         co_return;
       }
 
-      ecs_.defer_async([this](entt_ext::ecs& ecs_inner) -> asio::awaitable<void> {
+      ecs_.defer_awaitable([this](entt_ext::ecs& ecs_inner) -> asio::awaitable<void> {
         loading_snapshot_ = false;
         ecs_inner.set_async_observers_muted(false);
         spdlog::info("sync_client: snapshot fully loaded from server (mappings established, observers unmuted)");
@@ -245,7 +245,7 @@ asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::ap
 
   } catch (std::exception const& ex) {
     // This outer catch only covers the SYNCHRONOUS prefix — the empty check and
-    // the defer_async *enqueue* call. The decode/ingest runs in the deferred
+    // the defer_awaitable *enqueue* call. The decode/ingest runs in the deferred
     // body and has its own try/catch above. Reaching here means we failed to
     // even queue the load (e.g. the command channel rejected it). Previously
     // this swallowed the exception with no log, hiding the failure entirely.
@@ -453,7 +453,7 @@ asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::re
       std::vector<std::pair<entity, ActualT>> items;
       bool                                    removed_stale = false;
     };
-    auto batch = co_await ecs_.run_async([](entt_ext::ecs& ecs) {
+    auto batch = co_await ecs_.invoke_on_main([](entt_ext::ecs& ecs) {
       create_batch b;
       for (auto e : ecs.template view<pending_create<ActualT>>()) {
         if (auto* component = ecs.template try_get<ActualT>(e)) {
@@ -481,7 +481,7 @@ asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::re
     }
 
     if (!sent.empty()) {
-      co_await ecs_.run_async([sent = std::move(sent)](entt_ext::ecs& ecs) {
+      co_await ecs_.invoke_on_main([sent = std::move(sent)](entt_ext::ecs& ecs) {
         for (auto e : sent) {
           if (ecs.valid(e)) {
             ecs.template remove<pending_create<ActualT>>(e);
@@ -511,7 +511,7 @@ asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::re
     // only on the main thread (this runs on the concurrent_io_context and would
     // otherwise race the main loop over entt's component-pool map). Snapshot on
     // main, send off-thread, remove markers back on main.
-    auto items = co_await ecs_.run_async([](entt_ext::ecs& ecs) {
+    auto items = co_await ecs_.invoke_on_main([](entt_ext::ecs& ecs) {
       std::vector<std::pair<entity, ActualT>> out;
       for (auto e : ecs.template view<pending_update<ActualT>>()) {
         if (auto* component = ecs.template try_get<ActualT>(e)) {
@@ -536,7 +536,7 @@ asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::re
     }
 
     if (!sent.empty()) {
-      co_await ecs_.run_async([sent = std::move(sent)](entt_ext::ecs& ecs) {
+      co_await ecs_.invoke_on_main([sent = std::move(sent)](entt_ext::ecs& ecs) {
         for (auto e : sent) {
           if (ecs.valid(e)) {
             ecs.template remove<pending_update<ActualT>>(e);
@@ -871,7 +871,7 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
       // marker (component_update_request<T>) and bails — so the marker
       // must still be present when the body runs.
       //
-      // defer/defer_async preserve call order in command_channel_ (see
+      // defer/defer_awaitable preserve call order in command_channel_ (see
       // ecs::defer's contract), so a plain ecs.defer(remove_marker) here
       // lands BEHIND the just-queued observer body. The historical
       // double-defer was a workaround for an earlier broken ordering and

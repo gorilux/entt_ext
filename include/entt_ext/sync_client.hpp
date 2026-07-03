@@ -109,7 +109,7 @@ public:
       // loading_snapshot_ to decide whether to send removal RPCs; with maps
       // already empty and the suppression flag set, both short-circuit — which
       // is what we want, since we're already disconnected.
-      co_await ecs_.run_async([this](entt_ext::ecs& ecs) {
+      co_await ecs_.invoke_on_main([this](entt_ext::ecs& ecs) {
         auto locals = continuous_loader_.local_entities();
         continuous_loader_.clear_mappings();
 

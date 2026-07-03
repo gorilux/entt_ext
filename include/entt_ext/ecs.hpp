@@ -673,7 +673,7 @@ public:
 
   // Defers a synchronous function to be executed on the ECS command queue.
   //
-  // Ordering contract: two sequential defer/defer_async calls land in the
+  // Ordering contract: two sequential defer/defer_awaitable calls land in the
   // command_channel_ in call order. Several places depend on this:
   //   - sync_client_impl.hpp's apply_component_update double-defer (marker
   //     removal must run after the writeable on_update observer's queued body
@@ -723,7 +723,7 @@ public:
 
   // Defers an async function to be executed on the ECS command queue.
   // See defer() above for the ordering contract and try_send rationale.
-  inline void defer_async(std::move_only_function<asio::awaitable<void>(ecs&)> func,
+  inline void defer_awaitable(std::move_only_function<asio::awaitable<void>(ecs&)> func,
                           std::source_location loc = std::source_location::current()) {
     deferred_command cmd{.operation      = deferred_command::op_type::custom,
                          .entity         = entt_ext::null,
@@ -734,7 +734,7 @@ public:
       return;
     }
 
-    spdlog::warn("ecs::defer_async: command_channel full from {}:{} ({}), falling back to async_send (ordering not preserved on this path)",
+    spdlog::warn("ecs::defer_awaitable: command_channel full from {}:{} ({}), falling back to async_send (ordering not preserved on this path)",
                   loc.file_name(), loc.line(), loc.function_name());
     asio::co_spawn(
         concurrent_io_context(),
@@ -790,30 +790,30 @@ public:
 
   // ============= Async Operations API (awaits completion on main thread) ============
 
-  auto destroy_async(const entity_type entt) -> asio::awaitable<void>;
+  auto destroy_on_main(const entity_type entt) -> asio::awaitable<void>;
 
   template <typename Type, typename... Args>
-  auto emplace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+  auto emplace_on_main(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
 
   template <typename Type, typename... Args>
-  auto emplace_or_replace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+  auto emplace_or_replace_on_main(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
 
   template <typename Type, typename... Args>
-  auto emplace_if_not_exists_async(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+  auto emplace_if_not_exists_on_main(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
 
   template <typename Type, typename... Args>
-  auto replace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
+  auto replace_on_main(const entity_type entt, Args&&... args) -> asio::awaitable<void>;
 
   template <typename Type, typename... Other>
-  auto remove_async(const entity_type entt) -> asio::awaitable<void>;
+  auto remove_on_main(const entity_type entt) -> asio::awaitable<void>;
 
   template <typename Type, typename... Func>
-  auto patch_async(const entity_type entt, Func&&... func) -> asio::awaitable<void>;
+  auto patch_on_main(const entity_type entt, Func&&... func) -> asio::awaitable<void>;
 
   // Create an entity on the main thread and resume the caller with it. Use
   // from a concurrent coroutine instead of create_deferred when you need the
   // new entity id back.
-  auto create_async() -> asio::awaitable<entity_type>;
+  auto create_on_main() -> asio::awaitable<entity_type>;
 
   // Run an arbitrary callable on the main thread — the only place registry
   // access (view iteration, get, create, emplace, …) is safe — and resume the
@@ -824,7 +824,7 @@ public:
   // resumes off-thread). This is the primitive that lets concurrent coroutines
   // (RPC handlers, transfer workers) touch the registry without racing it.
   template <typename Func>
-  auto run_async(Func&& func) -> asio::awaitable<std::invoke_result_t<Func, ecs&>>;
+  auto invoke_on_main(Func&& func) -> asio::awaitable<std::invoke_result_t<Func, ecs&>>;
 
   template <typename... ComponentsT, typename... ExcludeT>
   auto system(entt::exclude_t<ExcludeT...>) -> system_builder<entt::get_t<ComponentsT...>, entt::exclude_t<ExcludeT...>>;
@@ -846,7 +846,7 @@ public:
   asio::awaitable<void> process_command_channel();
 
   // Async observer mute switch. When true, component_observer::dispatch_on_*
-  // skips queueing async (defer_async-based) observer bodies. Sync observers
+  // skips queueing async (defer_awaitable-based) observer bodies. Sync observers
   // still fire normally. Intended for bulk-load paths (e.g. sync_client's
   // snapshot ingest) where every emplace would otherwise queue an observer
   // body that immediately bails on a loading_snapshot_ check — pure channel
@@ -1251,7 +1251,7 @@ inline auto ecs::destroy_deferred(const entity_type entt) -> asio::awaitable<voi
 // Unlike _deferred (fire-and-forget via command channel), _async posts directly
 // to main_io_context and resumes the caller only after execution completes.
 
-inline auto ecs::destroy_async(const entity_type entt) -> asio::awaitable<void> {
+inline auto ecs::destroy_on_main(const entity_type entt) -> asio::awaitable<void> {
   co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
       [this, entt](auto handler) mutable {
         asio::post(main_io_context(), [this, entt, handler = std::move(handler)]() mutable {
@@ -1264,7 +1264,7 @@ inline auto ecs::destroy_async(const entity_type entt) -> asio::awaitable<void> 
 }
 
 template <typename Type, typename... Args>
-inline auto ecs::emplace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+inline auto ecs::emplace_on_main(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
   auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
 
   co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
@@ -1284,7 +1284,7 @@ inline auto ecs::emplace_async(const entity_type entt, Args&&... args) -> asio::
 }
 
 template <typename Type, typename... Args>
-inline auto ecs::emplace_or_replace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+inline auto ecs::emplace_or_replace_on_main(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
   auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
 
   co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
@@ -1304,7 +1304,7 @@ inline auto ecs::emplace_or_replace_async(const entity_type entt, Args&&... args
 }
 
 template <typename Type, typename... Args>
-inline auto ecs::emplace_if_not_exists_async(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+inline auto ecs::emplace_if_not_exists_on_main(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
   auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
 
   co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
@@ -1324,7 +1324,7 @@ inline auto ecs::emplace_if_not_exists_async(const entity_type entt, Args&&... a
 }
 
 template <typename Type, typename... Args>
-inline auto ecs::replace_async(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
+inline auto ecs::replace_on_main(const entity_type entt, Args&&... args) -> asio::awaitable<void> {
   auto args_tuple = std::make_tuple(std::forward<Args>(args)...);
 
   co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
@@ -1344,7 +1344,7 @@ inline auto ecs::replace_async(const entity_type entt, Args&&... args) -> asio::
 }
 
 template <typename Type, typename... Other>
-inline auto ecs::remove_async(const entity_type entt) -> asio::awaitable<void> {
+inline auto ecs::remove_on_main(const entity_type entt) -> asio::awaitable<void> {
   co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
       [this, entt](auto handler) mutable {
         asio::post(main_io_context(), [this, entt, handler = std::move(handler)]() mutable {
@@ -1357,7 +1357,7 @@ inline auto ecs::remove_async(const entity_type entt) -> asio::awaitable<void> {
 }
 
 template <typename Type, typename... Func>
-inline auto ecs::patch_async(const entity_type entt, Func&&... func) -> asio::awaitable<void> {
+inline auto ecs::patch_on_main(const entity_type entt, Func&&... func) -> asio::awaitable<void> {
   auto funcs_tuple = std::make_tuple(std::forward<Func>(func)...);
 
   co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
@@ -1376,7 +1376,7 @@ inline auto ecs::patch_async(const entity_type entt, Func&&... func) -> asio::aw
       asio::use_awaitable);
 }
 
-inline auto ecs::create_async() -> asio::awaitable<entity_type> {
+inline auto ecs::create_on_main() -> asio::awaitable<entity_type> {
   co_return co_await asio::async_initiate<decltype(asio::use_awaitable), void(entity_type)>(
       [this](auto handler) mutable {
         asio::post(main_io_context(), [this, handler = std::move(handler)]() mutable {
@@ -1387,7 +1387,7 @@ inline auto ecs::create_async() -> asio::awaitable<entity_type> {
 }
 
 template <typename Func>
-inline auto ecs::run_async(Func&& func) -> asio::awaitable<std::invoke_result_t<Func, ecs&>> {
+inline auto ecs::invoke_on_main(Func&& func) -> asio::awaitable<std::invoke_result_t<Func, ecs&>> {
   using result_t = std::invoke_result_t<Func, ecs&>;
   if constexpr (std::is_void_v<result_t>) {
     co_await asio::async_initiate<decltype(asio::use_awaitable), void()>(
