@@ -27,6 +27,8 @@
 #include <entt_ext/sync/user_account.hpp>
 #include <entt_ext/sync_common.hpp>
 
+#include <grlx/rpc/security.hpp>  // current_call_context() for per-IP throttle (WI-15)
+
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -69,9 +71,21 @@ public:
     return [this](handshake_request const& request) -> handshake_response {
       auto const now = std::chrono::system_clock::now();
 
+      // Source IP for per-IP throttling (WI-15), bound at the TLS handshake.
+      // Read synchronously (before any co_await) while the call context is valid.
+      std::string peer_ip;
+      if (auto const* cc = grlx::rpc::current_call_context()) peer_ip = cc->peer_ip;
+
       if (request.username.empty()) {
         return {.success       = false,
                 .error_message = "Authentication required: please provide username and password"};
+      }
+
+      // Per-IP throttle (WI-15): primary brake against spraying many usernames
+      // from one source, which the per-username lock never sees.
+      if (rate_limiter_.is_ip_throttled(peer_ip, now)) {
+        spdlog::warn("auth: throttling login flood from ip={}", peer_ip.empty() ? "<unknown>" : peer_ip);
+        return {.success = false, .error_message = "Too many attempts — try again later"};
       }
 
       if (rate_limiter_.is_locked(request.username, now)) {
@@ -83,6 +97,7 @@ public:
         if (acc.username != request.username) continue;
 
         if (!password::verify(acc.password_hash, request.password, acc.salt)) {
+          rate_limiter_.record_ip_failure(peer_ip, now);
           bool newly_locked = rate_limiter_.record_failure(request.username, now);
           if (newly_locked) {
             spdlog::warn("auth: user '{}' locked out after repeated failures", request.username);
@@ -95,6 +110,7 @@ public:
         }
 
         rate_limiter_.record_success(request.username);
+        rate_limiter_.record_ip_success(peer_ip);
 
         // Migration: a successful verify against a legacy SHA-256 hash
         // is the one chance to upgrade. Rehash with PBKDF2, drop the
@@ -114,8 +130,9 @@ public:
                 .auth_token = token};
       }
 
-      // Unknown username still counts as a failure for rate-limiting so
+      // Unknown username still counts as a failure (per-IP AND per-username) so
       // an attacker can't probe the user list for free.
+      rate_limiter_.record_ip_failure(peer_ip, now);
       rate_limiter_.record_failure(request.username, now);
       return {.success       = false,
               .error_message = "User '" + request.username + "' not found"};
