@@ -8,6 +8,7 @@
 // handle_sync_request's save_component_and_hierarchy_from,
 // setup_rpc_endpoints's register_component_endpoints) don't re-instantiate
 // everything locally.
+#include <entt_ext/pp_for_each.hpp>
 #include <entt_ext/sync_server_impl.hpp>
 
 #define ENTT_EXT_SYNC_SERVER_INSTANTIATE(SyncServerT, ComponentT)                                                        \
@@ -21,3 +22,14 @@
   extern template void SyncServerT::save_component_and_hierarchy_from<ComponentT>(                                       \
       entt::registry&, cereal::PortableBinaryOutputArchive&);                                                            \
   extern template void SyncServerT::register_component_endpoints<ComponentT>(entt_ext::ecs&)
+
+// _LIST variants — see sync_client_shard.hpp's ENTT_EXT_SYNC_CLIENT_*_LIST
+// for the full rationale. Drives ENTT_EXT_SYNC_SERVER_INSTANTIATE/EXTERN
+// across an entire comma-separated component list in one macro call.
+#define ENTT_EXT_SYNC_SERVER_INSTANTIATE_ONE_(SyncServerT, ComponentT) ENTT_EXT_SYNC_SERVER_INSTANTIATE(SyncServerT, ComponentT);
+#define ENTT_EXT_SYNC_SERVER_INSTANTIATE_LIST(SyncServerT, ...) \
+  ENTT_EXT_FOR_EACH_ARG(ENTT_EXT_SYNC_SERVER_INSTANTIATE_ONE_, SyncServerT, __VA_ARGS__)
+
+#define ENTT_EXT_SYNC_SERVER_EXTERN_ONE_(SyncServerT, ComponentT) ENTT_EXT_SYNC_SERVER_EXTERN(SyncServerT, ComponentT);
+#define ENTT_EXT_SYNC_SERVER_EXTERN_LIST(SyncServerT, ...) \
+  ENTT_EXT_FOR_EACH_ARG(ENTT_EXT_SYNC_SERVER_EXTERN_ONE_, SyncServerT, __VA_ARGS__)

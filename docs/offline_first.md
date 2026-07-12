@@ -1,8 +1,12 @@
 # Offline-first sync (design)
 
-Status: design — phase 0 / 5. No implementation has shipped under this
-section yet. See `sync_client.hpp` / `sync_server.hpp` for the existing
-online-only protocol that this work extends rather than replaces.
+Status: phases 1-4 v1 shipped (mapping persistence, server-keyed cache,
+pending-change markers + offline-only-entity persistence, reconcile RPC
+reuse + pending_delete tombstones). Phase 5 (gym wiring) is wired for
+gym; conflict policy (client-wins only) and a few scale follow-ups
+remain open — see "Follow-ups" below for what's actually done vs. not.
+See `sync_client.hpp` / `sync_server.hpp` for the existing online-only
+protocol this work extends rather than replaces.
 
 ## Goal
 
@@ -245,16 +249,69 @@ file is now a **server-keyed snapshot**, byte-identical to a live
 The persisted entity-id mapping is now implicit in the server-keyed
 table (the continuous_loader rebuilds it on restore), so
 `client_state_cache` no longer calls `save_mapping`/`load_mapping` — the
-thin `sync_client` wrappers remain for any external caller. Offline-only
-entities (no server ID yet) are still not cached; that remains the
-documented phase-2 limitation closed by phase 3/4.
+thin `sync_client` wrappers remain for any external caller.
 
-### Phase 4 follow-up: pending_delete tombstones
+### Phase 3/4 follow-up: cross-restart persistence, complete (shipped)
 
-Today an entity destroyed offline cannot be propagated to the server —
-the dying entity can't carry a `pending_delete<T>` marker because all
-its components are gone by the time observers run. The fix is a global
-tombstone list:
+Three gaps closed together, since they share the same cache-file format
+change (a version bump, in effect — old cache files fail to parse and
+are renamed to `.bak` on first load, same as any other decode failure;
+see `client_state_cache::load_now()`'s existing catch block):
+
+- **Pending markers on already-mapped entities.** Before this, an
+  offline edit to an existing synced entity had its VALUE cached (the
+  server-keyed snapshot always captured current component state) but
+  not its `pending_create<T>`/`pending_update<T>` MARKER — so after a
+  restart the edit sat in the local registry looking correct, but
+  reconcile had nothing telling it to push it, and the next server
+  snapshot silently reverted it. `save_cached_snapshot` now also copies
+  each mapped entity's markers into the server-keyed temp registry and
+  snapshots them (`copy_pending_markers_to_server_keyed`);
+  `restore_cached_snapshot` reads them back via the continuous_loader
+  (`load_pending_markers`), after the main entity/component load so the
+  target entities already exist.
+- **Offline-only entities** (created while disconnected, so they have
+  no server mapping at all — e.g. a whole workout session logged with
+  zero signal) are now cached too. They can't reuse the
+  continuous_loader-keyed format above (that format makes every entity
+  in its table an authoritative server mapping, which these aren't —
+  giving one a fake mapping would permanently block it from ever
+  reconciling with the real server entity). Instead
+  `save_offline_component`/`load_offline_component` use a private,
+  per-save sequential temp-id space, independent of both local
+  `entt::entity` values and server ids, to preserve hierarchy
+  (`parent<T>`/`children<T>`) cross-references between two offline-only
+  entities (e.g. a set logged under a session created in the same
+  offline stretch); a cross-reference to an already-mapped entity is
+  stored as its server id instead. Restored as brand-new local entities
+  with no continuous_loader mapping, so the existing (unmodified)
+  `reconcile_creates_for`/`request_server_entity` path uploads them and
+  mints real server ids on the next connect — no reconcile-path changes
+  needed.
+
+  Limitation: only hierarchy cross-references are restored this way. A
+  plain entity-ref component (the `with_entity_refs`/
+  `map_entities_to_remote` pattern, e.g. `nexus::automation::targets`)
+  pointing at another offline-only entity is not restorable across a
+  restart — no component in gym's or algotrade's sync list (the two
+  apps using `client_state_cache` today) uses that pattern, so this is
+  currently a latent limitation, not an active bug.
+- **`pending_delete` tombstones**, detailed below — the one piece that
+  needed a genuinely new data structure and a change to
+  `setup_entity_sync`'s on_destroy observer, rather than just a cache
+  format extension.
+
+All three are client-side only: no server or wire-protocol change (the
+`entity_destroy`/`component_updated_*` RPCs reconcile already used are
+unchanged), so this ships as a client-only rebuild.
+
+### Phase 4 follow-up: pending_delete tombstones (shipped)
+
+An entity destroyed offline previously could not be propagated to the
+server — the dying entity can't carry a `pending_delete<T>` marker
+because all its components are gone by the time observers run. The fix
+is a global tombstone list, `entt_ext::sync::pending_deletes` (see
+`entt_ext/sync/pending_changes.hpp`):
 
 ```cpp
 struct pending_deletes {
@@ -268,11 +325,17 @@ struct pending_deletes {
 
 Stamped on the global entity by sync_client's `on_destroy` observer
 (which translates the local-entity-being-destroyed to its server ID via
-`continuous_loader_.to_remote(e)` BEFORE the entity is gone). Persisted
-by client_state_cache. Drained by reconcile via the existing
-`notify_component_removal` path. Without this, deleting a plan offline
-still shows it gone locally but it reappears on reconnect when the
-server snapshot lands.
+`continuous_loader_.to_remote(e)` BEFORE the entity is gone) whenever
+the entity was synced but the `entity_destroy` RPC can't go out right
+now — offline, or the RPC itself failed (both the observer's own
+fire-and-forget send and reconcile's retry stamp on failure, via a
+shared `stamp_pending_delete` helper). Persisted by `client_state_cache`
+alongside everything else. Drained by
+`sync_client::reconcile_pending_deletes` (called from
+`reconcile_pending_changes`, after creates and updates), which replays
+the same `entity_destroy` RPC per tombstone and drops confirmed entries.
+Without this, deleting a plan offline still shows it gone locally but
+it reappears on reconnect when the server snapshot lands.
 
 ### Phase 4 follow-up: per-component conflict policy
 

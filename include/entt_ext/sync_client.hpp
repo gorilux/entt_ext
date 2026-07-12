@@ -261,6 +261,12 @@ public:
   template <typename ComponentT>
   asio::awaitable<void> reconcile_updates_for();
 
+  // Phase 4 follow-up: drain the pending_deletes tombstone list (see
+  // entt_ext/sync/pending_changes.hpp) — entities destroyed while
+  // disconnected, or whose entity_destroy RPC failed, get one more retry of
+  // that RPC per entry here; confirmed entries are dropped from the list.
+  asio::awaitable<void> reconcile_pending_deletes();
+
   // Stable per-install device id, sent in the handshake so the server binds it
   // to this session and can authorize per-share access (peer_acl) against the
   // authenticated device rather than a forgeable per-request field. Set by the
@@ -450,6 +456,76 @@ private:
   void copy_component_to_server_keyed(entt::registry&            tmp,
                                       std::vector<entity> const& mapped_local,
                                       std::vector<entity> const& mapped_server);
+
+  // Copy a component's pending_create<T>/pending_update<T> markers (if
+  // present) onto the server-keyed temp registry alongside the component
+  // value itself. Without this, an offline edit to an already-mapped
+  // entity is cached (the component's edited VALUE is captured by
+  // copy_component_to_server_keyed above) but the marker that tells
+  // reconcile to push it is not — so the edit silently vanishes the moment
+  // the next server snapshot lands, instead of reconciling.
+  template <typename ComponentT>
+  void copy_pending_markers_to_server_keyed(entt::registry&            tmp,
+                                            std::vector<entity> const& mapped_local,
+                                            std::vector<entity> const& mapped_server);
+
+  // Read back pending_create<T>/pending_update<T> for already-mapped
+  // entities. Must run after load_snapshot_from_archive (restore_cached_snapshot
+  // calls it first) so the entities already exist under the continuous_loader.
+  template <typename ComponentT>
+  void load_pending_markers(cereal::PortableBinaryInputArchive& archive);
+
+  // Encodes what an offline-only entity's parent<T>/children<T> reference
+  // resolves to across a process restart — see save_offline_component.
+  enum class offline_ref_kind : std::uint8_t { none = 0, server = 1, offline_temp = 2 };
+
+  void write_offline_ref(cereal::PortableBinaryOutputArchive& archive, entity target,
+                         std::unordered_map<entity, std::uint32_t> const& local_to_temp);
+  entity read_offline_ref(cereal::PortableBinaryInputArchive& archive, std::vector<entity> const& temp_to_local);
+
+  // Offline-only entities: carry at least one SyncComponentsT component but
+  // have no server mapping at all (created while disconnected, or created
+  // online but not yet acknowledged). These can't go through the
+  // continuous_loader-keyed format above — get<entity>(archive) there
+  // makes every entity in its table an authoritative server mapping, which
+  // these are not (giving one a fake mapping would permanently block it
+  // from ever reconciling with the real server entity).
+  //
+  // Instead: a private, per-save, sequential temp-id space (0..N-1,
+  // independent of both local entt::entity values and server ids) stands
+  // in for cross-references between two offline-only entities (e.g. a set
+  // logged offline under a workout session created in the same offline
+  // stretch); a cross-reference to an already-mapped entity is stored as
+  // its server id instead (see write_offline_ref/read_offline_ref).
+  //
+  // Restored as brand-new local entities with NO continuous_loader
+  // mapping — from that point on they are indistinguishable from entities
+  // freshly created this run, and the existing (unmodified)
+  // reconcile_creates_for / request_server_entity path uploads them and
+  // mints real server ids on the next connect.
+  //
+  // Limitation: only hierarchy (parent<T>/children<T>) cross-references
+  // are restored. A plain entity-ref component (the with_entity_refs /
+  // map_entities_to_remote pattern, e.g. nexus::automation::targets)
+  // pointing at another offline-only entity is not restorable across a
+  // restart — no component in any app's sync list uses that pattern on a
+  // type that could plausibly be offline-only today, but an app that adds
+  // one should know this is unhandled rather than silently wrong.
+  template <typename ComponentT>
+  void save_offline_component(cereal::PortableBinaryOutputArchive&              archive,
+                             std::vector<entity> const&                       offline_local,
+                             std::unordered_map<entity, std::uint32_t> const& local_to_temp);
+
+  template <typename ComponentT>
+  void load_offline_component(cereal::PortableBinaryInputArchive& archive, std::vector<entity> const& temp_to_local);
+
+  // Stamp a tombstone for a server-mapped entity destroyed while offline
+  // (or whose entity_destroy RPC failed), so the delete survives a
+  // process restart and is drained by reconcile_pending_deletes on the
+  // next connect. Goes through ecs_.defer so it's safe to call from the
+  // concurrent RPC pool (a failed send) as well as the main-thread
+  // observer body (an offline destroy).
+  void stamp_pending_delete(entity server_entity);
 
 public:
   // Access the underlying RPC client (e.g. to register custom notification handlers)

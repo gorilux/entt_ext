@@ -19,6 +19,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace entt_ext::sync {
@@ -377,6 +378,40 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_cached_snapsho
     }
   };
   (save_one.template operator()<SyncComponentsT>(), ...);
+
+  // Pending markers for the already-mapped entities above (phase 4
+  // follow-up — see copy_pending_markers_to_server_keyed).
+  auto save_pending = [&]<typename T>() {
+    using ActualT = unwrap_hierarchy_t<T>;
+    copy_pending_markers_to_server_keyed<T>(tmp, mapped_local, mapped_server);
+    entt::snapshot{tmp}.template get<pending_create<ActualT>>(archive);
+    entt::snapshot{tmp}.template get<pending_update<ActualT>>(archive);
+  };
+  (save_pending.template operator()<SyncComponentsT>(), ...);
+
+  // Offline-only entities: same criterion as `seen` above, inverted — any
+  // entity carrying a SyncComponentsT component that never made it into
+  // `seen` has no server mapping at all (see save_offline_component).
+  std::vector<entity>                       offline_local;
+  std::unordered_map<entity, std::uint32_t> local_to_temp;
+  auto                                      collect_offline = [&]<typename T>() {
+    using ActualT = unwrap_hierarchy_t<T>;
+    for (auto e : ecs_.view<ActualT>()) {
+      if (seen.contains(e) || local_to_temp.contains(e)) {
+        continue;
+      }
+      local_to_temp.emplace(e, static_cast<std::uint32_t>(offline_local.size()));
+      offline_local.push_back(e);
+    }
+  };
+  (collect_offline.template operator()<SyncComponentsT>(), ...);
+
+  archive(static_cast<std::uint64_t>(offline_local.size()));
+  (save_offline_component<SyncComponentsT>(archive, offline_local, local_to_temp), ...);
+
+  // Tombstones for deletes made while offline (or whose entity_destroy RPC
+  // failed) — see entt_ext/sync/pending_changes.hpp.
+  archive(ecs_.template get_or_emplace<pending_deletes>(ecs_.get_global_entity()).entries);
 }
 
 template <typename ChannelT, typename... SyncComponentsT>
@@ -384,7 +419,265 @@ asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::re
   // Identical ingest path to a live server snapshot — the cache file is
   // shaped exactly like sync_response.snapshot_data.
   co_await load_snapshot_from_archive(archive);
+
+  // Pending markers for the already-mapped entities just restored above
+  // (must run after load_snapshot_from_archive — see load_pending_markers).
+  (load_pending_markers<SyncComponentsT>(archive), ...);
+
+  // Offline-only entities: brand-new local entities, no continuous_loader
+  // mapping (see save_offline_component).
+  std::uint64_t offline_count = 0;
+  archive(offline_count);
+  std::vector<entity> temp_to_local;
+  temp_to_local.reserve(offline_count);
+  for (std::uint64_t i = 0; i < offline_count; ++i) {
+    temp_to_local.push_back(ecs_.create());
+  }
+  (load_offline_component<SyncComponentsT>(archive, temp_to_local), ...);
+
+  // Tombstones for deletes made while offline.
+  std::vector<pending_deletes::entry> tombstones;
+  archive(tombstones);
+  if (!tombstones.empty()) {
+    ecs_.template get_or_emplace<pending_deletes>(ecs_.get_global_entity()).entries = std::move(tombstones);
+  }
+
   co_return;
+}
+
+// ============================================================================
+// Offline-first cache: pending markers on already-mapped entities
+// ============================================================================
+
+template <typename ChannelT, typename... SyncComponentsT>
+template <typename ComponentT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::copy_pending_markers_to_server_keyed(
+    entt::registry& tmp, std::vector<entity> const& mapped_local, std::vector<entity> const& mapped_server) {
+  using ActualT = unwrap_hierarchy_t<ComponentT>;
+
+  for (std::size_t i = 0; i < mapped_local.size(); ++i) {
+    auto loc = mapped_local[i];
+    auto srv = mapped_server[i];
+    if (ecs_.template all_of<pending_create<ActualT>>(loc)) {
+      // pending_create<T> is an empty marker (see pending_changes.hpp) —
+      // entt's try_get<T> would need std::addressof(cpool->get(entt)), which
+      // is ill-formed for empty types since get() returns void for them.
+      // all_of<T> only needs presence, and there is no value to copy anyway.
+      tmp.template emplace<pending_create<ActualT>>(srv);
+    }
+    if (auto* pu = ecs_.template try_get<pending_update<ActualT>>(loc)) {
+      tmp.template emplace<pending_update<ActualT>>(srv, *pu);
+    }
+  }
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+template <typename ComponentT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::load_pending_markers(cereal::PortableBinaryInputArchive& archive) {
+  using ActualT = unwrap_hierarchy_t<ComponentT>;
+  continuous_loader_.template get<pending_create<ActualT>>(archive);
+  continuous_loader_.template get<pending_update<ActualT>>(archive);
+}
+
+// ============================================================================
+// Offline-first cache: offline-only entities (no server mapping at all)
+// ============================================================================
+
+template <typename ChannelT, typename... SyncComponentsT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::write_offline_ref(
+    cereal::PortableBinaryOutputArchive& archive, entity target, std::unordered_map<entity, std::uint32_t> const& local_to_temp) {
+  if (target == entt_ext::null) {
+    archive(offline_ref_kind::none);
+    return;
+  }
+  if (auto it = local_to_temp.find(target); it != local_to_temp.end()) {
+    archive(offline_ref_kind::offline_temp);
+    archive(it->second);
+    return;
+  }
+  auto srv = continuous_loader_.to_remote(target);
+  if (srv != entt_ext::null) {
+    archive(offline_ref_kind::server);
+    archive(srv);
+    return;
+  }
+  // Neither an offline-only sibling nor a server-mapped entity (destroyed,
+  // or belongs to a type outside SyncComponentsT) — drop the reference
+  // rather than persist a dangling id.
+  archive(offline_ref_kind::none);
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+entt_ext::entity sync_client_with_channel<ChannelT, SyncComponentsT...>::read_offline_ref(cereal::PortableBinaryInputArchive& archive,
+                                                                                          std::vector<entity> const& temp_to_local) {
+  offline_ref_kind kind{};
+  archive(kind);
+  switch (kind) {
+    case offline_ref_kind::server: {
+      entity srv{entt_ext::null};
+      archive(srv);
+      return continuous_loader_.to_local(srv);
+    }
+    case offline_ref_kind::offline_temp: {
+      std::uint32_t idx = 0;
+      archive(idx);
+      return idx < temp_to_local.size() ? temp_to_local[idx] : entt_ext::null;
+    }
+    default:
+      return entt_ext::null;
+  }
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+template <typename ComponentT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_offline_component(
+    cereal::PortableBinaryOutputArchive& archive, std::vector<entity> const& offline_local,
+    std::unordered_map<entity, std::uint32_t> const& local_to_temp) {
+  using ActualT = unwrap_hierarchy_t<ComponentT>;
+
+  // Component value.
+  std::vector<entity> present;
+  for (auto e : offline_local) {
+    if (ecs_.template try_get<ActualT>(e)) {
+      present.push_back(e);
+    }
+  }
+  archive(static_cast<std::uint64_t>(present.size()));
+  for (auto e : present) {
+    archive(local_to_temp.at(e));
+    archive(*ecs_.template try_get<ActualT>(e));
+  }
+
+  // pending_create marker.
+  std::vector<entity> creating;
+  for (auto e : offline_local) {
+    // all_of<T>, not try_get<T> — pending_create<T> is an empty marker (see
+    // pending_changes.hpp) and entt's try_get<T> is ill-formed for empty
+    // types (get() returns void, so std::addressof(...) can't compile).
+    if (ecs_.template all_of<pending_create<ActualT>>(e)) {
+      creating.push_back(e);
+    }
+  }
+  archive(static_cast<std::uint64_t>(creating.size()));
+  for (auto e : creating) {
+    archive(local_to_temp.at(e));
+  }
+
+  // pending_update marker.
+  std::vector<entity> updating;
+  for (auto e : offline_local) {
+    if (ecs_.template try_get<pending_update<ActualT>>(e)) {
+      updating.push_back(e);
+    }
+  }
+  archive(static_cast<std::uint64_t>(updating.size()));
+  for (auto e : updating) {
+    archive(local_to_temp.at(e));
+    archive(*ecs_.template try_get<pending_update<ActualT>>(e));
+  }
+
+  if constexpr (is_with_hierarchy_v<ComponentT>) {
+    std::vector<entity> with_parent;
+    for (auto e : offline_local) {
+      if (ecs_.template try_get<entt_ext::parent<ActualT>>(e)) {
+        with_parent.push_back(e);
+      }
+    }
+    archive(static_cast<std::uint64_t>(with_parent.size()));
+    for (auto e : with_parent) {
+      archive(local_to_temp.at(e));
+      write_offline_ref(archive, ecs_.template try_get<entt_ext::parent<ActualT>>(e)->entity, local_to_temp);
+    }
+
+    std::vector<entity> with_children;
+    for (auto e : offline_local) {
+      if (ecs_.template try_get<entt_ext::children<ActualT>>(e)) {
+        with_children.push_back(e);
+      }
+    }
+    archive(static_cast<std::uint64_t>(with_children.size()));
+    for (auto e : with_children) {
+      archive(local_to_temp.at(e));
+      auto* ch = ecs_.template try_get<entt_ext::children<ActualT>>(e);
+      archive(static_cast<std::uint64_t>(ch->size()));
+      for (auto child : *ch) {
+        write_offline_ref(archive, child, local_to_temp);
+      }
+    }
+  }
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+template <typename ComponentT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::load_offline_component(cereal::PortableBinaryInputArchive& archive,
+                                                                                    std::vector<entity> const&          temp_to_local) {
+  using ActualT = unwrap_hierarchy_t<ComponentT>;
+
+  std::uint64_t present_count = 0;
+  archive(present_count);
+  for (std::uint64_t i = 0; i < present_count; ++i) {
+    std::uint32_t idx = 0;
+    archive(idx);
+    ActualT value{};
+    archive(value);
+    if (idx < temp_to_local.size()) {
+      ecs_.template emplace<ActualT>(temp_to_local[idx], std::move(value));
+    }
+  }
+
+  std::uint64_t creating_count = 0;
+  archive(creating_count);
+  for (std::uint64_t i = 0; i < creating_count; ++i) {
+    std::uint32_t idx = 0;
+    archive(idx);
+    if (idx < temp_to_local.size()) {
+      ecs_.template emplace<pending_create<ActualT>>(temp_to_local[idx]);
+    }
+  }
+
+  std::uint64_t updating_count = 0;
+  archive(updating_count);
+  for (std::uint64_t i = 0; i < updating_count; ++i) {
+    std::uint32_t idx = 0;
+    archive(idx);
+    pending_update<ActualT> value{};
+    archive(value);
+    if (idx < temp_to_local.size()) {
+      ecs_.template emplace<pending_update<ActualT>>(temp_to_local[idx], value);
+    }
+  }
+
+  if constexpr (is_with_hierarchy_v<ComponentT>) {
+    std::uint64_t parent_count = 0;
+    archive(parent_count);
+    for (std::uint64_t i = 0; i < parent_count; ++i) {
+      std::uint32_t idx = 0;
+      archive(idx);
+      entity resolved = read_offline_ref(archive, temp_to_local);
+      if (idx < temp_to_local.size() && resolved != entt_ext::null) {
+        ecs_.template emplace<entt_ext::parent<ActualT>>(temp_to_local[idx], entt_ext::parent<ActualT>{resolved});
+      }
+    }
+
+    std::uint64_t children_count = 0;
+    archive(children_count);
+    for (std::uint64_t i = 0; i < children_count; ++i) {
+      std::uint32_t idx = 0;
+      archive(idx);
+      std::uint64_t child_count = 0;
+      archive(child_count);
+      entt_ext::children<ActualT> set;
+      for (std::uint64_t c = 0; c < child_count; ++c) {
+        entity resolved = read_offline_ref(archive, temp_to_local);
+        if (resolved != entt_ext::null) {
+          set.insert(resolved);
+        }
+      }
+      if (idx < temp_to_local.size() && !set.empty()) {
+        ecs_.template emplace<entt_ext::children<ActualT>>(temp_to_local[idx], std::move(set));
+      }
+    }
+  }
 }
 
 // ============================================================================
@@ -405,6 +698,57 @@ asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::re
   // (it was emplaced from a server snapshot at some prior point), so
   // a single pass is enough.
   co_await reconcile_updates_helper<SyncComponentsT...>();
+
+  // Deletes last, per the offline-first design doc's ordering (creates,
+  // then updates, then deletes).
+  co_await reconcile_pending_deletes();
+
+  co_return;
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+asio::awaitable<void> sync_client_with_channel<ChannelT, SyncComponentsT...>::reconcile_pending_deletes() {
+  // Same threading rule as reconcile_creates_for/reconcile_updates_for:
+  // this runs on the concurrent_io_context, so registry access is hopped
+  // to main.
+  auto pending = co_await ecs_.invoke_on_main([](entt_ext::ecs& ecs) -> std::vector<pending_deletes::entry> {
+    if (auto* pd = ecs.template try_get<pending_deletes>(ecs.get_global_entity())) {
+      return pd->entries;
+    }
+    return {};
+  });
+
+  std::vector<entity> confirmed;
+  for (auto const& tomb : pending) {
+    try {
+      entity_destroy_request request{.session_id = session_id_, .server_entity = tomb.server_entity, .sync_version = std::chrono::steady_clock::now()};
+      auto response = co_await rpc_client_.template invoke<entity_destroy_response>("entity_destroy", std::move(request));
+      if (response.success) {
+        confirmed.push_back(tomb.server_entity);
+      } else {
+        spdlog::warn("[reconcile] delete failed for server entity {}: {}", static_cast<int>(tomb.server_entity), response.error_message);
+      }
+    } catch (std::exception const& ex) {
+      spdlog::warn("[reconcile] delete failed for server entity {}: {}", static_cast<int>(tomb.server_entity), ex.what());
+    } catch (...) {
+      spdlog::warn("[reconcile] delete failed for server entity {}: unknown", static_cast<int>(tomb.server_entity));
+    }
+  }
+
+  if (!confirmed.empty()) {
+    co_await ecs_.invoke_on_main([confirmed = std::move(confirmed)](entt_ext::ecs& ecs) {
+      if (auto* pd = ecs.template try_get<pending_deletes>(ecs.get_global_entity())) {
+        auto& entries = pd->entries;
+        entries.erase(std::remove_if(entries.begin(),
+                                     entries.end(),
+                                     [&](auto const& e) {
+                                       return std::find(confirmed.begin(), confirmed.end(), e.server_entity) != confirmed.end();
+                                     }),
+                     entries.end());
+      }
+      return 0;
+    });
+  }
 
   co_return;
 }
@@ -1225,13 +1569,22 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_entity_sync()
       // this matches what notify_entity_destruction_to_server would do
       // internally but avoids putting it inside the spawned coroutine,
       // where it would race with the synchronous mapping removal below.
-      auto server_entity = continuous_loader_.to_remote(e);
-      bool should_notify = !loading_snapshot_ && server_entity != entt_ext::null && rpc_client_.is_connected() && !session_id_.empty();
+      auto       server_entity = continuous_loader_.to_remote(e);
+      bool const was_synced    = !loading_snapshot_ && server_entity != entt_ext::null;
+      bool const should_notify = was_synced && rpc_client_.is_connected() && !session_id_.empty();
 
       // Remove the mapping synchronously now. The spawned RPC has the
       // server_entity captured by value, so it doesn't depend on the
       // map any more.
       continuous_loader_.remove_mapping_by_local(e);
+
+      if (was_synced && !should_notify) {
+        // Offline (or no session): the delete can't reach the server
+        // right now. Stamp a tombstone so it survives a process restart
+        // and is drained by reconcile_pending_deletes on the next
+        // connect (see entt_ext/sync/pending_changes.hpp).
+        stamp_pending_delete(server_entity);
+      }
 
       if (should_notify) {
         // Spawn the RPC externally so the channel processor isn't blocked
@@ -1246,6 +1599,7 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_entity_sync()
                 auto                   response = co_await rpc_client_.template invoke<entity_destroy_response>("entity_destroy", std::move(request));
                 if (!response.success) {
                   spdlog::error("Entity destruction sync failed: {}", response.error_message);
+                  stamp_pending_delete(server_entity);
                 } else {
                   spdlog::debug("Entity destruction notification sent successfully: client={} server={}",
                                 static_cast<int>(e),
@@ -1253,14 +1607,24 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_entity_sync()
                 }
               } catch (std::exception const& ex) {
                 spdlog::error("Error notifying entity destruction to server: {} {}", static_cast<int>(e), ex.what());
+                stamp_pending_delete(server_entity);
               } catch (...) {
                 spdlog::error("Error notifying entity destruction to server: unknown exception");
+                stamp_pending_delete(server_entity);
               }
             },
             asio::detached);
       }
     }
     co_return;
+  });
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::stamp_pending_delete(entity server_entity) {
+  auto const at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  ecs_.defer([server_entity, at_ms](entt_ext::ecs& ecs) {
+    ecs.template get_or_emplace<pending_deletes>(ecs.get_global_entity()).entries.push_back({server_entity, at_ms});
   });
 }
 

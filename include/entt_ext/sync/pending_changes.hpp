@@ -20,11 +20,15 @@
 //       last-write-wins ordering on the server.
 //       Clearing rule: server confirmed apply in reconcile.
 //
-// pending_delete is intentionally omitted at this phase — entity-level
-// deletes need a tombstone on the *global* entity (the dying entity
-// can't carry markers). It's a phase 4 concern.
+// Entity-level deletes can't carry a pending_delete<T> marker the same way
+// (the dying entity's components are gone by the time on_destroy observers
+// run), so they use a separate tombstone list on the *global* entity —
+// see pending_deletes below.
+
+#include <entt_ext/core.hpp>
 
 #include <cstdint>
+#include <vector>
 
 namespace entt_ext::sync {
 
@@ -46,6 +50,31 @@ struct pending_update {
   void serialize(Archive& ar) {
     ar(at_ms);
   }
+};
+
+// ---------------------------------------------------------------------------
+// pending_deletes — phase 4 follow-up (see docs/offline_first.md). Lives on
+// the global entity, not the dying one: sync_client's entity-destroy
+// observer resolves the entity's server id (continuous_loader_.to_remote)
+// before the mapping is dropped and appends an entry here whenever the
+// entity_destroy RPC can't go out immediately (offline, or the RPC itself
+// failed). Persisted by client_state_cache alongside everything else so the
+// delete survives a process restart; drained by
+// sync_client::reconcile_pending_deletes on the next connect, which retries
+// the entity_destroy RPC per entry and removes it on success.
+// ---------------------------------------------------------------------------
+struct pending_deletes {
+  struct entry {
+    entt_ext::entity server_entity = entt_ext::null;
+    std::int64_t     at_ms         = 0;
+
+    template <typename Archive>
+    void serialize(Archive& ar) {
+      ar(server_entity, at_ms);
+    }
+  };
+
+  std::vector<entry> entries;
 };
 
 // ---------------------------------------------------------------------------

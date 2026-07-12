@@ -38,6 +38,7 @@
 // along as an implicit instantiation inside whichever TU (shard or
 // scaffold) ends up calling the entry point, which is exactly where we
 // want the heavy lifting to happen.
+#include <entt_ext/pp_for_each.hpp>
 #include <entt_ext/sync_client_impl.hpp>
 
 #define ENTT_EXT_SYNC_CLIENT_INSTANTIATE(SyncClientT, ComponentT)                                                        \
@@ -48,7 +49,15 @@
   template boost::asio::awaitable<void> SyncClientT::reconcile_creates_for<ComponentT>(bool&);                           \
   template boost::asio::awaitable<void> SyncClientT::reconcile_updates_for<ComponentT>();                                \
   template void SyncClientT::copy_component_to_server_keyed<ComponentT>(                                                 \
-      entt::registry&, std::vector<entt_ext::entity> const&, std::vector<entt_ext::entity> const&)
+      entt::registry&, std::vector<entt_ext::entity> const&, std::vector<entt_ext::entity> const&);                     \
+  template void SyncClientT::copy_pending_markers_to_server_keyed<ComponentT>(                                           \
+      entt::registry&, std::vector<entt_ext::entity> const&, std::vector<entt_ext::entity> const&);                     \
+  template void SyncClientT::load_pending_markers<ComponentT>(cereal::PortableBinaryInputArchive&);                      \
+  template void SyncClientT::save_offline_component<ComponentT>(                                                         \
+      cereal::PortableBinaryOutputArchive&, std::vector<entt_ext::entity> const&,                                       \
+      std::unordered_map<entt_ext::entity, std::uint32_t> const&);                                                      \
+  template void SyncClientT::load_offline_component<ComponentT>(cereal::PortableBinaryInputArchive&,                     \
+                                                                std::vector<entt_ext::entity> const&)
 
 #define ENTT_EXT_SYNC_CLIENT_EXTERN(SyncClientT, ComponentT)                                                             \
   extern template void SyncClientT::setup_automatic_sync<ComponentT>();                                                  \
@@ -58,4 +67,26 @@
   extern template boost::asio::awaitable<void> SyncClientT::reconcile_creates_for<ComponentT>(bool&);                    \
   extern template boost::asio::awaitable<void> SyncClientT::reconcile_updates_for<ComponentT>();                         \
   extern template void SyncClientT::copy_component_to_server_keyed<ComponentT>(                                         \
-      entt::registry&, std::vector<entt_ext::entity> const&, std::vector<entt_ext::entity> const&)
+      entt::registry&, std::vector<entt_ext::entity> const&, std::vector<entt_ext::entity> const&);                     \
+  extern template void SyncClientT::copy_pending_markers_to_server_keyed<ComponentT>(                                    \
+      entt::registry&, std::vector<entt_ext::entity> const&, std::vector<entt_ext::entity> const&);                     \
+  extern template void SyncClientT::load_pending_markers<ComponentT>(cereal::PortableBinaryInputArchive&);               \
+  extern template void SyncClientT::save_offline_component<ComponentT>(                                                  \
+      cereal::PortableBinaryOutputArchive&, std::vector<entt_ext::entity> const&,                                       \
+      std::unordered_map<entt_ext::entity, std::uint32_t> const&);                                                      \
+  extern template void SyncClientT::load_offline_component<ComponentT>(cereal::PortableBinaryInputArchive&,              \
+                                                                       std::vector<entt_ext::entity> const&)
+
+// _LIST variants: drive ENTT_EXT_SYNC_CLIENT_INSTANTIATE/EXTERN across an
+// entire comma-separated component list in one shot (see pp_for_each.hpp),
+// so a shard file or the scaffold's extern block never has to spell out one
+// line per component — they instead name a whole group macro from the app's
+// sync_components.hpp. Adding/removing a component then only means editing
+// that one group list; nothing here or in any shard/scaffold .cpp changes.
+#define ENTT_EXT_SYNC_CLIENT_INSTANTIATE_ONE_(SyncClientT, ComponentT) ENTT_EXT_SYNC_CLIENT_INSTANTIATE(SyncClientT, ComponentT);
+#define ENTT_EXT_SYNC_CLIENT_INSTANTIATE_LIST(SyncClientT, ...) \
+  ENTT_EXT_FOR_EACH_ARG(ENTT_EXT_SYNC_CLIENT_INSTANTIATE_ONE_, SyncClientT, __VA_ARGS__)
+
+#define ENTT_EXT_SYNC_CLIENT_EXTERN_ONE_(SyncClientT, ComponentT) ENTT_EXT_SYNC_CLIENT_EXTERN(SyncClientT, ComponentT);
+#define ENTT_EXT_SYNC_CLIENT_EXTERN_LIST(SyncClientT, ...) \
+  ENTT_EXT_FOR_EACH_ARG(ENTT_EXT_SYNC_CLIENT_EXTERN_ONE_, SyncClientT, __VA_ARGS__)

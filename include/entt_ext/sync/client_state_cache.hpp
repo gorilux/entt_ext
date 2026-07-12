@@ -191,6 +191,14 @@ private:
       }
     };
     (attach.template operator()<ComponentsT>(), ...);
+
+    // pending_deletes lives on the global entity (see
+    // entt_ext/sync/pending_changes.hpp) and isn't part of ComponentsT, so
+    // it needs its own dirty-trigger wiring to be captured by the
+    // periodic save.
+    auto& pending_deletes_obs = ecs_.template component_observer<pending_deletes>();
+    pending_deletes_obs.on_construct(trigger);
+    pending_deletes_obs.on_update(trigger);
   }
 
   void register_save_system(double interval) {

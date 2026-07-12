@@ -18,6 +18,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace entt_ext {
 struct settings_header {
@@ -121,15 +122,55 @@ struct settings_collection {
 using InputArchiveType  = cereal::PortableBinaryInputArchive;
 using OutputArchiveType = cereal::PortableBinaryOutputArchive;
 
+// A file that fails to deserialize (truncated, corrupted, unreadable version)
+// gets moved aside instead of left in place, because the caller falls back to
+// an empty/default registry and — for apps with autosave — will write that
+// default state back over `filename` shortly after. Without this rename, the
+// corrupt file's contents (and any forensic value they had) are gone the
+// moment that autosave lands, with no trace anything went wrong beyond a log
+// line. `filename + ".corrupt"` is a fixed name (not timestamped) since this
+// is a single most-recent-failure artifact, not a rotating history.
+inline void preserve_corrupt_file(std::string const& filename, std::exception const& ex) {
+  std::string const corrupt_filename = filename + ".corrupt";
+  spdlog::error("Failed to load settings '{}': {} — preserving as '{}' and starting fresh",
+                filename, ex.what(), corrupt_filename);
+  std::error_code ec;
+  std::filesystem::rename(filename, corrupt_filename, ec);
+  if (ec) {
+    spdlog::error("Failed to preserve corrupt settings file '{}' as '{}': {}",
+                  filename, corrupt_filename, ec.message());
+  }
+}
+
+// Writes to a temp file in the same directory, then rename()s it over the
+// destination. rename() is atomic on POSIX, so a crash mid-write leaves the
+// old (still-valid) file untouched instead of a truncated/corrupt one — the
+// prior direct-write-in-place version could zero out the settings file if the
+// process died between opening it and finishing the write.
 template <typename SettingsCollectionT>
 asio::awaitable<bool> save(std::string const& filename, entt_ext::ecs const& ecs) {
 
-  std::ofstream     ofs(filename, std::ios::binary);
-  OutputArchiveType archive(ofs);
-  settings_header   header{.version = SettingsCollectionT::latest_version};
-  archive(header);
+  std::string const tmp_filename = filename + ".tmp";
 
-  co_await SettingsCollectionT::save(header.version, archive, ecs);
+  {
+    std::ofstream ofs(tmp_filename, std::ios::binary | std::ios::trunc);
+    if (!ofs) {
+      throw std::runtime_error("Failed to open '" + tmp_filename + "' for writing");
+    }
+    OutputArchiveType archive(ofs);
+    settings_header   header{.version = SettingsCollectionT::latest_version};
+    archive(header);
+
+    co_await SettingsCollectionT::save(header.version, archive, ecs);
+  } // archive/ofs destroyed here — flushed and closed before the rename below
+
+  std::error_code ec;
+  std::filesystem::rename(tmp_filename, filename, ec);
+  if (ec) {
+    throw std::runtime_error("Failed to rename '" + tmp_filename + "' to '" + filename
+                             + "': " + ec.message());
+  }
+
   co_return true;
 }
 
@@ -162,7 +203,7 @@ asio::awaitable<entt_ext::ecs> load(std::string const& filename) {
     archive(header);
     co_await SettingsCollectionT::load(header.version, archive, ecs);
   } catch (std::exception const& ex) {
-    spdlog::error("Failed to load settings: {}", ex.what());
+    preserve_corrupt_file(filename, ex);
     co_return ecs;
   }
 
@@ -182,7 +223,7 @@ asio::awaitable<bool> merge(std::string const& filename, entt_ext::ecs& ecs) {
     archive(header);
     co_return co_await SettingsCollectionT::merge(header.version, archive, ecs);
   } catch (std::exception const& ex) {
-    spdlog::error("Failed to load settings: {}", ex.what());
+    preserve_corrupt_file(filename, ex);
     co_return false;
   }
 }
