@@ -352,9 +352,11 @@ private:
                 filtered.insert(child);
               }
             }
-            if (!filtered.empty()) {
-              tmp.template emplace<entt_ext::children<ActualT>>(e, std::move(filtered));
-            }
+            // Emplace even when empty: the component's PRESENCE is state
+            // (an empty group/hierarchy node must still reach the client, or
+            // views over children<T> lose the entity after every reconnect).
+            // Only the filtered-out member ids were the tenant-leak concern.
+            tmp.template emplace<entt_ext::children<ActualT>>(e, std::move(filtered));
           }
         }
       }
