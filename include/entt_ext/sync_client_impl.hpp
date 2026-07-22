@@ -1046,6 +1046,12 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
       if (loading_snapshot_) {
         co_return;
       }
+      // This body runs deferred; the entity can be destroyed between the
+      // construct signal and here (e.g. emplace immediately followed by
+      // delete_later). try_get/emplace_or_replace assert on invalid entities.
+      if (!ecs.valid(e)) {
+        co_return;
+      }
       if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
         co_return;
       }
@@ -1095,6 +1101,12 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
       if (loading_snapshot_) {
         co_return;
       }
+      // Deferred body — the entity can be gone by now (patch immediately
+      // followed by delete_later: nexus group deletion crashed exactly here,
+      // emplace_or_replace<pending_update> asserting on the dead entity).
+      if (!ecs.valid(e)) {
+        co_return;
+      }
       if (auto request = ecs.template try_get<component_update_request<ComponentT>>(e); request != nullptr) {
         co_return;
       }
@@ -1135,6 +1147,12 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
     // When a sync component is removed, notify server immediately
     observer.on_destroy([this](entt_ext::ecs& ecs, entt_ext::entity e, ComponentT& component) -> asio::awaitable<void> {
       if (loading_snapshot_) {
+        co_return;
+      }
+      // Deferred body — when the WHOLE entity was destroyed (not just this
+      // component), try_get below would assert, and the entity-destroy path
+      // already notifies the server; per-component removals are redundant.
+      if (!ecs.valid(e)) {
         co_return;
       }
       if (auto request = ecs.template try_get<component_remove_request<ComponentT>>(e); request != nullptr) {
