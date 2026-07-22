@@ -270,8 +270,12 @@ private:
           [entity = cfg.entity, &ecs, &self, dt, handler = cfg.handler, view]() mutable -> asio::awaitable<void> {
             try {
               co_await handler(ecs, self, dt, view);
+            } catch (std::exception const& ex) {
+              // Running tag is still removed below, but the handler died mid-body —
+              // any manual guard state it holds (atomics, flags) may be stuck.
+              spdlog::error("entt_ext: detached run handler '{}' threw: {}", entt::type_id<FuncT>().name(), ex.what());
             } catch (...) {
-              // Ensure running tag is always removed even if handler throws
+              spdlog::error("entt_ext: detached run handler '{}' threw a non-std exception", entt::type_id<FuncT>().name());
             }
             co_await ecs.remove_deferred<running<system_tag>>(entity);
           },
@@ -450,8 +454,12 @@ private:
 
               try {
                 co_await invoke_handler_async(handler, ecs, self, dt, entity, args);
+              } catch (std::exception const& ex) {
+                // Running tag is still removed below, but the handler died mid-body —
+                // any manual guard state it holds (atomics, flags) may be stuck.
+                spdlog::error("entt_ext: detached each handler '{}' threw on entity {}: {}", entt::type_id<FuncT>().name(), static_cast<std::uint32_t>(entity), ex.what());
               } catch (...) {
-                // Ensure running tag is always removed even if handler throws
+                spdlog::error("entt_ext: detached each handler '{}' threw a non-std exception on entity {}", entt::type_id<FuncT>().name(), static_cast<std::uint32_t>(entity));
               }
 
               co_await ecs.remove_deferred<running<FuncT, each_tag>>(entity);
@@ -732,8 +740,12 @@ public:
             co_await asio::this_coro::executor;
             try {
               co_await std::apply(handler, std::tuple_cat(std::tie(ecs, self, dt), entry));
+            } catch (std::exception const& ex) {
+              // Running tag is still removed below, but the handler died mid-body —
+              // any manual guard state it holds (atomics, flags) may be stuck.
+              spdlog::error("entt_ext: detached each handler '{}' threw on entity {}: {}", entt::type_id<FuncT>().name(), static_cast<std::uint32_t>(entity), ex.what());
             } catch (...) {
-              // Ensure running tag is always removed even if handler throws
+              spdlog::error("entt_ext: detached each handler '{}' threw a non-std exception on entity {}", entt::type_id<FuncT>().name(), static_cast<std::uint32_t>(entity));
             }
 
             co_await ecs.remove_deferred<running<FuncT, each_tag>>(entity);
