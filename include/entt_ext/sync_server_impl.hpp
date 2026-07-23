@@ -163,6 +163,8 @@ sync_server_with_channel<ChannelT, SyncComponentsT...>::handle_handshake_request
     if (!request.protocol_version.empty() && request.protocol_version != protocol_version_) {
       std::string error_msg = "Protocol version mismatch! Server: " + protocol_version_ + ", Client: " + request.protocol_version;
       spdlog::error("sync_server::handshake: {}", error_msg);
+      spdlog::info("sync_server: local sync components (diff against the client's log):\n{}",
+                   sync_component_list<SyncComponentsT...>::component_list());
       co_return handshake_response{.success          = false,
                                    .session_id       = "",
                                    .error_message    = error_msg,

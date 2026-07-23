@@ -1540,6 +1540,8 @@ asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::pe
       // Validate protocol version match
       if (!response.protocol_version.empty() && response.protocol_version != protocol_version_) {
         spdlog::error("Protocol version mismatch! Client: {}, Server: {}", protocol_version_, response.protocol_version);
+        spdlog::info("sync_client: local sync components (diff against the server's log):\n{}",
+                     sync_component_list<SyncComponentsT...>::component_list());
         session_id_.clear();
         co_return false;
       }

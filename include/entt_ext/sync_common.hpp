@@ -57,30 +57,31 @@ private:
     return hash;
   }
 
-  // Helper to add component name to hash and output stream
+  // Order-sensitive mix of the full type name (including with_hierarchy /
+  // sync policy wrappers) — client/server with different wrappers must not match.
   template <typename T>
-  static void add_component_to_protocol(std::ostringstream& oss, size_t& hash) {
-    // Use the full type name (including with_hierarchy wrapper if present)
-    // This ensures client/server with different hierarchy configs don't match
-    auto name = type_name<T>();
-    hash ^= fnv1a(name) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    oss << name << "_";
+  static void hash_component(std::uint64_t& hash) {
+    hash ^= fnv1a(type_name<T>()) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
   }
 
 public:
-  // Generate a protocol version string based on component types and their order
+  // Wire protocol identity: prefix + component count + hash of the ordered
+  // type names. The names themselves stay off the wire — with dozens of
+  // components the concatenation ran to kilobytes and made mismatch errors
+  // unreadable; component_list() reproduces the readable list for local logs.
   static std::string generate_protocol_version() {
+    std::uint64_t hash = size();
+    (hash_component<Components>(hash), ...);
     std::ostringstream oss;
-    size_t             hash = size();
+    oss << "sync_v1_" << size() << "c_" << std::hex << hash;
+    return oss.str();
+  }
 
-    // Include component names for debugging
-    oss << "sync_v1_";
-
-    // Combine type names in order to create a version identifier
-    (add_component_to_protocol<Components>(oss, hash), ...);
-
-    oss << "hash_" << std::hex << hash;
-
+  // Human-readable component names in protocol order, one per line — log this
+  // on a version mismatch so the two sides' lists can be diffed.
+  static std::string component_list() {
+    std::ostringstream oss;
+    ((oss << type_name<Components>() << '\n'), ...);
     return oss.str();
   }
 

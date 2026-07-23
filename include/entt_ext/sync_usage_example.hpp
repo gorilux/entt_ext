@@ -132,7 +132,7 @@ constexpr bool validate_sync_lists() {
 // ============================================================================
 //
 // When the client connects:
-// 1. Client generates protocol version: "sync_v1_Position_Velocity_Health_hash_abc123"
+// 1. Client generates protocol version: "sync_v1_3c_abc123" (count + hash of the ordered type names)
 // 2. Client sends handshake with protocol version
 // 3. Server validates protocol version matches its own
 // 4. If match: Connection succeeds
