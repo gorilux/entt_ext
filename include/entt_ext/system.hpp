@@ -736,7 +736,7 @@ public:
       ecs.detached_each_acquire();
       asio::co_spawn(
           concurrent_executor,
-          [&main_executor, entity, &ecs, &self, dt, handler, entry]() -> asio::awaitable<void> {
+          [entity, &ecs, &self, dt, handler, entry]() -> asio::awaitable<void> {
             co_await asio::this_coro::executor;
             try {
               co_await std::apply(handler, std::tuple_cat(std::tie(ecs, self, dt), entry));
@@ -804,10 +804,12 @@ struct system_builder<entt::get_t<>, entt::exclude_t<>> {
   }
 
 private:
-  entt_ext::ecs&    ecs_;
-  asio::io_context& main_io_context_;
-  asio::io_context& concurrent_io_context_;
-  entt_ext::entity  entity_;
+  entt_ext::ecs& ecs_;
+  // Held only for signature symmetry with the general template; this specialization
+  // drives no view and never dispatches onto either context.
+  [[maybe_unused]] asio::io_context& main_io_context_;
+  [[maybe_unused]] asio::io_context& concurrent_io_context_;
+  entt_ext::entity                   entity_;
 };
 
 template <typename... ComponentsT, typename... ExcludeT>

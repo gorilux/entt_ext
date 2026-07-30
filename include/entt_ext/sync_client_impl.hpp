@@ -1261,7 +1261,7 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
   // Connected to BOTH on_construct and on_update for the same reason as
   // apply_component_update above — the marker is placed with emplace_or_replace.
   auto apply_component_remove =
-      [this](entt_ext::ecs& ecs, entt_ext::entity e, component_remove_request<ComponentT>& request) -> asio::awaitable<void> {
+      [](entt_ext::ecs& ecs, entt_ext::entity e, component_remove_request<ComponentT>& request) -> asio::awaitable<void> {
     (void)request;
     try {
       // Same window as apply_component_update: the entity can be destroyed

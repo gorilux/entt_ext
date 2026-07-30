@@ -164,7 +164,7 @@ public:
 
 private:
   void setup_auto_save_observers() {
-    auto trigger = [this](ecs& e, entity, auto&) {
+    auto trigger = [](ecs& e, entity, auto&) {
       e.template emplace_if_not_exists<detail::cache_dirty>(e.get_global_entity());
     };
 

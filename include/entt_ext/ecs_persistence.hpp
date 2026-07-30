@@ -100,7 +100,7 @@ asio::awaitable<bool> ecs::merge_snapshot(ArchiveT& ar) {
             continuous_loader_.orphans();
 
             // Remap entity references inside components after loading
-            auto remap_component = [this]<typename T>() {
+            auto remap_component = [&]<typename T>() {
               using ActualT = sync::unwrap_hierarchy_t<T>;
               remap_component_entities<ActualT>();
               if constexpr (sync::is_with_hierarchy_v<T>) {
