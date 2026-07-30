@@ -1,6 +1,7 @@
 #include "entt_ext/ecs_persistence.hpp"
 
-#include <boost/asio/deadline_timer.hpp>
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/system_timer.hpp>
 
 #include <functional>
 
@@ -96,7 +97,12 @@ void ecs::run(int timeout_ms, size_t concurrency) {
 
 #ifndef __EMSCRIPTEN__
   auto& concurrent_io_ctx = concurrent_io_context();
-  auto  dummy_timer       = boost::asio::deadline_timer{concurrent_io_ctx};
+
+  // Keep the worker threads' concurrent_io_ctx.run() alive even when it has no
+  // outstanding work yet. This used to be a never-expiring deadline_timer; a
+  // work guard says the same thing without depending on a timer's default
+  // expiry (system_timer's default is the epoch, i.e. already elapsed).
+  auto concurrent_work = boost::asio::make_work_guard(concurrent_io_ctx);
 
   // Ignore SIGPIPE to prevent socket write operations from terminating the process.
   // This is essential for network applications — writing to a closed socket generates
@@ -109,8 +115,6 @@ void ecs::run(int timeout_ms, size_t concurrency) {
     concurrent_io_context().stop();
     main_io_context().stop();
   });
-
-  dummy_timer.async_wait([](auto) {});
 
   sort<entt_ext::system>([](const auto& lhs, const auto& rhs) {
     return lhs.stage < rhs.stage;
@@ -134,7 +138,7 @@ void ecs::run(int timeout_ms, size_t concurrency) {
 
   main_io_ctx.run();
   signals.cancel();
-  dummy_timer.cancel();
+  concurrent_work.reset();
   remove<asio::thread_pool>(global_entity_);
 
   clear();
@@ -172,7 +176,7 @@ void ecs::run(int timeout_ms, size_t concurrency) {
 auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable<void> {
 
   auto executor = co_await asio::this_coro::executor;
-  auto timer    = boost::asio::deadline_timer{executor};
+  auto timer    = boost::asio::system_timer{executor};
 
   auto outstanding_systems = view<entt_ext::system>(entt::exclude<running<system_tag>, run_once_tag>);
 
@@ -180,7 +184,7 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
     auto systems_running = view<running<system_tag>>();
 
     while (systems_running.begin() != systems_running.end()) {
-      timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
+      timer.expires_after(std::chrono::milliseconds(timeout_ms));
       co_await timer.async_wait(use_nothrow_awaitable);
       // spdlog::debug("waiting for systems to finish");
     }
@@ -193,7 +197,7 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
     // co_await below yields the main thread so process_command_channel can
     // apply those decrements — do NOT gate command processing on this barrier.
     while (detached_each_in_flight_ > 0) {
-      timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
+      timer.expires_after(std::chrono::milliseconds(timeout_ms));
       co_await timer.async_wait(use_nothrow_awaitable);
       // spdlog::debug("waiting for detached each coroutines to finish");
     }
@@ -201,7 +205,7 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
   };
 
   while (running_) {
-    timer.expires_from_now(boost::posix_time::milliseconds(timeout_ms));
+    timer.expires_after(std::chrono::milliseconds(timeout_ms));
 
     for (auto [entt, sys] : outstanding_systems.each()) {
 
