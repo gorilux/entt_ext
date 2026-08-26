@@ -27,11 +27,32 @@ struct unwrap_optional_tag<optional_tag<T>> {
   using type = T;
 };
 
-// A marker is any template parameter that is NOT a required component:
-// currently {children_view<...>, optional_tag<...>}. Markers are stripped
-// from the view query and replaced at call time with computed arguments.
+// Type trait to detect by_value
 template <typename T>
-inline constexpr bool is_marker_v = is_children_view_v<T> || is_optional_tag_v<T>;
+struct is_by_value : std::false_type {};
+
+template <typename T>
+struct is_by_value<by_value<T>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_by_value_v = is_by_value<T>::value;
+
+// Unwrap by_value<T> -> T
+template <typename T>
+struct unwrap_by_value;
+
+template <typename T>
+struct unwrap_by_value<by_value<T>> {
+  using type = T;
+};
+
+// A marker is any template parameter that needs special argument handling:
+// currently {children_view<...>, optional_tag<...>, by_value<...>}.
+// children_view and optional_tag are stripped from the view query; by_value
+// keeps its component in the query but the handler receives a copy taken at
+// dispatch time instead of a reference into the pool.
+template <typename T>
+inline constexpr bool is_marker_v = is_children_view_v<T> || is_optional_tag_v<T> || is_by_value_v<T>;
 
 // Helper to filter children_view types from component list
 template <typename... Ts>
@@ -65,7 +86,21 @@ struct extract_children_views<T, Rest...> {
       std::conditional_t<is_children_view_v<T>, decltype(std::tuple_cat(std::declval<std::tuple<T>>(), std::declval<rest_type>())), rest_type>;
 };
 
-// Filter: keep only regular (non-marker) components. Used to build the view query.
+// Map a declared template parameter to its view-query contribution:
+//   regular component T -> tuple<T>
+//   by_value<T>         -> tuple<T>   (still required by the query)
+//   other markers       -> tuple<>    (stripped)
+template <typename T>
+struct view_contribution {
+  using type = std::conditional_t<is_marker_v<T>, std::tuple<>, std::tuple<T>>;
+};
+
+template <typename T>
+struct view_contribution<by_value<T>> {
+  using type = std::tuple<T>;
+};
+
+// Filter: build the view-query component list from the declared parameters.
 template <typename... Ts>
 struct filter_markers;
 
@@ -77,8 +112,7 @@ struct filter_markers<> {
 template <typename T, typename... Rest>
 struct filter_markers<T, Rest...> {
   using rest_type = typename filter_markers<Rest...>::type;
-  using type =
-      std::conditional_t<is_marker_v<T>, rest_type, decltype(std::tuple_cat(std::declval<std::tuple<T>>(), std::declval<rest_type>()))>;
+  using type      = decltype(std::tuple_cat(std::declval<typename view_contribution<T>::type>(), std::declval<rest_type>()));
 };
 
 // Convert tuple to entt::get_t
@@ -604,6 +638,7 @@ private:
   // Compute the handler-argument type for each declared template parameter:
   //   regular component T      -> T&
   //   optional_tag<T>          -> T*   (nullable, via ecs.try_get<T>)
+  //   by_value<T>              -> std::remove_const_t<T> (a copy taken at dispatch time)
   //   children_view<Type,...>  -> children_range<ecs_type, Type, Others...> (by value)
   template <typename T>
   struct handler_arg {
@@ -613,6 +648,13 @@ private:
   template <typename T>
   struct handler_arg<optional_tag<T>> {
     using type = T*;
+  };
+
+  template <typename T>
+  struct handler_arg<by_value<T>> {
+    // The copy lives in the args tuple; non-const so the tuple stays movable
+    // into a detached coroutine's capture (moving a const element copies).
+    using type = std::remove_const_t<T>;
   };
 
   template <typename Type, typename... Others>
@@ -629,6 +671,12 @@ private:
     if constexpr (is_optional_tag_v<T>) {
       using inner = typename unwrap_optional_tag<T>::type;
       return ecs.template try_get<inner>(entity); // inner*
+    } else if constexpr (is_by_value_v<T>) {
+      using inner = typename unwrap_by_value<T>::type;
+      // Returns a reference, but the tuple element is a value type — the copy
+      // happens at tuple construction, on the scheduler thread, while the
+      // reference is still guaranteed valid.
+      return ecs.template get<inner>(entity);
     } else if constexpr (is_children_view_v<T>) {
       return create_children_range<T>(ecs, entity); // children_range by value
     } else {

@@ -111,6 +111,15 @@ struct children_view {};
 template <typename T>
 struct optional_tag {};
 
+// Marker type for system component declarations: T stays in the view's
+// required set, but the handler receives a private copy of T taken on the
+// scheduler thread at dispatch time instead of a reference into the pool.
+// Required for any component a detached body reads: a pool reference dangles
+// as soon as the main thread replaces or removes the component while the body
+// runs on the concurrent executor.
+template <typename T>
+struct by_value {};
+
 // Entity mapping helper functions for children (index_set<entity, Type>)
 // These are free functions that work with the children type alias
 
