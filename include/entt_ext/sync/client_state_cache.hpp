@@ -24,12 +24,14 @@
 #include <entt_ext/sync/pending_changes.hpp>
 
 #include <cereal/archives/portable_binary.hpp>
+#include <cereal/types/string.hpp>
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
 
 #include <spdlog/spdlog.h>
 
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -42,6 +44,16 @@ namespace detail {
 // the periodic save system. Local to this header to avoid polluting the
 // app's component namespace.
 struct cache_dirty {};
+
+// Cache file header. The payload (save_cached_snapshot) is a positional
+// archive whose shape depends on the ordered sync component list — a file
+// written under a different list cannot be parsed: the stream desyncs and
+// the garbage entity ids abort on an entt assert (not an exception), so it
+// must be rejected up front. cache_format_version covers the layout of the
+// sections themselves (bump when save_cached_snapshot gains/reorders
+// sections); the protocol string covers the app's component list.
+inline constexpr char          cache_magic[]        = "entt_ext_sync_cache";
+inline constexpr std::uint32_t cache_format_version = 1;
 } // namespace detail
 
 template <typename SyncClient, typename... ComponentsT>
@@ -86,6 +98,24 @@ public:
     try {
       cereal::PortableBinaryInputArchive archive(ifs);
 
+      // Header validation — see detail::cache_magic. A stale cache (older
+      // binary, different component list, pre-header format) is discarded
+      // and the client starts fresh; the next server snapshot repopulates
+      // it. A pre-header file usually throws inside these reads (its first
+      // bytes decode as an absurd string length) — same catch path below.
+      std::string   magic;
+      std::uint32_t format = 0;
+      std::string   protocol;
+      archive(magic, format, protocol);
+      if (magic != detail::cache_magic || format != detail::cache_format_version ||
+          protocol != expected_protocol()) {
+        spdlog::warn("[sync cache] {} has incompatible schema (format {} protocol '{}', expected {} '{}') — "
+                     "renaming to .bak and continuing fresh",
+                     filename_, format, protocol, detail::cache_format_version, expected_protocol());
+        discard_cache();
+        return;
+      }
+
       // Suppress sync_client's "send to server" observers while the
       // registry rehydrates — the emplace events here are local restore
       // events, not user-driven mutations, and the session may not even
@@ -126,8 +156,7 @@ public:
     } catch (std::exception const& ex) {
       spdlog::warn("[sync cache] failed to load {}: {} — renaming to .bak and continuing fresh",
                    filename_, ex.what());
-      std::error_code rename_ec;
-      std::filesystem::rename(filename_, filename_ + ".bak", rename_ec);
+      discard_cache();
     }
   }
 
@@ -144,6 +173,8 @@ public:
       }
 
       cereal::PortableBinaryOutputArchive archive(ofs);
+
+      archive(std::string(detail::cache_magic), detail::cache_format_version, expected_protocol());
 
       // Persist a server-keyed snapshot (the sync_client translates the
       // live local entity IDs to their server IDs). The file is therefore
@@ -163,6 +194,19 @@ public:
   }
 
 private:
+  // Same wrapped component pack as the sync client, so this reproduces the
+  // wire protocol string exactly (count + ordered-name hash, see
+  // sync_component_list::generate_protocol_version).
+  static std::string const& expected_protocol() {
+    static std::string const value = sync_component_list<ComponentsT...>::generate_protocol_version();
+    return value;
+  }
+
+  void discard_cache() {
+    std::error_code ec;
+    std::filesystem::rename(filename_, filename_ + ".bak", ec);
+  }
+
   void setup_auto_save_observers() {
     auto trigger = [](ecs& e, entity, auto&) {
       e.template emplace_if_not_exists<detail::cache_dirty>(e.get_global_entity());
