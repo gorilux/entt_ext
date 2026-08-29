@@ -1,9 +1,11 @@
 [wrap-git]
 directory = cereal
 url = https://github.com/USCiLab/cereal.git
-revision = master
+# Pinned: cereal has no release with the tuple.hpp fix (v1.3.2 still
+# emits `::template apply(...)` with no argument list). Track a commit,
+# never `master` -- an unpinned branch silently breaks fresh clones.
+revision = 22a1b369f39be918ca79206a83c4facd759f9105
 
-diff_files = cereal.patch
 patch_filename = cereal.tar.gz
 
 [provide]
