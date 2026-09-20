@@ -1,0 +1,6 @@
+option(
+  'tests',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build entt_ext unit tests. Auto = enabled when built standalone on a native target, disabled when used as a subproject.',
+)
