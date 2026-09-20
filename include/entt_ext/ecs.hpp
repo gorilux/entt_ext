@@ -768,6 +768,19 @@ public:
   auto                      detached_each_release_deferred() -> asio::awaitable<void>;
 
   void run(int timeout_ms = 16, size_t concurrency = std::thread::hardware_concurrency());
+
+  // Non-blocking counterpart to run(), for hosts that own their own main loop
+  // (unit tests, embedders). Spawns process_command_channel() on first call —
+  // the same single processor run() relies on — then executes whatever is
+  // already ready on the main executor and returns the handler count, so
+  // `while (ecs.poll() != 0) {}` drains the command channel to quiescence.
+  //
+  // It deliberately does NOT drive run_update_loop(): systems do not tick, no
+  // signal handlers are installed and clear() is not called on exit. This
+  // exercises the deferred command path (defer / defer_awaitable / async
+  // observer bodies) in isolation. Do not mix with run() on the same instance.
+  std::size_t poll();
+
   void stop();
   auto main_io_context() -> asio::io_context&;
   auto main_io_context() const -> const asio::io_context&;
@@ -954,6 +967,10 @@ private:
   std::size_t                                                       detached_each_in_flight_ = 0;
   std::size_t                                                       command_channel_size_;
   command_channel                                                   command_channel_;
+  // process_command_channel() must be spawned exactly once per instance.
+  // run() and poll() are both entry points, so the guard lives here rather
+  // than at either call site.
+  bool                                                              command_processor_started_ = false;
   std::unordered_set<entt::id_type>                                 registered_cleanup_handlers_;
   // Set to true during bulk-load paths to suppress async observer queueing.
   // See set_async_observers_muted() for rationale. Single-thread access only.

@@ -121,6 +121,7 @@ void ecs::run(int timeout_ms, size_t concurrency) {
   });
 
   // Spawn global channel processor
+  command_processor_started_ = true;
   asio::co_spawn(main_io_ctx, process_command_channel(), asio::detached);
 
   asio::co_spawn(main_io_ctx, run_update_loop(timeout_ms, concurrency), asio::detached);
@@ -266,6 +267,22 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
 
 void ecs::stop() {
   running_ = false;
+}
+
+std::size_t ecs::poll() {
+  if (!command_processor_started_) {
+    command_processor_started_ = true;
+    asio::co_spawn(main_io_context_, process_command_channel(), asio::detached);
+  }
+
+  // poll() leaves an io_context in the stopped state once it runs out of
+  // ready work; without the restart a command deferred after the previous
+  // poll would sit in the channel and never be dispatched.
+  if (main_io_context_.stopped()) {
+    main_io_context_.restart();
+  }
+
+  return main_io_context_.poll();
 }
 
 // ============= Deferred Operations Implementation =============
