@@ -588,7 +588,7 @@ void sync_server_with_channel<ChannelT, SyncComponentsT...>::setup_automatic_syn
             // succeed on the wire.
 
             // Apply the component update
-            spdlog::debug("Applying component update request: {} server={} client={} version={}",
+            spdlog::debug("Applying component update request: {} server={} sync_version_ms={} session={}",
                           type_name<ComponentT>(),
                           static_cast<int>(e),
                           std::chrono::duration_cast<std::chrono::milliseconds>(request.sync_version.time_since_epoch()).count(),
