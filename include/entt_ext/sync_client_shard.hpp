@@ -57,7 +57,17 @@
       cereal::PortableBinaryOutputArchive&, std::vector<entt_ext::entity> const&,                                       \
       std::unordered_map<entt_ext::entity, std::uint32_t> const&);                                                      \
   template void SyncClientT::load_offline_component<ComponentT>(cereal::PortableBinaryInputArchive&,                     \
-                                                                std::vector<entt_ext::entity> const&)
+                                                                std::vector<entt_ext::entity> const&);                  \
+  template void SyncClientT::collect_mapped_entities<ComponentT>(                                                        \
+      std::vector<entt_ext::entity>&, std::vector<entt_ext::entity>&, std::unordered_set<entt_ext::entity>&);            \
+  template void SyncClientT::save_cached_component<ComponentT>(entt::registry&,                                          \
+                                                               cereal::PortableBinaryOutputArchive&);                    \
+  template void SyncClientT::save_cached_pending_markers<ComponentT>(                                                    \
+      entt::registry&, cereal::PortableBinaryOutputArchive&, std::vector<entt_ext::entity> const&,                       \
+      std::vector<entt_ext::entity> const&);                                                                             \
+  template void SyncClientT::collect_offline_entities<ComponentT>(                                                       \
+      std::vector<entt_ext::entity>&, std::unordered_map<entt_ext::entity, std::uint32_t>&,                              \
+      std::unordered_set<entt_ext::entity> const&)
 
 #define ENTT_EXT_SYNC_CLIENT_EXTERN(SyncClientT, ComponentT)                                                             \
   extern template void SyncClientT::setup_automatic_sync<ComponentT>();                                                  \
@@ -75,7 +85,17 @@
       cereal::PortableBinaryOutputArchive&, std::vector<entt_ext::entity> const&,                                       \
       std::unordered_map<entt_ext::entity, std::uint32_t> const&);                                                      \
   extern template void SyncClientT::load_offline_component<ComponentT>(cereal::PortableBinaryInputArchive&,              \
-                                                                       std::vector<entt_ext::entity> const&)
+                                                                       std::vector<entt_ext::entity> const&);           \
+  extern template void SyncClientT::collect_mapped_entities<ComponentT>(                                                 \
+      std::vector<entt_ext::entity>&, std::vector<entt_ext::entity>&, std::unordered_set<entt_ext::entity>&);            \
+  extern template void SyncClientT::save_cached_component<ComponentT>(entt::registry&,                                   \
+                                                                      cereal::PortableBinaryOutputArchive&);             \
+  extern template void SyncClientT::save_cached_pending_markers<ComponentT>(                                             \
+      entt::registry&, cereal::PortableBinaryOutputArchive&, std::vector<entt_ext::entity> const&,                       \
+      std::vector<entt_ext::entity> const&);                                                                             \
+  extern template void SyncClientT::collect_offline_entities<ComponentT>(                                                \
+      std::vector<entt_ext::entity>&, std::unordered_map<entt_ext::entity, std::uint32_t>&,                              \
+      std::unordered_set<entt_ext::entity> const&)
 
 // _LIST variants: drive ENTT_EXT_SYNC_CLIENT_INSTANTIATE/EXTERN across an
 // entire comma-separated component list in one shot (see pp_for_each.hpp),

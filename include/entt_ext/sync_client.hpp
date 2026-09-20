@@ -28,9 +28,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace entt_ext::sync {
@@ -122,6 +124,11 @@ public:
         }
         ecs.set_async_observers_muted(false);
         loading_snapshot_ = false;
+
+        // These reference entities we just destroyed. The thunks re-check
+        // valid()/all_of(), but entity ids recycle — drop them rather than
+        // let the next snapshot's unmute patch an unrelated marker.
+        muted_update_replay_.clear();
       });
     }
 
@@ -308,6 +315,12 @@ private:
   // Notify server about entity destruction
   asio::awaitable<void> notify_entity_destruction_to_server(entity e, version_type sync_version);
 
+  // Re-fire the inbound updates the snapshot-load mute swallowed. Call only
+  // with observers already unmuted — every thunk patches a
+  // component_update_request<T> marker, which goes straight back through
+  // dispatch_on_update. See muted_update_replay_.
+  void drain_muted_update_replay(ecs& registry);
+
   // Helper to load component and its hierarchy components from archive
   template <typename ComponentT>
   void load_component_and_hierarchy(cereal::PortableBinaryInputArchive& archive) {
@@ -475,6 +488,37 @@ private:
   template <typename ComponentT>
   void load_pending_markers(cereal::PortableBinaryInputArchive& archive);
 
+  // save_cached_snapshot's four per-component passes. These were generic
+  // lambdas fold-expanded inside save_cached_snapshot itself, which meant
+  // the single scaffold TU that explicitly instantiates the class paid an
+  // entt::snapshot + Cereal instantiation per component per pass — five
+  // archive slots x the whole pack — no matter how the pack was sharded,
+  // because a lambda local to a non-template member cannot be named by an
+  // `extern template` declaration. As member templates they ride the same
+  // extern/shard split as every other per-component entry point (see
+  // entt_ext/sync_client_shard.hpp), so the cost lands in the shard TUs
+  // that ninja compiles in parallel.
+  //
+  // The archive write order across the four passes IS the cache file
+  // format; keep the fold order in save_cached_snapshot as-is.
+  template <typename ComponentT>
+  void collect_mapped_entities(std::vector<entity>&        mapped_local,
+                               std::vector<entity>&        mapped_server,
+                               std::unordered_set<entity>& seen);
+
+  template <typename ComponentT>
+  void save_cached_component(entt::registry& tmp, cereal::PortableBinaryOutputArchive& archive);
+
+  template <typename ComponentT>
+  void save_cached_pending_markers(entt::registry& tmp, cereal::PortableBinaryOutputArchive& archive,
+                                   std::vector<entity> const& mapped_local,
+                                   std::vector<entity> const& mapped_server);
+
+  template <typename ComponentT>
+  void collect_offline_entities(std::vector<entity>&                       offline_local,
+                                std::unordered_map<entity, std::uint32_t>& local_to_temp,
+                                std::unordered_set<entity> const&          seen);
+
   // Encodes what an offline-only entity's parent<T>/children<T> reference
   // resolves to across a process restart — see save_offline_component.
   enum class offline_ref_kind : std::uint8_t { none = 0, server = 1, offline_temp = 2 };
@@ -549,6 +593,29 @@ private:
   // apply_sync_response's catch path. A plain bool there was a data race.
   std::atomic<bool>                              loading_snapshot_{false};
   std::string                                    device_id_;        // sent in the handshake; bound to the session for ACL
+
+  // Inbound updates whose apply body the snapshot-load mute swallowed.
+  //
+  // A component_updated_<T> notification that arrives while the ingest
+  // command is running defers its own command, which lands behind the ingest
+  // but ahead of the unmute. It emplaces the component_update_request<T>
+  // marker with observers still muted, so dispatch_on_update drops the apply
+  // body: the update is lost AND the marker is stranded (removal lives inside
+  // the apply body). A stranded marker then makes the writeable on_update
+  // observer bail before stamping pending_update, silently disabling
+  // client->server sync for that component on that entity.
+  //
+  // The handler records a re-fire thunk here instead of the unmute pass
+  // scanning every component_update_request<T> view: a marker sitting in the
+  // registry at unmute time is not proof its apply was dropped (one applied
+  // normally just before the ingest is removed by a command queued *behind*
+  // the unmute), and re-patching that one would re-apply the value with the
+  // marker already gone — the writeable observer would not bail and would
+  // echo the server's own value straight back at it.
+  //
+  // Touched only from the command-channel thread (the handler's deferred
+  // body and the unmute body), so no synchronization.
+  std::vector<std::move_only_function<void(ecs&)>> muted_update_replay_;
 
   // Single-flight coalescing for entity_create, keyed by client entity. When a
   // freshly created client entity carries several synced components, each

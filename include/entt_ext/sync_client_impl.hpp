@@ -224,11 +224,17 @@ asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::ap
         spdlog::error("sync_client: snapshot load FAILED (decode/ingest threw): {} — restoring sync state", ex.what());
         loading_snapshot_ = false;
         ecs.set_async_observers_muted(false);
+        // Replay here too: the handler bodies that recorded these ran before
+        // this command (they are what landed behind the previous ingest), and
+        // nothing else will ever re-fire them. Failing the load must not also
+        // strand their markers.
+        drain_muted_update_replay(ecs);
         co_return;
       } catch (...) {
         spdlog::error("sync_client: snapshot load FAILED (unknown exception during decode/ingest) — restoring sync state");
         loading_snapshot_ = false;
         ecs.set_async_observers_muted(false);
+        drain_muted_update_replay(ecs);
         co_return;
       }
 
@@ -236,6 +242,10 @@ asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::ap
         loading_snapshot_ = false;
         ecs_inner.set_async_observers_muted(false);
         spdlog::info("sync_client: snapshot fully loaded from server (mappings established, observers unmuted)");
+
+        // Drain AFTER unmuting — these patches re-enter dispatch_on_update
+        // and would otherwise be dropped a second time.
+        drain_muted_update_replay(ecs_inner);
         co_return;
       });
 
@@ -258,6 +268,21 @@ asio::awaitable<bool> sync_client_with_channel<ChannelT, SyncComponentsT...>::ap
     loading_snapshot_ = false;
     co_return false;
   }
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::drain_muted_update_replay(ecs& registry) {
+  if (muted_update_replay_.empty()) {
+    return;
+  }
+  // Move out first: a thunk's patch queues an apply body, and that body can
+  // (on a later command) run a handler that appends here again.
+  auto replay = std::move(muted_update_replay_);
+  muted_update_replay_.clear();
+  for (auto& refire : replay) {
+    refire(registry);
+  }
+  spdlog::info("sync_client: replayed {} component update(s) that arrived during the snapshot load", replay.size());
 }
 
 // ============================================================================
@@ -333,6 +358,66 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::copy_component_to_s
   }
 }
 
+// The four per-component passes of save_cached_snapshot below. They are
+// member templates rather than generic lambdas inside save_cached_snapshot
+// precisely so sync_client_shard.hpp can `extern template` them out of the
+// scaffold TU — see the declarations in sync_client.hpp.
+template <typename ChannelT, typename... SyncComponentsT>
+template <typename ComponentT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::collect_mapped_entities(
+    std::vector<entity>& mapped_local, std::vector<entity>& mapped_server, std::unordered_set<entity>& seen) {
+  using ActualT = unwrap_hierarchy_t<ComponentT>;
+  for (auto e : ecs_.template view<ActualT>()) {
+    if (seen.contains(e)) {
+      continue;
+    }
+    auto srv = continuous_loader_.to_remote(e);
+    if (srv != entt_ext::null) {
+      seen.insert(e);
+      mapped_local.push_back(e);
+      mapped_server.push_back(srv);
+    }
+  }
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+template <typename ComponentT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_cached_component(
+    entt::registry& tmp, cereal::PortableBinaryOutputArchive& archive) {
+  using ActualT = unwrap_hierarchy_t<ComponentT>;
+  entt::snapshot{tmp}.template get<ActualT>(archive);
+  if constexpr (is_with_hierarchy_v<ComponentT>) {
+    entt::snapshot{tmp}.template get<entt_ext::parent<ActualT>>(archive);
+    entt::snapshot{tmp}.template get<entt_ext::children<ActualT>>(archive);
+  }
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+template <typename ComponentT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_cached_pending_markers(
+    entt::registry& tmp, cereal::PortableBinaryOutputArchive& archive, std::vector<entity> const& mapped_local,
+    std::vector<entity> const& mapped_server) {
+  using ActualT = unwrap_hierarchy_t<ComponentT>;
+  copy_pending_markers_to_server_keyed<ComponentT>(tmp, mapped_local, mapped_server);
+  entt::snapshot{tmp}.template get<pending_create<ActualT>>(archive);
+  entt::snapshot{tmp}.template get<pending_update<ActualT>>(archive);
+}
+
+template <typename ChannelT, typename... SyncComponentsT>
+template <typename ComponentT>
+void sync_client_with_channel<ChannelT, SyncComponentsT...>::collect_offline_entities(
+    std::vector<entity>& offline_local, std::unordered_map<entity, std::uint32_t>& local_to_temp,
+    std::unordered_set<entity> const& seen) {
+  using ActualT = unwrap_hierarchy_t<ComponentT>;
+  for (auto e : ecs_.template view<ActualT>()) {
+    if (seen.contains(e) || local_to_temp.contains(e)) {
+      continue;
+    }
+    local_to_temp.emplace(e, static_cast<std::uint32_t>(offline_local.size()));
+    offline_local.push_back(e);
+  }
+}
+
 template <typename ChannelT, typename... SyncComponentsT>
 void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_cached_snapshot(cereal::PortableBinaryOutputArchive& archive) {
   // Gather every synced local entity that already has a server mapping,
@@ -343,21 +428,7 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_cached_snapsho
   std::vector<entity>        mapped_server;
   std::unordered_set<entity> seen;
 
-  auto collect = [&]<typename T>() {
-    using ActualT = unwrap_hierarchy_t<T>;
-    for (auto e : ecs_.view<ActualT>()) {
-      if (seen.contains(e)) {
-        continue;
-      }
-      auto srv = continuous_loader_.to_remote(e);
-      if (srv != entt_ext::null) {
-        seen.insert(e);
-        mapped_local.push_back(e);
-        mapped_server.push_back(srv);
-      }
-    }
-  };
-  (collect.template operator()<SyncComponentsT>(), ...);
+  (collect_mapped_entities<SyncComponentsT>(mapped_local, mapped_server, seen), ...);
 
   // Build a server-keyed temporary registry (mirror of the server's
   // build_filtered_registry): the entity table on disk holds server IDs,
@@ -369,42 +440,18 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::save_cached_snapsho
   (copy_component_to_server_keyed<SyncComponentsT>(tmp, mapped_local, mapped_server), ...);
 
   entt::snapshot{tmp}.get<entt_ext::entity>(archive);
-  auto save_one = [&]<typename T>() {
-    using ActualT = unwrap_hierarchy_t<T>;
-    entt::snapshot{tmp}.template get<ActualT>(archive);
-    if constexpr (is_with_hierarchy_v<T>) {
-      entt::snapshot{tmp}.template get<entt_ext::parent<ActualT>>(archive);
-      entt::snapshot{tmp}.template get<entt_ext::children<ActualT>>(archive);
-    }
-  };
-  (save_one.template operator()<SyncComponentsT>(), ...);
+  (save_cached_component<SyncComponentsT>(tmp, archive), ...);
 
   // Pending markers for the already-mapped entities above (phase 4
   // follow-up — see copy_pending_markers_to_server_keyed).
-  auto save_pending = [&]<typename T>() {
-    using ActualT = unwrap_hierarchy_t<T>;
-    copy_pending_markers_to_server_keyed<T>(tmp, mapped_local, mapped_server);
-    entt::snapshot{tmp}.template get<pending_create<ActualT>>(archive);
-    entt::snapshot{tmp}.template get<pending_update<ActualT>>(archive);
-  };
-  (save_pending.template operator()<SyncComponentsT>(), ...);
+  (save_cached_pending_markers<SyncComponentsT>(tmp, archive, mapped_local, mapped_server), ...);
 
   // Offline-only entities: same criterion as `seen` above, inverted — any
   // entity carrying a SyncComponentsT component that never made it into
   // `seen` has no server mapping at all (see save_offline_component).
   std::vector<entity>                       offline_local;
   std::unordered_map<entity, std::uint32_t> local_to_temp;
-  auto                                      collect_offline = [&]<typename T>() {
-    using ActualT = unwrap_hierarchy_t<T>;
-    for (auto e : ecs_.view<ActualT>()) {
-      if (seen.contains(e) || local_to_temp.contains(e)) {
-        continue;
-      }
-      local_to_temp.emplace(e, static_cast<std::uint32_t>(offline_local.size()));
-      offline_local.push_back(e);
-    }
-  };
-  (collect_offline.template operator()<SyncComponentsT>(), ...);
+  (collect_offline_entities<SyncComponentsT>(offline_local, local_to_temp, seen), ...);
 
   archive(static_cast<std::uint64_t>(offline_local.size()));
   (save_offline_component<SyncComponentsT>(archive, offline_local, local_to_temp), ...);
@@ -976,6 +1023,21 @@ void sync_client_with_channel<ChannelT, SyncComponentsT...>::setup_component_not
 
       if (ecs.valid(client_entity)) {
         ecs.template emplace_or_replace<component_update_request<ComponentT>>(client_entity, request);
+
+        // Observers are muted only by the snapshot ingest, which runs as a
+        // single command — so this body landed behind the ingest and ahead
+        // of the unmute, and dispatch_on_update just dropped our apply body.
+        // Record a re-fire so the unmute pass can replay it; see
+        // muted_update_replay_ for why the unmute cannot simply rescan the
+        // marker views. Both this body and the unmute run on the command
+        // channel, so the vector needs no synchronization.
+        if (ecs.async_observers_muted()) {
+          muted_update_replay_.emplace_back([client_entity](entt_ext::ecs& ecs_ref) {
+            if (ecs_ref.valid(client_entity) && ecs_ref.template all_of<component_update_request<ComponentT>>(client_entity)) {
+              ecs_ref.template patch<component_update_request<ComponentT>>(client_entity);
+            }
+          });
+        }
       }
     });
   });
