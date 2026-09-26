@@ -1,6 +1,7 @@
 #include "entt_ext/ecs_persistence.hpp"
 
 #include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/system_timer.hpp>
 
 #include <functional>
@@ -40,7 +41,7 @@ ecs::ecs(ecs&& other) noexcept
   : registry_{std::move(other.registry_)}
   , global_entity_{std::move(other.global_entity_)}
   , continuous_loader_{std::move(other.continuous_loader_)}
-  , running_{other.running_}
+  , running_{other.running_.load()}
   , detached_each_in_flight_{other.detached_each_in_flight_}
   , command_channel_size_{other.command_channel_size_}
   , command_channel_{main_io_context(), other.command_channel_size_}
@@ -54,7 +55,7 @@ ecs& ecs::operator=(ecs&& other) noexcept {
     registry_             = std::move(other.registry_);
     global_entity_        = std::move(other.global_entity_);
     continuous_loader_    = std::move(other.continuous_loader_);
-    running_                 = other.running_;
+    running_.store(other.running_.load());
     detached_each_in_flight_  = other.detached_each_in_flight_;
     command_channel_size_     = other.command_channel_size_;
     // Note: io_contexts and command_channel cannot be moved/assigned
@@ -107,13 +108,46 @@ void ecs::run(int timeout_ms, size_t concurrency) {
   // Ignore SIGPIPE to prevent socket write operations from terminating the process.
   // This is essential for network applications — writing to a closed socket generates
   // SIGPIPE whose default action is process termination.
+  //
+  // Windows has no SIGPIPE: a write to a closed socket returns WSAECONNRESET
+  // through the normal error path instead of raising a signal, so there is
+  // nothing to suppress. Note that on Windows Asio's signal_set is plain CRT
+  // ::signal(): Ctrl+C raises SIGINT, but closing the console, logoff,
+  // shutdown and taskkill never raise SIGTERM — those terminate the process
+  // without reaching the handler below.
+#ifndef _WIN32
   std::signal(SIGPIPE, SIG_IGN);
+#endif
 
-  asio::signal_set signals(main_io_ctx, SIGINT, SIGTERM);
-  signals.async_wait([this](auto error_code, auto) {
-    stop();
+  // SIGINT/SIGTERM request the same graceful shutdown as stop(): the update
+  // loop drains running systems, saves state and stops both contexts. A drain
+  // that outlives k_signal_grace (e.g. a detached system parked on I/O), or a
+  // second signal, forces the hard stop so neither Ctrl+C nor a service
+  // manager's SIGTERM can hang on it. Handlers bail on error so the cancel at
+  // teardown never touches the locals they reference.
+  static constexpr auto k_signal_grace = std::chrono::seconds(5);
+  asio::signal_set   signals(main_io_ctx, SIGINT, SIGTERM);
+  asio::steady_timer signal_grace(main_io_ctx);
+  auto               hard_stop = [this]() {
     concurrent_io_context().stop();
     main_io_context().stop();
+  };
+  signals.async_wait([this, &signals, &signal_grace, hard_stop](auto error_code, auto) {
+    if (error_code) {
+      return;
+    }
+    stop();
+    signal_grace.expires_after(k_signal_grace);
+    signal_grace.async_wait([hard_stop](auto error_code) {
+      if (!error_code) {
+        hard_stop();
+      }
+    });
+    signals.async_wait([hard_stop](auto error_code, auto) {
+      if (!error_code) {
+        hard_stop();
+      }
+    });
   });
 
   sort<entt_ext::system>([](const auto& lhs, const auto& rhs) {
@@ -139,6 +173,7 @@ void ecs::run(int timeout_ms, size_t concurrency) {
 
   main_io_ctx.run();
   signals.cancel();
+  signal_grace.cancel();
   concurrent_work.reset();
   remove<asio::thread_pool>(global_entity_);
 
@@ -236,25 +271,6 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
       }
     }
 
-    if (!running_) {
-      // spdlog::info("Stopping update loop");
-      co_await wait_for_systems_to_finish();
-
-      save_state();
-
-      asio::post(main_io_context(), [this]() {
-        concurrent_io_context().stop();
-      });
-      asio::post(main_io_context(), [this]() {
-        command_channel_.close();
-      });
-      asio::post(main_io_context(), [this]() {
-        main_io_context().stop();
-      });
-
-      co_return;
-    }
-
     auto [ec] = co_await timer.async_wait(use_nothrow_awaitable);
 
     if (ec) {
@@ -262,11 +278,32 @@ auto ecs::run_update_loop(int timeout_ms, size_t concurrency) -> asio::awaitable
       co_return;
     }
   }
+
+  // Stopping. This cleanup MUST sit after the loop, on every normal exit path —
+  // not inside a mid-loop `if (!running_)` branch. A stop() that lands while the
+  // loop is parked in async_wait above used to fall off the while-condition and
+  // return without running this code: the io contexts were never stopped,
+  // ecs::run() never returned, and the process hung on exit (reproduced
+  // reliably by calling stop() from any thread that is not inside a system).
+  co_await wait_for_systems_to_finish();
+
+  save_state();
+
+  asio::post(main_io_context(), [this]() {
+    concurrent_io_context().stop();
+  });
+  asio::post(main_io_context(), [this]() {
+    command_channel_.close();
+  });
+  asio::post(main_io_context(), [this]() {
+    main_io_context().stop();
+  });
+
   co_return;
 }
 
 void ecs::stop() {
-  running_ = false;
+  running_.store(false);
 }
 
 std::size_t ecs::poll() {

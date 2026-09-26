@@ -18,6 +18,7 @@
 
 #include <boost/asio/experimental/concurrent_channel.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <coroutine>
 #include <fstream>
@@ -963,7 +964,8 @@ private:
   continuous_loader_with_mapping<registry_type>                     continuous_loader_;
   asio::io_context                                                  main_io_context_       = asio::io_context{};
   asio::io_context                                                  concurrent_io_context_ = asio::io_context{};
-  bool                                                              running_                 = true;
+  // Atomic so stop() is safe from any thread; run_update_loop polls it once per tick.
+  std::atomic<bool>                                                 running_                 = true;
   std::size_t                                                       detached_each_in_flight_ = 0;
   std::size_t                                                       command_channel_size_;
   command_channel                                                   command_channel_;
