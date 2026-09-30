@@ -11,8 +11,44 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: read   # the "already built?" gate lists this repo's runs
+
 jobs:
+  # Skip rebuilding a commit that was already built green. PRs and the submodule
+  # bump branch are merged by fast-forward, so the push to main carries the
+  # exact commit their run verified; without this gate that push rebuilt it.
+  # Keyed on the exact SHA, so any new commit still builds. Runs on a
+  # GitHub-hosted runner so it doesn't queue behind builds on s2c.
+  gate:
+    name: already built?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      built: ${{ steps.check.outputs.built }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          built=false
+          if [ "$EVENT" = push ]; then
+            wf=$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq .workflow_id)
+            n=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&status=success&per_page=100" \
+                  --jq "[.workflow_runs[] | select(.workflow_id == $wf and .id != $RUN_ID)] | length")
+            [ "$n" -gt 0 ] && built=true
+          fi
+          echo "built=$built" >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT sha=$SHA already built green: $built"
+
   build:
+    needs: gate
+    if: needs.gate.outputs.built != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container: archlinux:latest
