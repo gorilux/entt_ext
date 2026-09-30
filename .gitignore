@@ -1,3 +1,4 @@
 .cache/
 subprojects/cereal/
 subprojects/packagecache/
+build-*/

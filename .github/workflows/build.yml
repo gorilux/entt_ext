@@ -1,0 +1,31 @@
+name: build
+
+# Public repo: GitHub-hosted runner (free for public repos), Arch container so
+# the toolchain matches the grlx-labs apps. Deliberately not the s2c runner,
+# which serves private repos only (a fork's PR must not run code on s2c), and
+# not the shared grlx-workflows build, which is private and so unavailable to
+# public repos.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain
+        run: pacman -Syu --noconfirm --needed base-devel git meson ninja pkgconf cmake boost spdlog fmt gtest
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build
+        run: make linux
+
+      - name: Test
+        run: make test
