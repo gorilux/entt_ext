@@ -41,6 +41,13 @@ grlx_rpc_dep = grlx_rpc_project.get_variable('grlx_rpc_dep')
 
 cmake = import('cmake')
 
+# EnTT's CMake project enables C, and meson hands CMake only the compilers of
+# languages enabled on the meson side. If the consumer's project() is C++
+# only, a cross build then gets the HOST cc (mingw: /usr/sbin/cc driving Linux
+# ld, which rejects --major-image-version). Enable C here so every consumer
+# works regardless of the languages it declares.
+add_languages('c', native: false)
+
 entt_opt_var = cmake.subproject_options()
 entt_proj = cmake.subproject('entt', options: entt_opt_var)
 message('CMaket targets:\n - ' + '\n - '.join(entt_proj.target_list()))
