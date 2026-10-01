@@ -65,3 +65,28 @@ jobs:
 
       - name: Test
         run: make test
+
+  # main moved and is green: send every grlx-labs project that pins this repo
+  # a `submodule-updated` dispatch, which starts its submodule bump bot
+  # (grlx-workflows bump.yml). The org secret reaches public repos.
+  notify:
+    name: notify dependents
+    needs: [gate, build]
+    if: >-
+      !cancelled() && github.event_name == 'push' &&
+      (needs.build.result == 'success' || needs.gate.outputs.built == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: grlx-labs/grlx-workflows
+          path: .grlx-workflows
+          token: ${{ secrets.GRLX_LABS_TOKEN }}
+          persist-credentials: false
+
+      - name: Notify dependents
+        env:
+          GH_TOKEN: ${{ secrets.GRLX_LABS_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: .grlx-workflows/scripts/notify-dependents.sh
