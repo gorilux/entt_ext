@@ -87,13 +87,27 @@ public:
   template <typename... ChannelArgs>
   explicit sync_server_with_channel(entt_ext::ecs& ecs_instance, ChannelArgs&&... channel_args);
 
-  asio::awaitable<void> start(uint16_t port) {
+  // TCP channels only. The constraint keeps an explicit instantiation for a
+  // non-TCP channel (local_channel) from instantiating these at all.
+  asio::awaitable<void> start(uint16_t port)
+    requires requires(ChannelT& channel, tcp::endpoint const& endpoint) { channel.bind(endpoint); }
+  {
     auto endpoint = tcp::endpoint(asio::ip::address_v6::any(), port);
     co_await start(endpoint);
   }
 
-  asio::awaitable<void> start(tcp::endpoint const& endpoint) {
+  asio::awaitable<void> start(tcp::endpoint const& endpoint)
+    requires requires(ChannelT& channel, tcp::endpoint const& endpoint) { channel.bind(endpoint); }
+  {
     co_await rpc_server_.start(endpoint);
+  }
+
+  // Start on whatever the channel's bind() takes — e.g. local_channel: a
+  // Unix socket endpoint, or a listening fd inherited from systemd. Named,
+  // not a start() overload, so an int fd can never be read as a port.
+  template <typename... BindArgsT>
+  asio::awaitable<void> start_with(BindArgsT const&... bind_args) {
+    co_await rpc_server_.start(bind_args...);
   }
 
   asio::awaitable<void> stop() {
