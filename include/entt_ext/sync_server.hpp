@@ -96,6 +96,14 @@ public:
     co_await rpc_server_.start(endpoint);
   }
 
+  // Start on whatever the channel's bind() takes — e.g. local_channel: a
+  // Unix socket endpoint, or a listening fd inherited from systemd. Named,
+  // not a start() overload, so an int fd can never be read as a port.
+  template <typename... BindArgsT>
+  asio::awaitable<void> start_with(BindArgsT const&... bind_args) {
+    co_await rpc_server_.start(bind_args...);
+  }
+
   asio::awaitable<void> stop() {
     co_await rpc_server_.stop();
   }
