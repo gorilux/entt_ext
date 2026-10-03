@@ -87,12 +87,18 @@ public:
   template <typename... ChannelArgs>
   explicit sync_server_with_channel(entt_ext::ecs& ecs_instance, ChannelArgs&&... channel_args);
 
-  asio::awaitable<void> start(uint16_t port) {
+  // TCP channels only. The constraint keeps an explicit instantiation for a
+  // non-TCP channel (local_channel) from instantiating these at all.
+  asio::awaitable<void> start(uint16_t port)
+    requires requires(ChannelT& channel, tcp::endpoint const& endpoint) { channel.bind(endpoint); }
+  {
     auto endpoint = tcp::endpoint(asio::ip::address_v6::any(), port);
     co_await start(endpoint);
   }
 
-  asio::awaitable<void> start(tcp::endpoint const& endpoint) {
+  asio::awaitable<void> start(tcp::endpoint const& endpoint)
+    requires requires(ChannelT& channel, tcp::endpoint const& endpoint) { channel.bind(endpoint); }
+  {
     co_await rpc_server_.start(endpoint);
   }
 
